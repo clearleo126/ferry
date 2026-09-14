@@ -5,7 +5,10 @@ namespace ferry {
 HostStagedChannel::HostStagedChannel(int src_dev, int dst_dev, int ring_slots,
                                      size_t slot_bytes)
     : src_dev_(src_dev), dst_dev_(dst_dev), slot_bytes_(slot_bytes) {
-  // pinned host 内存与设备上下文无关，可直接分配
+  // 必须先切换到 src 设备：CUDA event 绑定创建时的设备上下文，
+  // 之后 event 会在 src 的 copy_stream 上 record（跨设备 record 会报
+  // invalid resource handle——单卡环回时恰好不触发，跨卡必现）
+  CUDA_CHECK(cudaSetDevice(src_dev));
   slots_.resize(ring_slots);
   for (auto& s : slots_) {
     s.bytes = slot_bytes;
@@ -13,7 +16,6 @@ HostStagedChannel::HostStagedChannel(int src_dev, int dst_dev, int ring_slots,
     CUDA_CHECK(cudaEventCreateWithFlags(&s.d2h_done, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&s.h2d_done, cudaEventDisableTiming));
   }
-  CUDA_CHECK(cudaSetDevice(src_dev));
   CUDA_CHECK(cudaStreamCreate(&copy_stream_));
 }
 

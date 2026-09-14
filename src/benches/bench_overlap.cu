@@ -105,7 +105,8 @@ int main(int argc, char** argv) {
       for (int i = 0; i < nbatches; ++i) {
         ch.submit(static_cast<const char*>(d_src) + i * batch_bytes,
                   batch_bytes, outs[i]);
-        ch.sync();  // 传输完全结束
+        ch.sync();  // 传输完全结束（注意：submit 内部会切到 src 上下文）
+        CUDA_CHECK(cudaSetDevice(dst));  // 回到 dst 上下文再启动计算 kernel
         heavy_scale_kernel<<<blocks, 256, 0, compute>>>(
             static_cast<const float*>(outs[i]),
             static_cast<float*>(tmp_outs[i]), n_elems, inner);

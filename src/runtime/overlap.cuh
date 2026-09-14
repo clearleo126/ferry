@@ -74,6 +74,8 @@ class OverlapPipeline {
       ch_->submit(static_cast<const char*>(d_src) + i * batch_bytes_,
                   batch_bytes_, bufs_[i]);
       ch_->wait_last_arrival(compute_stream_);
+      // submit 内部切到 src 上下文；计算 kernel 必须回到 dst 上下文再启动
+      CUDA_CHECK(cudaSetDevice(dst_dev_));
       scale_kernel<<<blocks, 256, 0, compute_stream_>>>(
           static_cast<const float*>(bufs_[i]),
           static_cast<float*>(outs_[i]), n, a);
