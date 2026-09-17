@@ -115,6 +115,12 @@ add_executable(run_missstream
 )
 target_link_libraries(run_missstream PRIVATE ferry_workloads ferry_comm ferry_runtime ferry_config ferry_common)
 
+# run_ablation: R4 消融矩阵（M1×M2×M3 开关全组合 + CSV）
+add_executable(run_ablation
+  src/benches/run_ablation.cu
+)
+target_link_libraries(run_ablation PRIVATE ferry_workloads ferry_comm ferry_runtime ferry_config ferry_common)
+
 # ------------------------------------------------------------------
 # 后续模块（P2 中逐步添加，先占位说明）
 #   workloads/: Workload A/B 生成器

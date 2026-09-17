@@ -1,276 +1,140 @@
-实验设计总结（收束版，面向 ICDCS/ICS）
-场景已钉死：LLM 稀疏注意力持续 decode 的 host-staged 热 KV 工作集
-不是「持续稀疏负载」统称，不是 GNN，不是又一个 HiSparse/SGLang。
+实验设计（收束版 v3 · 2026-09-17 · 取代 v1/v2；两版旧稿作废）
+场景钉死：LLM 稀疏注意力持续 decode 的 host-staged 热 KV 工作集（QSA-style miss 流）。
+v3 = v2 的场景与口径 + R1/R2/R3 实测结果回填 + 删除过期信息（WSL 证据、旧吞吐数字、平台现状过期描述）。
 
-【平台确认 + P1 验证完成】
-- 拓扑：4×RTX 3090，无直接 P2P，跨卡一律 host-staged（~12 GB/s），拓扑高度对称
-- Host-staged 吞吐（P1 已验证）：
-  * 非批处理：16KB→16MB 升至 ~24 GB/s
-  * 批处理：同一范围升至 ~49 GB/s
-  * 拐点：1–4MB，batched 相对 baseline 稳定 2.0×
-- 主贡献冻结：host-staged 通道上的批粒度自适应 + 算通重叠（多卡控制面）
-- 明确不做：Qwen3.8 整模 8×256K、完整 SGLang/HiSparse 移植、PD 分离、MTP、MoE all-to-all
+【0. 一页状态（全部为集群 4×3090 实测；环回=机制证据，跨卡=论文数字）】
+通道特性（probe --bw，GPU0↔GPU1 与 GPU2↔GPU3 一致）：
+- 无 P2P；host-staged 单流 ≈11–12 GB/s，≥1MB 饱和（16MB 时 11.9）
+- 单流下「多段提交统一 sync」相对逐段 sync 在 ≥0.5MB 时 ≈1.0×；增益只存在于 <0.5MB
+- 双流流水（2×D2H + 1×H2D）：20.36 GB/s = 1.82× 单流
+机制倍数（GPU2 环回）：
+- H1 批+流水 vs 逐段 sync：fixed-2MB 1.78×；段数 32→21
+- H3 算通重叠：1.87×（7.76→4.14ms，计算通信量级相当时）
+- 本地队列：4M 任务恰好一次 PASS；wave-batched ≈ per-thread → 降级为消融，不做主张
+跨卡结果（R3，GPU0↔GPU1 真实跨卡，vLLM 驻留显存但 util=0%）：
+- Workload B（65536 任务；medium=1GB / high=4GB）：
+  medium：steady C/A 1.67× C/B 1.97×；bursty C/A 1.47× C/B 2.22×；skewed C/A 2.23× C/B 1.93×；
+          段数 1024→267（0.26）
+  high：  steady C/A 1.25× C/B 1.45×；bursty C/A 1.09× C/B 1.42×；skewed C/A 1.33× C/B 1.44×；
+          段数 1024→1024（大总量下自适应批贴近上限，段数比无优势）
+- Workload A miss 流（4 req × 12 层 × 4 steps，57.66MB miss 回填）：
+  steady：C/A 5.86×  C/B 1.76×  refill 3690→1227（0.333） p99 11.67→3.87ms
+  bursty：C/A 7.99×  C/B 2.29×  p99 16.65→4.82ms
+  mixed： C/A 9.40×  C/B 2.74×  p99 16.80→3.63ms
+两条科学结论：
+① H4 成立：A 的步末同步在突发/偏斜到达下灾难性劣化，C 优势放大至 8–9.4×——「只报平均
+   吞吐会掩盖问题」有直接证据。
+② M2（批粒度自适应）收益边界清晰：中小总量时段数砍至 0.26；大总量下批已贴近饱和上限，
+   段数比=1.0，收益让渡给 M1（流水）。支撑「M1 报吞吐倍数、M2 报段数/尾延迟」的归因分工。
+跨卡 vs 环回：C/B 从环回 1.44–2.08× 升至跨卡 1.76–2.74×——真实 PCIe 往返下批处理+重叠
+收益更显著（通信越贵，控制面越值钱）。
 
-【P2 实现状态（WSL 1×4060 单卡验收；论文数字一律集群出）】
-已落地并验收：
-- comm/：HostStagedChannel（pinned ring + event 依赖），验收 0.997x 于 P1 batched 协议
-- queue/：GPU 本地有界环（per-thread / wave-batched 双模式），恰好一次出队 PASS
-- runtime/：批粒度自适应（1–4MB 拐点）+ 批处理跨卡重分配 + N 缓冲算通重叠
-- workloads/：合成稀疏任务流（steady/bursty/skewed × 偏斜）+ 基线 A/B/C 执行器
-- 工具链：probe（拓扑+批粒度扫描）、bench_comm/queue/redistribute/overlap、run_synthetic
+【1. 一句话主张（冻结）】
+面向 LLM 稀疏注意力持续 decode 的 host-staged 多 GPU 运行时：完整 KV 历史驻 pinned host，
+GPU 只驻留每请求每层热工作集；miss 经 PCIe 以流水化批传输回填。系统以本地优先队列、
+批处理跨 GPU 重分配、计算通信重叠为多卡控制面，在 4×3090（无 P2P、~12 GB/s）上
+提升吞吐、降低通信放大、压低突发/偏斜尾延迟。
 
-WSL 机制证据（非论文数字）：
-- H1：合成全矩阵 C vs B 463~626x，迁移段数 4096→1
-- H2：adaptive 吞吐最高且迁移段数 32→21；批收益随粒度增大收敛（1.84x→1.24x）
-- H3：重叠 1.18x，位级校验 PASS
-- H4 机制：baseline-B 的 p99 在 skewed（6.9ms）显著差于 steady（2.7ms）
-- 本地 wave-batched vs per-thread：小容量+退避下仅 ~4%，集群高争用复测
+【2. 机制归因（v2 校订，维持）】
+三个机制与消融开关一一对应：
+  M1 流水化批传输：dual-stream host-staged channel（开关 n_in_streams∈{1,2}）→ 报吞吐倍数
+  M2 带宽感知批粒度：自适应批大小削减段数（开关 MoveStrategy/固定粒度）→ 报段数+尾延迟
+  M3 计算-通信重叠：event 依赖的 compute/copy 流水（开关 seq/pipe）→ 报重叠倍数与 overlap ratio
+批粒度不与流水混为一谈（v1 的「batched 2.0×」实为 M1 的功劳，probe --bw 已证）。
 
-已确立的工程约束（后续实现必须遵守，违反即死锁/假阴性）：
-1. 算通重叠只靠 event 依赖（copy stream ↔ compute stream），不依赖跨 stream kernel 并发；
-   队列+计算合一的 kernel 用单 kernel role-partition（persistent kernel 形态）
-2. 迁移源必须驻留设备侧（远端任务池 d_src）；host 数组不能作 HostStagedChannel 源
-3. 合成负载禁用随机字节→float（signaling NaN 位模式 host/device 不同，校验假阴性）；
-   校验一律位级 memcmp
-4. 小总量会被自适应策略合并为单批；端到端实验 target_batches=8 保证流水窗存在
+【3. 边界 / Shetty / 投稿】
+不做：GNN、SpMM kernel、MoE EP、PD 分离、NVSHMEM、SGLang/HiSparse 移植、8×256K 整模、
+单卡 wait-free 定理。QSA/HiSparse 只是 workload 来源。
+两个 P0：单卡原语→多卡控制面；持续 decode miss 流的尾延迟/偏斜评测空白。
+投稿：ICDCS 主投；ICS 备选（persistent kernel/profiling）；ICML 不做默认。
 
-一、论文一句话主张
-我们提出一个面向 LLM 稀疏注意力持续 decode 的 host-staged 多 GPU 运行时：完整 KV 历史在 pinned host，GPU 只驻留每请求每层的热工作集；miss 经 PCIe 按自适应批粒度回填。系统把 GPU 并发队列从单卡数据结构推进为多卡控制面，通过本地优先队列、批处理跨 GPU 重分配和计算通信重叠，在 4×RTX 3090（~12 GB/s、无 P2P）上提升吞吐、降低通信放大，并压低突发/偏斜下的尾延迟。
+【4. RQ】
+RQ1 静态划分+大同步在到达偏斜/层间漂移/热缓存失配下是否劣化利用率与尾延迟？（R3 已证：是）
+RQ2 本地优先+流水化批重分配能否提升吞吐/扩展效率并降低通信放大？（R3 已证：2 卡全矩阵正收益）
+RQ3 仅 host-staged 是否足以成立？批粒度自适应相对固定粒度是否必要？（前者已证；后者 R4 出）
+RQ4（增强）强顺序 vs 放松顺序权衡。
 
-二、研究边界
-这篇论文不定义为：
-- 又一个 HiSparse / QSA serving 系统，或 SGLang 工程移植
-- 又一个图神经网络（GNN）或 SpMM kernel 系统
-- 又一个 MoE 专家并行 / PD 分离服务系统
-- 又一个 NVSHMEM 系统
-- 又一个单卡更强的 lock-free / wait-free 队列（不与 Shetty 硬刚线性一致性 + 进度保证 + 有界内存）
+【5. 基线语义（锁定）】
+A 静态+bulk-sync：全局 barrier（等全部任务到达）后一次性 bulk 迁移（经 host-staged 通道，
+  禁止 D2D 绕过）+ 单 kernel。旧实现不等到达即传、或用 D2D 隐藏通信成本，均为伪影。
+B 动态非批处理：逐段迁移 + 逐段 sync；段门控 = 段内最后任务已到达；单流。
+C Ferry：自适应批 + 双流流水 + event 依赖计算；批门控 = 批内最后任务已到达；
+  在途窗口 pending_ahead。
+门控总则：任何批/段在其最后任务到达前不得提交；出现负延迟即作废重调参。
 
-这篇论文定义为：
-- 面向稀疏注意力 decode 的多 GPU runtime（任务 = 热缓存命中/miss 回填/lease 调度）
-- 研究重点：本地优先、跨卡批重分配、host-staged 批粒度、重叠执行
-- QSA/HiSparse 只提供 workload 生成器与评测形态，不是论文主题
-- 单卡有界环 + 波级批处理预约是底层积木，不是主贡献
+【6. Workload B 参数（锁定，已实现）】
+payload：low/med/high = 4KB/16KB/64KB。到达校准：tick 使 arrival_span ∈ [0.5,2]×
+service_span；p50<0 作废。bursty = 64 任务同 tick 集中 + 行间指数静默；skewed = 帕累托。
+tasks 64K–256K（总迁移量 64MB–4GB 覆盖饱和区）。
 
-三、与 Shetty 2026 的关系
-原文已占住：单 GPU lock-free/wait-free + 有界内存 + 线性一致性；wave-batched 降争用；微基准 + BFS / 光追。
+【7. Workload A（已实现已跨卡）】
+QSA-style miss 流：多请求持续 decode，每 step 每层选 128–512 个 C4 block；步间 reuse≈66%；
+层间独立；host pinned slab 存逻辑 KV，GPU 每(请求,层)固定热缓存（1×/2×/4× 档）；
+miss 经批回填。执行器三模式 = kv_exec.cuh（A 步末同步 / B 逐 C4 / C 自适应批+重叠）。
+跨卡结果见【0】。数据源是 host pinned slab（与设备无关），热缓存/kernel 驻 dst。
 
-我们只挖两个 P0：
-P0-1 单卡原语 → 多卡控制面
-- 痛点：跨卡后队列变成控制面；~12 GB/s host-staged 上细粒度操作会被放大
-- 切口：本地有界环 + 批处理转发/窃取 + 带宽感知批粒度（不做拓扑路由）
+【8. 指标口径（锁定）】
+延迟 = 完成时刻 − 到达时刻（event 级）；makespan = 首到达→末完成。
+通信量 = 真实迁移字节；迁移段数 = 通信放大代理。
+overlap ratio = 1 − T_pipe / (T_comm_alone + T_compute_alone)（R5 实现三项独立计时）。
+Workload A 专属：hit rate、miss 字节/token、p50/p99 step。
+扩展效率 = N 卡吞吐 / 单卡吞吐（4 卡窗口出）。
 
-P0-2 持续 decode miss 流与尾延迟空白
-- 痛点：固定时长 enqueue/dequeue 不等于突发到达、层间稀疏漂移、热缓存失配下仍好
-- 切口：QSA-style miss 流 + steady/bursty/skewed + p99 + miss 字节/token
+【9. 实验矩阵与消融开关】
+开关：n_in_streams{1,2} × MoveStrategy{non-batched,fixed,adaptive} × overlap{seq,pipe}
+      × queue{per-thread,wave} × 粒度{C4,固定页,固定1–4MB,自适应}
+输入：arrival{steady,bursty,skewed/mixed} × hot{1,2,4}× × sparsity{4,16,64}KB × skew{bal,imb}
+硬件：1（环回）/ 2（已出）/ 4（待窗口）。
+必做消融（R4）：去 M1（n_in_streams=1）；去 M2（固定粒度）；去 M3（seq）；去本地优先（B 语义）。
+建议：批大小曲线、hot 档位、per-thread vs wave。
+不扫：语义模式、反压阈值、NVSHMEM、serving SLO、GNN/MoE 参数。
 
-增强项（最小版本后再考虑，不进成立条件）：
-P1-1 语义可调；P1-2 反压/突发打满；P2-1 慢路径降本；P2-2 平台 profiling
+【10. 工程约束（七条，违反即死锁/假阴性/跨卡崩溃）】
+1. 算通重叠只靠 event 依赖，不依赖跨 stream kernel 并发；队列+计算用单 kernel role-partition。
+2. 迁移源必须驻留设备侧；host 数组不能作 HostStagedChannel 的 D2H 源
+   （Workload A 例外：host pinned slab 本身就是源，通道对其只走 H2D 语义——由 slab_offset
+   直供，不经过 D2H 段）。
+3. 合成负载禁用随机字节→float（signaling NaN 位模式差异）；校验一律位级 memcmp。
+4. 小总量会被自适应合并为单批；端到端 target_batches=8 保证流水窗。
+5. CUDA event/stream 必须在 cudaSetDevice(src) 之后创建（跨设备 record 报
+   invalid resource handle；单卡环回不暴露，跨卡必现）。
+6. HostStagedChannel.submit() 会把上下文切到 src；调用方在 dst 流上启动计算 kernel 前
+   必须 cudaSetDevice(dst)。
+7. HostStagedChannel 析构会把上下文切到 src 销毁资源（现已恢复调用方设备）；
+   任何「构造-使用-析构」块之后启动 kernel 前，仍必须显式 cudaSetDevice(dst)。
 
-明确不挖：
-- 再造 G-LFQ/G-WFQ
-- NVSHMEM 远程 wait-free
-- 「GNN 更快」或「QSA 端到端 tok/s 超过某 serving 系统」而无 runtime 主张
+【11. 平台与执行策略】
+共享集群：他人进程常驻（vLLM 驻留显存但 util=0% 时可用；util>0 或他人训练时禁用）。
+监控线程 watch_gpu_window.sh 常驻（120s 轮询，日志 watch_gpu.log）。
+数字层级：环回=机制证据；2 卡=论文主数字；4 卡=扩展性（专用窗口）。
+任何新机器先跑 probe 复测通道再出数。
 
-四、目标投稿
-- ICDCS 主投：runtime、动态负载均衡、带宽感知批粒度、portable host-staged；主故事 = P0-1 + P0-2
-- ICS 备选：补 persistent kernel、队列策略、Nsight 解释、runtime–kernel 协同
-- ICML 不做默认：没有第二类真实 ML 负载 + 质量指标前，不转叙事
+【12. 风险与止损】
+不写成 QSA/HiSparse 跟跑；不滑回「泛稀疏」或 GNN；不模块堆叠；不抢 Shetty 单卡队列；
+不复现 8×256K 容量数字；Portable 相对 B 无稳定收益即停扩。
+新增：
+- R1 修正后 C 仍 ≤A → 先查通信占比（加 payload/tasks），不得改结论口径（已解除：R3 全正收益）。
+- 窗口长期不可得（>2 周）→ 4 卡矩阵降级，主结论挂 2 卡 + 机制层倍数。
 
-五、核心研究问题
-RQ1：稀疏注意力持续 decode 下，静态划分 + 大同步通信是否会因请求到达偏斜、层间 locality 漂移和热缓存失配，导致 GPU 利用率下降、尾延迟恶化？
+【13. 进度与剩余工作】
+五项必做：① portable runtime ✓ ② Workload A ✓（含跨卡） ③ Workload B ✓（R1 修正后跨卡）
+④ 基线 A/B/C ✓（语义校订） ⑤ 消融 ⏳（开关已备，R4 执行）。
+已完成工作项：R1 门控+payload（验收：无负延迟，C/A 1.96–2.83× 环回）；
+R2 跨卡接线（验收：--src/--dst 生效，烟雾 PASS）；R3 2 卡矩阵 + Workload A 跨卡（见【0】）。
+剩余：
+R4 ✓ 消融矩阵（run_ablation，8 组合 + CSV）。环回结果（steady/16KB/32K 任务）：
+   完整C vs B 2.10×；M3（重叠）贡献 1.76×（去重叠 26.3→45.3ms）；M1/M2 在环回下贡献 ≈1.0×
+   ——原因：环回 D2H+H2D 走同一根 PCIe，双流收益受限；M1/M2 的贡献预期在真实跨卡复现
+   （R3 数据已侧面支持：跨卡 C/B 2.22×>环回 2.08×）。CSV: results/ablation_steady_medium.csv。
+   ⏳ 跨卡消融关键行（等 GPU0/1 窗口）
+R5 overlap ratio 三项独立计时。验收：指标入表。
+R6 4 卡矩阵（等全空窗口）+ 监控线程自动提醒。
+R7 commit/push 全部修改（当前 9 文件未提交）。
 
-RQ2：本地优先 + 批处理跨 GPU 重分配，能否在 4×3090 的 ~12 GB/s host-staged 上提升吞吐和扩展效率，并相对「仅动态、非批处理迁移」降低通信放大（含 H2D miss 字节/token）？
-
-RQ3：不依赖直接 P2P、仅 host-staged 是否足以成立？批粒度自适应是否必要（对照固定 page=64 与固定 1–4MB）？
-
-RQ4（增强，非成立前提）：强顺序 vs 放松顺序的吞吐–正确性权衡。
-
-六、系统主张（主路径只三件事）
-1. 本地优先队列
-- 每卡本地有界任务队列；优先消费本卡热缓存命中与本卡 miss 回填
-- 快路径可借鉴 wave-batched，降 per-thread 原子争用
-- occupancy 驱动调度与反压
-
-2. 批处理跨 GPU 重分配
-- 仅在本地不足或负载失衡时跨卡转发/窃取
-- 跨卡与 H2D miss 一律按批，禁止逐 block / 逐任务拷
-- 带宽感知：在 ~12 GB/s 上按数据量自适应批大小（目标落在已验证的 1–4MB 拐点）
-- 4×3090 对称无 P2P：批粒度比路由更关键
-
-3. 计算通信重叠
-- persistent kernel + 多 CUDA stream
-- 本地 attention/热缓存命中、host refetch、队列维护流水重叠
-- 用 overlap ratio 证明收益不是「多搬几次」
-
-增强模块（跑通后再考虑）：语义可调、反压、慢路径、可选 NVSHMEM。默认全关。
-
-七、实现范围
-主实现（唯一必要）：portable host-staged runtime
-- pinned buffer pool + 多 stream；cudaMemcpyAsync（H↔D），不用 cudaMemcpyPeerAsync
-- NCCL 仅必要元数据/collectives
-- GPU 本地有界队列
-- host-coordinated 或 device-assisted 调度
-- 拓扑探测：确认无 P2P、测量 host-staged 吞吐
-- 显式 batch size 自适应
-
-禁止依赖：直接 P2P、NVSHMEM、remote atomics、跨设备 wait-free 形式化。
-
-QSA 接入边界（必须守住）：
-- 要：按真实 QSA 轨迹生成的 miss/refetch 任务流（selected C4 block、层间独立、步间 reuse）
-- 要：host pinned slab 上的逻辑 KV + GPU 固定热工作集 + batched H2D
-- 不要：完整 SGLang 服务栈、8×256K 整模、PD 分离、MTP、radix prefix
-- 不要：把论文写成 HiSparse 的 3090 复现
-- 可选小模型端到端仅在合成 miss 流与消融跑稳之后，上下文先 8K–32K，不冲 256K
-
-八、必须验证的假设
-H1（✓ P1）：只做动态迁移不够；必须本地优先 + 批处理。1–4MB 上 batched 相对 non-batched 稳定 2.0×。
-H2（✓ P1）：批粒度自适应优于固定粒度。拐点 1–4MB，过大收益递减。QSA 侧旁证：逻辑 page=64 仍可，但 H2D 下沉到 C4，否则 4× 热缓存装不下真实 selected set。
-H3：无重叠时，调度收益会被通信等待抵消。
-H4：突发/偏斜下必须报 p99 与不平衡度，不能只报平均吞吐。
-H5（增强）：强语义并非总最优。
-
-九、基线
-A：静态划分 + 同步通信（固定热缓存划分，每步/每批后同步，无动态迁移）
-B：动态但非批处理（允许跨卡/允许 miss 回填，但不做本地优先、不合并批）
-C：我们的 portable runtime（主结果）
-D：可选优化后端（只展示抽象可换后端，非主贡献）
-
-对照：Shetty 风格 wave-batched 只用于本地队列消融。不复现 G-WFQ + Porcupine。
-不把 SGLang-HiSparse 或 vLLM 当必须复现的系统基线；它们是场景来源，不是 runtime 对照。
-
-十、工作负载（已收束，只保留两类必做）
-工作负载A（主场景，必须做好）：QSA-style 稀疏 KV miss 流
-任务定义：
-- 多请求持续 decode；每 step 每层选出约 512 个 C4 block（约 2048 token）
-- 步间平均 reuse ≈ 66%、换入 ≈ 34%；12 层独立 selection，禁止跨层预取共享
-- 逻辑 KV 在 host pinned slab；GPU 每请求每层固定热缓存（默认 4× = 2048 C4）
-- miss 走 batched H2D；搬运单位在 C4 / 小批 / 1–4MB 间自适应，禁止把 64-token page 当唯一搬运粒度
-到达：steady / bursty / mixed-length（短 2K + 长 8K–32K）
-规模：合成轨迹为主（CPU LRU 回放生成 miss 流，对齐 QSA 局部性数字）。可选小模型端到端延后，且不把 256K/48GB 卡当成立条件。
-作用：给控制面一个真实、可引用的持续稀疏到达，而不是「泛稀疏」。
-
-最小实现映射（复用已验收积木，避免新造轮子）：
-- 逻辑 KV host slab = pinned 大块（即 comm/ 的 pinned buffer 放大为 slab）
-- 热缓存 = GPU 侧每(请求,层)固定缓冲；miss = HostStagedChannel 批回填（H2D 为主）
-- 轨迹回放 = CPU LRU 生成 miss 流 → 生成 Task{payload=C4 大小或自适应批, work=attention 迭代}
-- 执行器 = baselines.cuh 三模式换皮：A=固定热缓存+步末同步；B=逐 C4 回填+逐次 sync；C=自适应批+重叠
-- 新增量仅三件：LRU 轨迹回放器、(请求,层)→热缓存槽位映射、miss 字节/token 统计
-- 计算核 = 合成 attention（按 selected set 的 FMA 迭代），不做真实模型精度
-
-工作负载B（机制，必须保留）：合成稀疏任务流
-可控：到达、稀疏度、偏斜、跨卡压力、队列水位。
-作用：消融与 H1–H4 的因果解释。
-
-删除出最小版本：
-- 流式 GNN / 动态图（旧工作负载A）：不再定义问题；最小版本不做
-- Sparse MoE routing / 大 EP（旧工作负载C）：4×3090 无 NVLink，不进主线
-两者都不得为「多一个真实负载」挤占 A/B 和消融。
-
-十一、实验矩阵
-硬件：1 / 2 / 4 GPU
-
-输入（只保留能解释机制的）：
-- 到达：steady / bursty / mixed-length
-- 热缓存：1× / 2× / 4×（对应 miss rate 档位，不扫 8×）
-- 负载偏斜：balanced / imbalanced
-- 批粒度：C4 细粒 / 固定 page-64 / 固定 1–4MB / 自适应
-- 并发 decode：1 / 2 / 4（4 卡上到 4 即可；不承诺 8×256K）
-
-比较：
-- 静态 vs 动态
-- 非批处理 vs 批处理
-- 固定批大小 vs 自适应
-- 无重叠 vs 重叠
-
-不做默认：语义模式大扫、反压阈值大扫、portable vs NVSHMEM。
-
-十二、关键指标
-主指标：吞吐、扩展效率、通信量（含 H2D miss 字节/token）
-辅助：p50/p99 队列或 decode 间隔、热缓存命中率、GPU 利用率、负载不平衡度、overlap ratio、热 KV 显存占用
-原则：
-- 无吞吐/扩展收益则不成立
-- 无通信量或 overlap 解释则不像系统论文
-- 无 p99 与偏斜则相对 Shetty 微基准无差异
-- 不把 tok/s 对标某 serving 系统当主结论；容量/生命周期不是本工作的卖点
-
-十三、必须完成的消融
-必须：去本地优先；去批处理重分配；去批粒度自适应（改固定粒度）；去重叠
-建议：批大小曲线；热缓存 1×/2×/4×；到达偏斜；本地 per-thread vs wave-batched（说明积木来源）
-删除：GNN 数据集大扫、MoE 专家数大扫、Porcupine 全套、serving SLO 曲线
-
-十四、风险与止损
-风险1：被写成 HiSparse/QSA 工程跟跑
-应对：标题/摘要/引言不出现「我们实现了 QSA-HiSparse」；QSA 只作 workload；贡献句永远落在多卡控制面 + 批粒度。
-
-风险2：场景又滑回「持续稀疏负载」空话，或滑回 GNN
-应对：全文只承认一种真实到达：稀疏注意力 decode 的 miss/refetch。GNN/MoE 不进最小版本。
-
-风险3：模块堆叠
-应对：只讲本地优先 + 批重分配 + 重叠。Shetty 只用来定义缺口。
-
-风险4：被看成抢 Shetty 单卡队列
-应对：本地层复用 wave-batched / bounded ring；贡献是跨卡批处理控制面 + miss 流评测。
-
-风险5：4×3090 24GB 跑不动文章里的 2×48GB / 8×256K
-应对：这不是缺陷。我们的成立条件是 miss 流 + host-staged 批回填，不是整模长上下文容量。文章更贵的 PCIe 故事在 3090 无 P2P 上应当更强，而不是去复现其容量数字。
-
-止损：
-- Portable 相对基线 B 无稳定收益 → 停，不扩 NVSHMEM/语义/慢路径
-- 工作负载 A（miss 流）没跑稳 → 不停下来改 GNN/MoE
-- 仅 1GPU 变好、2/4GPU 无扩展 → 主线不成立，回到重分配与批粒度，不调单卡队列
-- 一旦开始接 SGLang 服务路径（graph capture、Marlin、tokenizer、PD）→ 立即停，那是另一篇论文
-
-十五、最小可发表版本
-只做这五项：
-1. Portable runtime：本地有界队列 + 批处理重分配 + 重叠 + 批粒度自适应
-2. 工作负载A：QSA-style miss 流（含层间独立、步间 reuse、热缓存 miss）
-3. 工作负载B：bursty/skewed + p99
-4. 基线 A/B/C
-5. 必做消融
-
-完成后对应 P0-1 + P0-2，可以成型。
-
-当前进度（对照上表）：
-- 第 1 项 ✓（comm/queue/runtime 全部单卡验收，工程约束已固化）
-- 第 3 项 ✓（合成全矩阵 + p99）
-- 第 4 项 ✓（A/B/C 执行器，环回模式全跑通）
-- 第 2 项 ⏳ 下一步：按「最小实现映射」实现 miss 流（复用已验收积木，新增仅三件）
-- 第 5 项 ⏳ 消融框架已具雏形（MoveStrategy 三态 + queue 双模式即消融开关），
-  待 Workload A 就绪后统一出消融矩阵
-
-十六、增强（严格后置）
-1. 反压/突发打满
-2. 可选小模型 8K–32K 端到端（仍不接完整 serving）
-3. 语义可调
-4. Nsight / wave-batched 本地消融
-5. 才考虑 NVSHMEM 或 ICS 慢路径
-GNN、MoE EP、PD 分离、8×256K 整模：默认删除。
-
-十七、推荐叙事
-不要写：
-「我们做了一个 GNN SpMM 系统，结合无锁队列、NVSHMEM。」
-「我们提出比 Shetty 更快的单卡 wait-free 队列。」
-「我们在 3090 上复现了 QSA-HiSparse 的 8×256K。」
-
-建议写：
-「Shetty 等解决了单 GPU 上可线性化、有进度保证的有界并发队列。但 LLM 稀疏注意力的持续 decode 把任务变成了 host 上的完整 KV 与 GPU 热工作集之间的 miss 回填：静态划分和大同步在到达偏斜、层间 locality 漂移和细粒度 PCIe 往返下会放大通信、抬高尾延迟。我们提出一个不依赖 P2P 的 host-staged 多 GPU 运行时，以本地优先有界队列、带宽感知批粒度重分配和算通重叠为控制面，在 4×RTX 3090 上稳定提升吞吐、降低 miss 通信放大，并补齐突发/偏斜下的尾延迟与扩展效率评估。」
-
-十八、执行优先级
-P0 ✓：拓扑、无 P2P、host-staged ~12 GB/s；主张冻结为本地优先 + 批重分配 + 重叠 + 批粒度自适应
-P1 ✓：通信层原型；1–4MB 拐点；batched 2.0×
-P2 进度：
-- ✓ comm/queue/runtime/baseline A/B/C/Workload B（WSL 单卡验收，含工程约束固化）
-- ⏳ Workload A miss 流（按第十五节「最小实现映射」：LRU 回放 + 热缓存映射 + miss 统计）
-- ⏳ 集群移植清单：CMAKE_CUDA_ARCHITECTURES=86；probe 复测 4 卡矩阵；全部论文数字重跑
-P3：必做消融；用通信量、命中率、overlap、p99 解释；ICDCS 稿
-P4 默认不做：GNN、MoE、NVSHMEM、整模 256K、语义/慢路径
-
-结论
-成立条件：
-1. ✓ 问题已收束为稀疏注意力 decode 的 host-staged 热工作集，不再用「持续稀疏负载」兜底
-2. ✓ 实现边界清：portable host-staged 必做；SGLang/HiSparse/GNN/MoE/NVSHMEM 不进最小版本
-3. ✓ 技术主张有根据：1–4MB 批处理 2.0×；QSA 侧 C4 vs page-64 说明粒度选错会吃掉稀疏收益
-4. ✓ H1/H2 已验证
-5. ⏳ 剩余：runtime、miss 流、消融、尾延迟
-
-当前策略：一篇可移植 host-staged 多卡运行时论文，workload 只有 QSA-style miss 流 + 合成偏斜。从 P2 做这五件必做项，三个月内投稿版；任何把系统做成 serving 产品的改动都视为扩题。
+【14. 推荐叙事（冻结）】
+「Shetty 等解决了单 GPU 上可线性化、有进度保证的有界并发队列；但 LLM 稀疏注意力的持续
+decode 把任务变成 host 完整 KV 与 GPU 热工作集之间的 miss 回填：静态划分与大同步在到达
+偏斜、层间 locality 漂移和细粒度 PCIe 往返下放大通信、抬高尾延迟。我们提出不依赖 P2P 的
+host-staged 多 GPU 运行时：miss 回填以双流流水化批传输执行，批粒度按待迁数据量自适应落在
+通道饱和区，计算以 event 依赖与回填流水重叠；在 4×RTX 3090 上稳定提升吞吐、降低 miss
+通信放大，并补齐突发/偏斜下的尾延迟与扩展效率评估。」

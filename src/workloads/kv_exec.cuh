@@ -59,7 +59,10 @@ inline size_t cache_slot_off(const MissSpec& sp, int req, int layer,
 }
 
 // 三模式执行 miss 流
-inline WlAStats run_miss_workload(int dev, const MissSpec& sp,
+// src_dev/dst_dev：host slab 为源（pinned 内存与设备无关），
+// 热缓存/输出/kernel 全在 dst 设备（= LLM decode 执行卡）
+inline WlAStats run_miss_workload(int src_dev, int dst_dev,
+                                  const MissSpec& sp,
                                   const MissTrace& tr,
                                   int mode,  // 0=A 1=B 2=C
                                   const AdaptiveBatchPolicy& pol,
@@ -83,6 +86,7 @@ inline WlAStats run_miss_workload(int dev, const MissSpec& sp,
   }
 
   __half *d_cache = nullptr, *d_out = nullptr;
+  CUDA_CHECK(cudaSetDevice(dst_dev));
   CUDA_CHECK(cudaMalloc(&d_cache, cache_bytes));
   CUDA_CHECK(cudaMalloc(&d_out, cache_bytes));
   CUDA_CHECK(cudaMemset(d_cache, 0, cache_bytes));
@@ -92,8 +96,9 @@ inline WlAStats run_miss_workload(int dev, const MissSpec& sp,
   std::vector<double> step_ms((size_t)sp.num_requests * sp.steps, 0.0);
   double step_ms_cum = 0.0;
 
-  HostStagedChannel ch(dev, dev, 4, pol.max_mb * (1 << 20));
+  HostStagedChannel ch(src_dev, dst_dev, 4, pol.max_mb * (1 << 20));
   cudaStream_t cs;
+  CUDA_CHECK(cudaSetDevice(dst_dev));
   CUDA_CHECK(cudaStreamCreate(&cs));
 
   HostTimer ht;
@@ -108,6 +113,7 @@ inline WlAStats run_miss_workload(int dev, const MissSpec& sp,
         // 全层 selected 一次性 H2D（大同步；无 LRU 复用，含命中重传）
         for (int l = 0; l < sp.num_layers; ++l) {
           const size_t g0 = base + (size_t)l * group;
+          CUDA_CHECK(cudaSetDevice(dst_dev));  // 同步 memcpy 语义绑定当前设备
           for (int k = 0; k < group; ++k) {
             const MissEvent& e = tr.events[g0 + k];
             const size_t off = cache_slot_off(sp, r, l, e.block_id);
@@ -262,6 +268,7 @@ inline WlAStats run_miss_workload(int dev, const MissSpec& sp,
           }
           // 计算流等待本批最后一段到达
           ch.wait_last_arrival(cs);
+          CUDA_CHECK(cudaSetDevice(dst_dev));  // submit 切到 src，回 dst 起计算
           i0 += take;
         }
         // 本步全层计算（依赖各批到达事件已在 cs 上排队）
@@ -298,6 +305,8 @@ inline WlAStats run_miss_workload(int dev, const MissSpec& sp,
     }
   }
 
+  // 尾部清理：先回 dst 上下文（ch 已在作用域外销毁前切过设备）
+  CUDA_CHECK(cudaSetDevice(dst_dev));
   cudaStreamDestroy(cs);
   cudaFreeHost(h_slab);
   cudaFree(d_cache);

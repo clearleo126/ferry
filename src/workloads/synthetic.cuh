@@ -31,9 +31,11 @@ struct ArrivalSpec {
   uint64_t total = 1 << 16;          // 任务总数
 
   size_t payload_bytes() const {
-    if (sparsity == "low") return 64;
-    if (sparsity == "high") return 256;
-    return 128;
+    // KB 级 payload（v2 实验设计第 6 节）：旧 4B 档使总迁移量仅 64KB 级，
+    // 通道成本≈0，C/A 比值变成参数伪影；修正后通信与计算进入可比量级
+    if (sparsity == "low") return 4 << 10;    // 4KB
+    if (sparsity == "high") return 64 << 10;  // 64KB
+    return 16 << 10;                          // 16KB
   }
 };
 
@@ -53,7 +55,9 @@ inline std::vector<Task> generate_tasks(const ArrivalSpec& spec,
   std::exponential_distribution<double> pareto_gap(1.16);  // 80/20 长尾
 
   double t = 0.0;
-  const uint64_t burst_period = spec.total / 8 + 1;  // 每 1/8 处一次突发
+  // bursty: 每 burst_period 个任务构成一个"突发行"——该行任务同一 tick
+  // 集中到达（真实突发 = 0 间隔成批到达），行间静默 gap 随机
+  const uint64_t burst_period = 64;  // 每行 64 个任务集中到达
   for (uint64_t i = 0; i < spec.total; ++i) {
     Task& tk = tasks[i];
     tk.id = i;
@@ -69,8 +73,11 @@ inline std::vector<Task> generate_tasks(const ArrivalSpec& spec,
     if (spec.arrival == "steady") {
       t += 1.0;  // 每 tick 一个任务
     } else if (spec.arrival == "bursty") {
-      t += exp_gap(rng) * 2.0;
-      if (i % burst_period == 0) t += 16.0;  // 突发：一次性推 16 tick
+      if (i % burst_period == 0) {
+        // 新的一行：从静默中醒来，本行 64 个任务全部落在同一 tick
+        t += exp_gap(rng) * 16.0;  // 行间静默（均值 16 tick）
+      }
+      // 行内：不推进 t（0 间隔集中到达）
     } else {  // skewed
       t += pareto_gap(rng) * 2.0;
     }
