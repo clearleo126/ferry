@@ -8,6 +8,7 @@
 //   skew    : 任务计算量偏斜（balanced / imbalanced -> 计算迭代次数分布）
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <random>
 #include <string>
@@ -21,6 +22,7 @@ struct Task {
   double arrive_t = 0.0; // 归一化到达时刻（单位：tick）
   size_t payload = 0;    // 数据量字节（迁移成本）
   int work = 0;          // 计算迭代数（计算成本）
+  int dest = 0;          // 初始到达的目标 GPU（到达偏斜：负载失衡的来源）
 };
 
 // 到达模式参数
@@ -29,6 +31,7 @@ struct ArrivalSpec {
   std::string sparsity = "medium";   // low|medium|high
   std::string load_skew = "balanced";// balanced|imbalanced
   uint64_t total = 1 << 16;          // 任务总数
+  int num_gpus = 1;                  // 目标卡数（dest 分布用）
 
   size_t payload_bytes() const {
     // KB 级 payload（v2 实验设计第 6 节）：旧 4B 档使总迁移量仅 64KB 级，
@@ -54,10 +57,15 @@ inline std::vector<Task> generate_tasks(const ArrivalSpec& spec,
   std::exponential_distribution<double> exp_gap(1.0);
   std::exponential_distribution<double> pareto_gap(1.16);  // 80/20 长尾
 
+  // 到达偏斜（dest 分布）：balanced = 均匀轮转；imbalanced = Zipf 偏向
+  // 少数卡（80% 任务落去前 20% 的卡）——这是多卡控制面要解决的负载失衡来源
+  const bool dest_skew = (spec.load_skew == "imbalanced");
+
   double t = 0.0;
   // bursty: 每 burst_period 个任务构成一个"突发行"——该行任务同一 tick
   // 集中到达（真实突发 = 0 间隔成批到达），行间静默 gap 随机
   const uint64_t burst_period = 64;  // 每行 64 个任务集中到达
+  uint64_t rr = 0;  // balanced 模式的轮转游标
   for (uint64_t i = 0; i < spec.total; ++i) {
     Task& tk = tasks[i];
     tk.id = i;
@@ -82,6 +90,21 @@ inline std::vector<Task> generate_tasks(const ArrivalSpec& spec,
       t += pareto_gap(rng) * 2.0;
     }
     tk.arrive_t = t;
+
+    // 目标卡：偏斜到达 → 80% 落在 rng 前 20% 的卡上
+    if (dest_skew && spec.num_gpus > 1) {
+      const double u = (double)(rng() % 1000) / 1000.0;
+      if (u < 0.8) {
+        // 落去前 1/5 的卡（至少 1 张）
+        const int hot = std::max(1, spec.num_gpus / 5);
+        tk.dest = (int)(rng() % (uint64_t)hot);
+      } else {
+        tk.dest = (int)(rng() % (uint64_t)spec.num_gpus);
+      }
+    } else {
+      tk.dest = (int)(rr % (uint64_t)std::max(1, spec.num_gpus));
+      ++rr;
+    }
   }
   return tasks;
 }

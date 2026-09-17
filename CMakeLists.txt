@@ -121,6 +121,12 @@ add_executable(run_ablation
 )
 target_link_libraries(run_ablation PRIVATE ferry_workloads ferry_comm ferry_runtime ferry_config ferry_common)
 
+# run_multigpu: N 卡控制面（A/B/C × 到达偏斜，水位批窃取）
+add_executable(run_multigpu
+  src/benches/run_multigpu.cu
+)
+target_link_libraries(run_multigpu PRIVATE ferry_workloads ferry_comm ferry_runtime ferry_config ferry_common)
+
 # ------------------------------------------------------------------
 # 后续模块（P2 中逐步添加，先占位说明）
 #   workloads/: Workload A/B 生成器
