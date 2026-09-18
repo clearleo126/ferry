@@ -1,6 +1,7 @@
-实验设计（收束版 v3 · 2026-09-17 · 取代 v1/v2；两版旧稿作废）
+实验设计（收束版 v4 · 2026-09-18 · 取代 v1/v2/v3；旧版作废）
 场景钉死：LLM 稀疏注意力持续 decode 的 host-staged 热 KV 工作集（QSA-style miss 流）。
-v3 = v2 的场景与口径 + R1/R2/R3 实测结果回填 + 删除过期信息（WSL 证据、旧吞吐数字、平台现状过期描述）。
+v4 = v3 场景与口径 + R4/R5/虚拟 N 卡控制面实测回填 + 约束 #8（通道深度）+ 剩余工作收敛为
+「真窗口三项」（跨卡消融、偏斜真卡数字、4 卡矩阵），其余全部关闭。
 
 【0. 一页状态（全部为集群 4×3090 实测；环回=机制证据，跨卡=论文数字）】
 通道特性（probe --bw，GPU0↔GPU1 与 GPU2↔GPU3 一致）：
@@ -102,6 +103,9 @@ Workload A 专属：hit rate、miss 字节/token、p50/p99 step。
    必须 cudaSetDevice(dst)。
 7. HostStagedChannel 析构会把上下文切到 src 销毁资源（现已恢复调用方设备）；
    任何「构造-使用-析构」块之后启动 kernel 前，仍必须显式 cudaSetDevice(dst)。
+8. 通道 ring 深度必须 ≥ 在途窗口 pending_ahead + 2：event 依赖批持有在途批的
+   h2d_done event，ring 浅于窗口时 slot 复用（event 被 re-record）发生在出队前，
+   会等错批（伪同步）。run_ferry_abl 与 run_overlap_ratio 均按此建通道。
 
 【11. 平台与执行策略】
 共享集群：他人进程常驻（vLLM 驻留显存但 util=0% 时可用；util>0 或他人训练时禁用）。
@@ -116,27 +120,44 @@ Workload A 专属：hit rate、miss 字节/token、p50/p99 step。
 - R1 修正后 C 仍 ≤A → 先查通信占比（加 payload/tasks），不得改结论口径（已解除：R3 全正收益）。
 - 窗口长期不可得（>2 周）→ 4 卡矩阵降级，主结论挂 2 卡 + 机制层倍数。
 
-【13. 进度与剩余工作】
-五项必做：① portable runtime ✓ ② Workload A ✓（含跨卡） ③ Workload B ✓（R1 修正后跨卡）
-④ 基线 A/B/C ✓（语义校订） ⑤ 消融 ⏳（开关已备，R4 执行）。
-已完成工作项：R1 门控+payload（验收：无负延迟，C/A 1.96–2.83× 环回）；
-R2 跨卡接线（验收：--src/--dst 生效，烟雾 PASS）；R3 2 卡矩阵 + Workload A 跨卡（见【0】）。
-剩余：
-N 卡控制面 ✓（P2 最后一块落地）：multigpu.cuh + run_multigpu。
-   结构：每卡执行线程（本地队列 + 双端窃取 + 通道矩阵）+ host 主线程到达分发；
-   任务带 dest（imbalanced 到达偏斜 = 失衡来源）；三模式 A/B/C 对齐单卡语义；
-   C = 本地优先批消费 + 水位批窃取 + 双流流水 + 在途窗口。
-   已修死锁：C 模式空闲路径必须收割在途批次（最后一匹批永不收割 → all_done 永假）。
-   环回验收：A/B/C 全部完成，C/B 2.19×，C/A 1.15×（单卡无偏斜，A 的 bulk 优势正常）。
-   ⏳ 偏斜 2/4 卡验收（窃取/再平衡路径需要 ≥2 卡；等 GPU0/1 窗口）
-R4 ✓ 消融矩阵（run_ablation，8 组合 + CSV）。环回结果（steady/16KB/32K 任务）：
-   完整C vs B 2.10×；M3（重叠）贡献 1.76×（去重叠 26.3→45.3ms）；M1/M2 在环回下贡献 ≈1.0×
-   ——原因：环回 D2H+H2D 走同一根 PCIe，双流收益受限；M1/M2 的贡献预期在真实跨卡复现
-   （R3 数据已侧面支持：跨卡 C/B 2.22×>环回 2.08×）。CSV: results/ablation_steady_medium.csv。
-   ⏳ 跨卡消融关键行（等 GPU0/1 窗口）
-R5 overlap ratio 三项独立计时。验收：指标入表。
-R6 4 卡矩阵（等全空窗口）+ 监控线程自动提醒。
-R7 commit/push 全部修改（当前 9 文件未提交）。
+【13. 进度与剩余工作（v4 收束：剩余只有「真窗口三项」）】
+五项必做全关：① portable runtime ✓ ② Workload A ✓（含跨卡） ③ Workload B ✓（跨卡）
+④ 基线 A/B/C ✓（语义校订） ⑤ 消融 ✓（R4 环回出数）。
+里程碑：R1 门控+payload ✓（无负延迟，C/A 1.96–2.83× 环回）；R2 跨卡接线 ✓；
+R3 2 卡矩阵 + Workload A 跨卡 ✓（见【0】）；R4 消融 ✓（下）；R5 overlap ratio ✓（下）；
+N 卡控制面 ✓（结构+逻辑验收，见下）。
+R4 ✓ 消融矩阵（run_ablation，8 组合 + CSV）。环回（steady/16KB/32K 任务）：
+   完整C vs B 2.16×；M3 贡献 1.86×；M1/M2 环回下 ≈1.0×（D2H+H2D 同根 PCIe，双流受限；
+   跨卡预期复现，R3 侧面支持：跨卡 C/B 2.22×>环回 2.08×）。CSV: results/ablation_steady_medium.csv。
+   B 基线公平性归因链（防「B 做弱了」质疑）：B(52.6ms, 逐段sync+单流) → ns1-ad0-ov0
+   (45.5ms, 批化但全机制关) = 1.17× 纯批化收益；→ 完整C(24.6ms) 再 1.84× 来自三机制。
+   即 C/B 2.16× 约一半来自批化、一半来自 M1/M2/M3——B 不是稻草人。
+   附带修复：摘要行索引 bug（原 no_m3 取到 ov=1 行 → M3 贡献恒报 1.00×；修复后 1.86×）；
+   tag 改 ns{n}-ad{0,1}-ov{0,1}（原「M1+A+O」的 M1 是 n_streams=1，易与机制 M1 混淆）。
+R5 ✓ overlap ratio 三项独立计时（baselines.cuh run_overlap_ratio；run_ablation 末尾输出+CSV）。
+   环回（GPU0，steady/16KB/32K/tick 0.0005）：ratio=0.400；T_pipe=24.59 T_comm=24.53
+   T_compute=16.45ms——T_comm≈T_pipe（环回通信是绝对瓶颈），ratio 打满理论上限
+   1−T_pipe/(T_comm+T_comp)≈0.40 → 流水本身零损耗；跨卡 T_comm 变长后 ratio 预期更高。
+   口径提醒：三项均含到达门控（开环回放），报数必须带 tick，否则被到达稀疏度稀释。
+   CSV: results/ablation_r5_steady_medium.csv(+_overlap.csv)。
+N 卡控制面 ✓（multigpu.cuh + run_multigpu；结构：每卡执行线程（本地队列+双端窃取+通道矩阵）
+   + host 主线程到达分发；任务带 dest；三模式 A/B/C 对齐单卡语义；
+   C = 本地优先批消费 + 水位批窃取 + 双流流水 + 在途窗口）。
+   环回验收：A/B/C 全完成，C/B 2.19×，C/A 1.15×（无偏斜下 A 的 bulk 优势正常）。
+   逻辑验收 ✓（--virtual N：同物理卡多逻辑 worker，仅验证控制面，无性能意义）：
+   virtual 2（imb）：A imb=0.802 → B 0.065(steals 12062) → C 0.002(steals 61)；
+     C/A 1.40× C/B 2.33×——61 次批窃取 vs 12062 次单任务窃取，批粒度重分配优势量化。
+   virtual 4（imb，thr 0.1/0.25/0.5）：C/A 1.59–1.69×，C/B 3.20–3.44×，C steals 97–105，
+     B steals ~18.5K；thr 放宽 imb 升（0.033→0.124）但 C makespan 在 thr=0.5 最好
+     → 水位阈值非性能敏感（鲁棒性结论）。N=4 无死锁无任务丢失。
+   已修两处死锁：① 空闲路径必须收割在途批次（最后一匹永不收割 → all_done 永假）；
+   ② 根因：ctx 共享 taken_ 在 take_local 与 submit_batch（隔 drain_one 长同步窗）之间
+   被其他线程 clear 覆盖 → 任务消失；改 take_local 按值返回 vector。附修约束 #6 与
+   计算流 H2D 依赖（wait_last_arrival，流级异步不破坏重叠）。
+剩余（真窗口三项，均挂监控 ./watch_gpu_window.sh 4 auto mg，4 卡全空自动跑）：
+   ⏳ W1 跨卡消融关键行（M1/M2 跨卡贡献复现；≥2 卡窗口即可）
+   ⏳ W2 偏斜真实 2/4 卡数字（窃取/再平衡路径真卡验证）
+   ⏳ W3 4 卡矩阵（R6：扩展效率 = N 卡吞吐/单卡吞吐；需全空窗口）
 
 【14. 推荐叙事（冻结）】
 「Shetty 等解决了单 GPU 上可线性化、有进度保证的有界并发队列；但 LLM 稀疏注意力的持续

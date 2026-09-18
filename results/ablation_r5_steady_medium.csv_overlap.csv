@@ -1,0 +1,10 @@
+metric,value
+t_pipe_ms,24.589
+t_comm_alone_ms,24.534
+t_compute_alone_ms,16.451
+overlap_ratio,0.4001
+batches,139
+arrival_span_ms,16.384
+tick_ms,0.000500
+pending_ahead,4
+n_streams,2

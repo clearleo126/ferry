@@ -361,4 +361,143 @@ inline ExecStats run_ferry(int src_dev, int dst_dev,
                        /*overlap=*/true);
 }
 
+// ---- R5：overlap ratio 三项独立计时 ----
+// 口径（实验设计 v3 第 8 节）：ratio = 1 − T_pipe / (T_comm_alone + T_compute_alone)
+//   T_pipe    : 完整重叠流水（直接复用 run_ferry_abl(overlap=true)，与 R4 的
+//               「完整 C」行逐位同源，不重复实现）
+//   T_comm    : 仅通信——同批序列、同到达门控、同在途窗口，但不 launch kernel
+//   T_compute : 仅计算——payload 先预置到 dst（不计时），同批序列/门控/窗口，
+//               但不走通道
+// 三遍共用同一批切分：choose_batch 只依赖 (n, off, payload_bytes) 且确定性，
+// 因此批序列逐批相同，唯一变量是「是否计算 / 是否通信」，到达节奏完全一致。
+// 注意：三项都保留到达门控（开环回放语义），故到达跨度会同时进入分子分母；
+// 报数时必须标注 tick（到达校准），否则 ratio 会被到达稀疏度稀释。
+struct OverlapStats {
+  double t_pipe_ms = 0.0;
+  double t_comm_ms = 0.0;
+  double t_compute_ms = 0.0;
+  double ratio = 0.0;           // 1 − t_pipe/(t_comm+t_compute)
+  size_t batches = 0;
+  double arrival_span_ms = 0.0;
+  int n_streams = 2;
+  size_t pending_ahead = 0;
+};
+
+inline OverlapStats run_overlap_ratio(int src_dev, int dst_dev,
+                                      const std::vector<Task>& tasks,
+                                      int inner_scale,
+                                      const AdaptiveBatchPolicy& pol,
+                                      double tick_ms = 0.001,
+                                      size_t pending_ahead = 4,
+                                      int n_streams = 2) {
+  OverlapStats o;
+  const size_t n = tasks.size();
+  if (n == 0) return o;
+  o.n_streams = n_streams;
+  o.pending_ahead = pending_ahead;
+
+  // T_pipe：复用 C 执行器（保证与 R4 的完整 C 行一致）
+  {
+    ExecStats st = run_ferry_abl(src_dev, dst_dev, tasks, inner_scale, pol,
+                                 tick_ms, pending_ahead, n_streams,
+                                 /*adaptive=*/true, /*overlap=*/true);
+    o.t_pipe_ms = st.makespan_ms;
+    o.arrival_span_ms = st.arrival_span_ms;
+  }
+
+  ExecCtx c = make_ctx(src_dev, dst_dev, tasks, tick_ms);
+  const size_t slot_bytes = static_cast<size_t>(pol.max_mb * (1 << 20));
+
+  // 批序列（两遍共用，确定性）
+  std::vector<size_t> bounds;
+  for (size_t off = 0; off < n;) {
+    const size_t b = choose_batch(pol, n, off, c.payload_bytes);
+    bounds.push_back(b);
+    off += b;
+  }
+  o.batches = bounds.size();
+
+  // ---- T_comm：仅通信 ----
+  {
+    // ring 深度必须 >= pending_ahead + 2：evq 持有在途批的到达 event，
+    // 只有 ring 比窗口深，slot 被复用（event 被 re-record）前该 event
+    // 必然已出队，否则会等错批（与 run_ferry_abl 同一约束）
+    HostStagedChannel ch(src_dev, dst_dev, (int)(pending_ahead + 2),
+                         slot_bytes, n_streams);
+    std::vector<cudaEvent_t> evq;
+    HostTimer ht;
+    ht.tick();
+    const double t0 = ht.toc_ms();
+    CUDA_CHECK(cudaSetDevice(src_dev));  // 到达 event 在 src 上 record
+    size_t off = 0;
+    for (size_t b : bounds) {
+      host_wait_arrival(ht, t0, c.arrive_ms[off + b - 1]);
+      while (evq.size() >= pending_ahead) {
+        CUDA_CHECK(cudaEventSynchronize(evq.front()));
+        evq.erase(evq.begin());
+      }
+      ch.submit(c.d_payload + off * c.payload_bytes, b * c.payload_bytes,
+                reinterpret_cast<char*>(c.d_in) + off * c.payload_bytes);
+      evq.push_back(ch.last_arrival_event());  // 借用：该批 H2D 完成 event
+      off += b;
+    }
+    for (auto e : evq) CUDA_CHECK(cudaEventSynchronize(e));
+    o.t_comm_ms = ht.toc_ms() - t0;
+  }
+
+  // ---- T_compute：仅计算 ----
+  {
+    // 预置：payload 全量搬到 dst（不计时）。跨卡无 P2P → 必须经 host-staged
+    // 通道，不能 D2D；逐 slot 段提交，避免 submit 的超长递归拆分
+    {
+      HostStagedChannel ch(src_dev, dst_dev, (int)(pending_ahead + 2),
+                           slot_bytes, n_streams);
+      const size_t pool = n * c.payload_bytes;
+      for (size_t sent = 0; sent < pool;) {
+        const size_t seg = std::min(slot_bytes, pool - sent);
+        ch.submit(c.d_payload + sent, seg,
+                  reinterpret_cast<char*>(c.d_in) + sent);
+        sent += seg;
+      }
+      ch.sync();
+    }
+    cudaStream_t cs;
+    CUDA_CHECK(cudaSetDevice(dst_dev));
+    CUDA_CHECK(cudaStreamCreate(&cs));
+    std::vector<cudaEvent_t> evq;
+    HostTimer ht;
+    ht.tick();
+    const double t0 = ht.toc_ms();
+    size_t off = 0;
+    for (size_t b : bounds) {
+      host_wait_arrival(ht, t0, c.arrive_ms[off + b - 1]);
+      while (evq.size() >= pending_ahead) {
+        CUDA_CHECK(cudaEventSynchronize(evq.front()));
+        cudaEventDestroy(evq.front());
+        evq.erase(evq.begin());
+      }
+      task_kernel<<<(int)((b + 255) / 256), 256, 0, cs>>>(
+          c.d_in + off * (c.payload_bytes / sizeof(float)),
+          c.d_out + off * (c.payload_bytes / sizeof(float)), b,
+          c.d_work + off, inner_scale);
+      CUDA_CHECK_LAST();
+      cudaEvent_t ev;
+      CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+      CUDA_CHECK(cudaEventRecord(ev, cs));
+      evq.push_back(ev);
+      off += b;
+    }
+    for (auto e : evq) {
+      CUDA_CHECK(cudaEventSynchronize(e));
+      cudaEventDestroy(e);
+    }
+    o.t_compute_ms = ht.toc_ms() - t0;
+    cudaStreamDestroy(cs);
+  }
+
+  o.ratio = 1.0 - o.t_pipe_ms / (o.t_comm_ms + o.t_compute_ms);
+  free_ctx(c);
+  return o;
+}
+
 }  // namespace ferry

@@ -10,21 +10,24 @@
 #   ./watch_gpu_window.sh 2          # 2 卡窗口即触发
 #   ./watch_gpu_window.sh 4 notify   # 4 卡窗口，触发时发桌面通知
 #   ./watch_gpu_window.sh 2 auto     # 触发后自动跑 R3 矩阵（写 results 目录）
+#   ./watch_gpu_window.sh 4 auto mg  # 4 卡真空闲自动跑 N 卡控制面矩阵
 #
 # 后台常驻：
-#   nohup ./watch_gpu_window.sh 2 auto >> watch_gpu.log 2>&1 &
+#   nohup ./watch_gpu_window.sh 4 auto mg >> watch_gpu.log 2>&1 &
 #   tail -f watch_gpu.log
 
 set -u
 
 THRESHOLD="${1:-3}"
 MODE="${2:-notify}"   # notify | auto
+JOB="${3:-r3}"        # r3 | mg（N 卡控制面矩阵）
 INTERVAL=120          # 轮询间隔（秒），避免频繁打扰 nvidia-smi
 
 cd "$(dirname "$0")"
 BUILD_DIR="build"
-RESULT_DIR="results/r3_$(date +%Y%m%d_%H%M%S)"
-TRIGGER_FLAG="/tmp/ferry_window_triggered_$$"
+STAMP="$(date +%Y%m%d_%H%M%S)"
+RESULT_DIR="results/${JOB}_$(date +%Y%m%d_%H%M%S)"
+TRIGGER_FLAG="/tmp/ferry_window_triggered_${STAMP}"
 
 echo "[watch] start $(date)  threshold=${THRESHOLD} mode=${MODE} interval=${INTERVAL}s"
 
@@ -35,13 +38,14 @@ free_gpus() {
 
 trigger_r3() {
   local gpus="$1"
+  local ndev="$2"
   echo ""
   echo "=========================================="
-  echo "[watch] 窗口开启! $(date)"
+  echo "[watch] 窗口开启! $(date)  job=${JOB}"
   echo "[watch] 空闲 GPU: $gpus"
   echo "=========================================="
   if command -v notify-send >/dev/null 2>&1; then
-    notify-send "Ferry R3 窗口开启" "空闲 GPU: $gpus" 2>/dev/null || true
+    notify-send "Ferry ${JOB} 窗口开启" "空闲 GPU: $gpus" 2>/dev/null || true
   fi
   # 终端响铃提醒（大多数终端支持）
   printf '\a'
@@ -49,19 +53,53 @@ trigger_r3() {
   if [ "$MODE" != "auto" ]; then
     echo "[watch] mode=notify，不自动执行。手动跑："
     echo "  cd $(pwd)/$BUILD_DIR"
-    echo "  ./run_synthetic --all --src 0 --dst 1 --tasks 65536 --tick 0.0005"
+    echo "  ./run_multigpu --gpus $gpus --tasks 32768 --tick 0.0005"
     return 0
   fi
 
-  # ---- auto 模式：R3 矩阵 ----
-  mkdir -p "$RESULT_DIR"
-  echo "[watch] auto 模式：R3 矩阵开始，结果 -> $RESULT_DIR"
-
-  # 读空闲卡列表
+  # 读空闲卡列表（gpus 为空格分隔字符串）
   mapfile -t GPUS <<< "$gpus"
-  local ndev=${#GPUS[@]}
   local dev_csv
   dev_csv=$(IFS=,; echo "${GPUS[*]}")
+
+  # ---- mg 作业：N 卡控制面矩阵（R6 的前半）----
+  if [ "$JOB" = "mg" ]; then
+    mkdir -p "$RESULT_DIR"
+    echo "[watch] auto 模式：mg 矩阵开始，结果 -> $RESULT_DIR"
+    # 1) 拓扑复测（确认通道状态与 knee 未漂移）
+    echo "[watch] step1: probe 拓扑+带宽扫描"
+    CUDA_VISIBLE_DEVICES="$dev_csv" "$BUILD_DIR/probe" --bw \
+      --csv "$RESULT_DIR/probe_bw.csv" > "$RESULT_DIR/probe.log" 2>&1
+    echo "[watch] step1 done: $RESULT_DIR/probe_bw.csv"
+
+    # 2) N 卡控制面：全模式 × 到达 × 偏斜（sparsity 取 medium 单档，控制时长）
+    local npairs=0
+    for arr in steady bursty; do
+      for skew in balanced imbalanced; do
+        npairs=$((npairs+1))
+        echo "[watch] step2.$npairs: N卡控制面 $arr/$skew (gpus=$dev_csv)"
+        CUDA_VISIBLE_DEVICES="$dev_csv" "$BUILD_DIR/run_multigpu" \
+          --gpus "$dev_csv" --arrival "$arr" --skew "$skew" \
+          --tasks 32768 --tick 0.0005 --inner 2 --sparsity 16KB \
+          > "$RESULT_DIR/mg_${arr}_${skew}.log" 2>&1
+        echo "[watch]   $arr/$skew done"
+      done
+    done
+    # 3) Workload A 跨卡（src=首空闲卡, dst=次空闲卡）
+    echo "[watch] step3: Workload A 跨卡 ${GPUS[0]} -> ${GPUS[1]}"
+    for arr in steady bursty mixed; do
+      CUDA_VISIBLE_DEVICES="$dev_csv" "$BUILD_DIR/run_missstream" \
+        --arrival "$arr" --steps 48 --attn 8 \
+        > "$RESULT_DIR/wla_${arr}.log" 2>&1
+      echo "[watch]   wlA $arr done"
+    done
+    echo "[watch] mg 矩阵完成: $RESULT_DIR ($(date))"
+    return 0
+  fi
+
+  # ---- r3 作业（默认）：R3 两卡矩阵 ----
+  mkdir -p "$RESULT_DIR"
+  echo "[watch] auto 模式：R3 矩阵开始，结果 -> $RESULT_DIR"
 
   # 1) 拓扑复测（确认通道状态与 knee 未漂移）
   echo "[watch] step1: probe 拓扑+带宽扫描"
@@ -112,7 +150,7 @@ while true; do
   n=${#GPUS_NOW[@]}
   ts=$(date +%H:%M:%S)
   if [ "$n" -ge "$THRESHOLD" ]; then
-    trigger_r3 "${GPUS_NOW[*]}"
+    trigger_r3 "${GPUS_NOW[*]}" "$n"
     if [ "$MODE" = "auto" ]; then
       echo "[watch] auto 轮结束，继续监控下一窗口（防止长占，30 分钟冷却）"
       sleep 1800

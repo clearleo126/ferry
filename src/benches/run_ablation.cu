@@ -113,8 +113,8 @@ int main(int argc, char** argv) {
                                      tick_ms, /*pending_ahead=*/4, ns,
                                      ad != 0, ov != 0);
         char tag[32];
-        std::snprintf(tag, sizeof(tag), "M%d%s%s", ns, ad ? "+A" : "-A",
-                      ov ? "+O" : "-O");
+        // tag 用开关名而非 Mx：M1/M2 是机制名，容易被误读成「机制 1/2 开」
+        std::snprintf(tag, sizeof(tag), "ns%d-ad%d-ov%d", ns, ad, ov);
         AblRow r{ /*tag*/ "", ns, ad, ov, st };
         static char tag_store[8][32];
         std::snprintf(tag_store[rows.size() % 8], sizeof(tag_store[0]), "%s",
@@ -135,13 +135,50 @@ int main(int argc, char** argv) {
   }
 
   // 关键比值行（写入 stdout 摘要）
-  const AblRow* full = &rows[7];  // ns=2 ad=1 ov=1（完整 C）
-  const AblRow* no_m1 = &rows[3];  // ns=1 ad=1 ov=1
-  const AblRow* no_m3 = &rows[5];  // ns=2 ad=1 ov=0
-  std::printf("  => M1 贡献: %.2fx  M3 贡献: %.2fx  完整C vs B: %.2fx\n",
-              no_m1->st.makespan_ms / full->st.makespan_ms,
-              no_m3->st.makespan_ms / full->st.makespan_ms,
-              b.makespan_ms / full->st.makespan_ms);
+  // 索引 = ns_idx*4 + ad_idx*2 + ov_idx（循环顺序 ns{1,2} → ad{0,1} → ov{0,1}）
+  const AblRow* full = &rows[7];   // ns=2 ad=1 ov=1（完整 C）
+  const AblRow* no_m1 = &rows[3];  // ns=1 ad=1 ov=1（去 M1：单流）
+  const AblRow* no_m2 = &rows[5];  // ns=2 ad=0 ov=1（去 M2：固定粒度）
+  const AblRow* no_m3 = &rows[6];  // ns=2 ad=1 ov=0（去 M3：零重叠）
+  std::printf(
+      "  => M1 贡献: %.2fx  M2 贡献: %.2fx  M3 贡献: %.2fx  完整C vs B: %.2fx\n",
+      no_m1->st.makespan_ms / full->st.makespan_ms,
+      no_m2->st.makespan_ms / full->st.makespan_ms,
+      no_m3->st.makespan_ms / full->st.makespan_ms,
+      b.makespan_ms / full->st.makespan_ms);
+
+  // ---- R5：overlap ratio 三项独立计时（实验设计 v3 第 8 节）----
+  // ratio = 1 − T_pipe/(T_comm_alone + T_compute_alone)
+  // 报数必须带 tick（到达校准），否则 ratio 被到达稀疏度稀释（见口径注释）
+  {
+    OverlapStats ov = run_overlap_ratio(src_dev, dst_dev, tasks, inner_scale,
+                                        pol, tick_ms, /*pending_ahead=*/4,
+                                        /*n_streams=*/2);
+    std::printf(
+        "  => overlap ratio %.3f  (T_pipe=%.2f  T_comm_alone=%.2f  "
+        "T_compute_alone=%.2f ms; batches=%zu arrival_span=%.2fms tick=%.4f)\n",
+        ov.ratio, ov.t_pipe_ms, ov.t_comm_ms, ov.t_compute_ms, ov.batches,
+        ov.arrival_span_ms, tick_ms);
+    std::fflush(stdout);
+    if (csv_path) {
+      const std::string op = std::string(csv_path) + "_overlap.csv";
+      if (FILE* f = std::fopen(op.c_str(), "w")) {
+        std::fprintf(f, "metric,value\n");
+        std::fprintf(f, "t_pipe_ms,%.3f\n", ov.t_pipe_ms);
+        std::fprintf(f, "t_comm_alone_ms,%.3f\n", ov.t_comm_ms);
+        std::fprintf(f, "t_compute_alone_ms,%.3f\n", ov.t_compute_ms);
+        std::fprintf(f, "overlap_ratio,%.4f\n", ov.ratio);
+        std::fprintf(f, "batches,%zu\n", ov.batches);
+        std::fprintf(f, "arrival_span_ms,%.3f\n", ov.arrival_span_ms);
+        std::fprintf(f, "tick_ms,%.6f\n", tick_ms);
+        std::fprintf(f, "pending_ahead,4\n");
+        std::fprintf(f, "n_streams,2\n");
+        std::fclose(f);
+        std::printf("  => overlap CSV: %s\n", op.c_str());
+      }
+    }
+  }
+
   if (csv_path) std::fclose(out);
   return 0;
 }

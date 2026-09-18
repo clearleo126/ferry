@@ -49,11 +49,11 @@ void run_scenario(const ferry::MissSpec& sp,
       tr.miss_bytes / 1048576.0, mb_per_token);
   std::fflush(stdout);
 
-  ferry::WlAStats a = ferry::run_miss_workload(0, sp, tr, 0, pol, attn_iters);
+  ferry::WlAStats a = ferry::run_miss_workload(0, 1, sp, tr, 0, pol, attn_iters);
   print_wla("baseline-A", a);
-  ferry::WlAStats b = ferry::run_miss_workload(0, sp, tr, 1, pol, attn_iters);
+  ferry::WlAStats b = ferry::run_miss_workload(0, 1, sp, tr, 1, pol, attn_iters);
   print_wla("baseline-B", b);
-  ferry::WlAStats c = ferry::run_miss_workload(0, sp, tr, 2, pol, attn_iters);
+  ferry::WlAStats c = ferry::run_miss_workload(0, 1, sp, tr, 2, pol, attn_iters);
   print_wla("ferry-C", c);
 
   const double sp_b = b.makespan_ms / c.makespan_ms;

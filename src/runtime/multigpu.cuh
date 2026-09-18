@@ -169,19 +169,21 @@ class MultiGpuCtx {
     return take;
   }
 
-  // 拿本卡下一批待执行任务（队头 batch 个；到达门控由调用方在 dispatch 侧保证：
-  // 队列里只会有已到达的任务）
-  size_t take_local(int g, size_t batch) {
+  // 拿本卡下一批待执行任务（队头 batch 个）。
+  // 返回真实 vector（按值拷出）——不能用共享 taken_：C 模式下其他线程在
+  // 本线程 submit 前调 take_local 会 clear() 覆盖（submit_batch 前的
+  // drain_one 同步窗口极长，竞态曾致 C 模式任务"消失"死锁）。
+  std::vector<size_t> take_local(int g, size_t batch) {
     std::unique_lock<std::mutex> lk(mtx_);
     size_t k = std::min(batch, local_[g].size());
-    taken_.clear();
+    std::vector<size_t> taken;
+    taken.reserve(k);
     for (size_t j = 0; j < k; ++j) {
-      taken_.push_back(local_[g].front());
+      taken.push_back(local_[g].front());
       local_[g].pop_front();
     }
-    return k;
+    return taken;
   }
-  const std::vector<size_t>& last_taken() const { return taken_; }
 
   size_t occ(int g) {
     std::unique_lock<std::mutex> lk(mtx_);
@@ -241,7 +243,6 @@ class MultiGpuCtx {
   std::vector<int*> d_work_;
   std::vector<std::unique_ptr<HostStagedChannel>> chs_;
   std::vector<TaskDeque> local_;
-  std::vector<size_t> taken_;
   std::mutex mtx_;
   std::condition_variable cv_;
   std::atomic<size_t> next_arrive_{0};
@@ -287,9 +288,14 @@ inline MultiStats run_multigpu(const std::vector<int>& devices,
   // 主线程：到达分发循环（独立线程）
   std::atomic<bool> stop_disp{false};
   std::thread disp([&] {
+    uint64_t beats = 0;
     while (!stop_disp.load()) {
       ctx.dispatch(ht.toc_ms() - t0);
       if (ctx.all_arrived()) break;
+      if (++beats % 1000 == 0) {
+        std::fprintf(stderr, "[disp] arrived=%zu/%zu t=%.1fms\n",
+                     ctx.all_arrived() ? NT : (size_t)0, NT, ht.toc_ms() - t0);
+      }
       std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
   });
@@ -334,15 +340,13 @@ inline MultiStats run_multigpu(const std::vector<int>& devices,
                      ctx.payload_bytes(),
                      ctx.in_buf(g) + id * ctx.payload_bytes());
         }
-        if (seq) {
-          ch->sync();
-          CUDA_CHECK(cudaSetDevice(devices[g]));
-        }
+        // ch.submit 内部把上下文切到了 src（pool）→ 切回本卡再起 kernel
+        //（v3 约束 #6：submit 后设备上下文残留 src）
+        CUDA_CHECK(cudaSetDevice(devices[g]));
+        // 计算流等待最后一段 H2D 到达（copy_out_ 同流保序 → 覆盖整批）；
+        // 流级异步依赖，不破坏 C 模式重叠
+        ch->wait_last_arrival(cs);
         // 计算：kernel 逐任务段（work[id] 已驻本卡）
-        // 一次 kernel 扫整批（任务在 ids 数组里，kernel 按 work 索引）
-        // 简化：对每任务独立 launch 会开销大 → 合并为一次 kernel：
-        // 用密集映射：ids -> 临时数组放全局内存（省略：直接逐任务 launch，
-        // inner_scale 大时 launch 开销可忽略）
         for (size_t id : ids) {
           const size_t nfloat = ctx.payload_bytes() / sizeof(float);
           task_kernel_mg<<<(int)((nfloat + 255) / 256), 256, 0, cs>>>(
@@ -379,25 +383,23 @@ inline MultiStats run_multigpu(const std::vector<int>& devices,
         std::vector<size_t> mine;
         while (true) {
           ctx.wait_arrival(ht.toc_ms() - t0, g);
-          size_t got = ctx.take_local(g, SIZE_MAX);
-          for (size_t id : ctx.last_taken()) mine.push_back(id);
-          if (got == 0 && ctx.all_arrived()) break;
-          if (ctx.all_arrived()) {
-            // 再取一把（可能还有残留在队列）
-            size_t more;
-            while ((more = ctx.take_local(g, SIZE_MAX)) > 0) {
-              for (size_t id : ctx.last_taken()) mine.push_back(id);
-            }
-            break;
+          std::vector<size_t> got = ctx.take_local(g, SIZE_MAX);
+          mine.insert(mine.end(), got.begin(), got.end());
+          if (ctx.all_arrived() && got.empty()) {
+            // 再确认一把（防最后一批推入与 all_arrived 之间的窗口）
+            std::vector<size_t> more = ctx.take_local(g, SIZE_MAX);
+            mine.insert(mine.end(), more.begin(), more.end());
+            if (more.empty()) break;
           }
         }
         submit_batch(mine, /*seq=*/true);
       } else if (mode == 1) {
         // B：动态逐任务。本地空 → 从最忙卡借 1 个（单任务迁移+sync）。
+        uint64_t idle_iters = 0;
         while (true) {
           if (ctx.all_done()) break;
-          size_t k = ctx.take_local(g, 1);
-          if (k == 0) {
+          std::vector<size_t> ids = ctx.take_local(g, 1);
+          if (ids.empty()) {
             // 本地空：偷 1 个
             size_t got = ctx.steal(g, 1);
             if (got == 0) {
@@ -406,53 +408,66 @@ inline MultiStats run_multigpu(const std::vector<int>& devices,
                 continue;
               }
               // 全到达且本地与可偷源都空 → 可能别人在做：稍等再试
+              if (++idle_iters % 50000 == 0) {
+                std::fprintf(stderr,
+                             "[B] g=%d idle heartbeats=%llu completed=%zu "
+                             "occ(g)=%zu\n",
+                             g, (unsigned long long)idle_iters,
+                             ctx.all_done() ? ctx.n_tasks() : (size_t)0,
+                             ctx.occ(g));
+              }
               std::this_thread::sleep_for(std::chrono::microseconds(200));
               continue;
             }
-            k = ctx.take_local(g, 1);
+            ids = ctx.take_local(g, 1);
             steals.fetch_add(1);
-            if (k == 0) continue;
+            if (ids.empty()) continue;
           }
-          std::vector<size_t> ids = ctx.last_taken();
           submit_batch(ids, /*seq=*/true);
         }
       } else {
         // C：Ferry。本地优先批消费 + 水位触发批窃取 + 流水重叠。
         const size_t thr = (size_t)(steal_threshold * 64);
+        uint64_t idle_iters = 0;
         while (true) {
           if (ctx.all_done()) break;
-          size_t occ = ctx.occ(g);
           // 批粒度：自适应（按剩余总量）
           const double pend_mb =
               (double)(NT - 0) * (double)ctx.payload_bytes() / (1 << 20);
           const double gmb = pol.choose_mb(pend_mb);
           size_t batch = std::max<size_t>(
               (size_t)(gmb * (1 << 20) / ctx.payload_bytes()), 16);
-          size_t k = ctx.take_local(g, batch);
-          if (k == 0) {
+          std::vector<size_t> ids = ctx.take_local(g, batch);
+          if (ids.empty()) {
             // 本地空：水位=0 < 阈值 → 批窃取
             size_t got = ctx.steal(g, batch);
             if (got > 0) {
               steals.fetch_add(1);
-              k = ctx.take_local(g, batch);
+              ids = ctx.take_local(g, batch);
             }
-            if (k == 0) {
+            if (ids.empty()) {
               // 无任务可做：收割在途批次（防最后一匹永不收割 → 死锁）
               if (inflight > 0) drain_one();
               if (!ctx.all_arrived()) {
                 ctx.wait_arrival(ht.toc_ms() - t0, g);
               } else {
+                if (++idle_iters % 50000 == 0) {
+                  std::fprintf(stderr,
+                               "[C] g=%d idle heartbeats=%llu occ(g)=%zu\n",
+                               g, (unsigned long long)idle_iters, ctx.occ(g));
+                }
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
               }
               continue;
             }
-          } else if (occ < thr) {
-            // 水位低于阈值：也预窃一批补充
+          }
+          // 水位低：预窃一批补充（不影响本批 ids）
+          if (ctx.occ(g) < thr) {
             if (ctx.steal(g, batch) > 0) steals.fetch_add(1);
           }
           // 在途窗口满 → 先收最早一批
           while (inflight >= pending_ahead) drain_one();
-          submit_batch(ctx.last_taken(), /*seq=*/false);
+          submit_batch(ids, /*seq=*/false);
         }
         // 收尾：收割在途
         while (inflight > 0) drain_one();

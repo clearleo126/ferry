@@ -44,6 +44,7 @@ int main(int argc, char** argv) {
   double tick_ms = 0.0005;
   double steal_threshold = 0.25;
   std::string gpus = "0";  // 逗号分隔设备号
+  int virtual_n = 0;       // >0 时：单物理卡模拟 N 个逻辑 worker（验证窃取逻辑）
   bool run_all = true;
 
   for (int i = 1; i < argc; ++i) {
@@ -57,6 +58,7 @@ int main(int argc, char** argv) {
     if (std::strcmp(argv[i], "--steal-thr") == 0)
       steal_threshold = std::atof(next());
     if (std::strcmp(argv[i], "--gpus") == 0) gpus = next();
+    if (std::strcmp(argv[i], "--virtual") == 0) virtual_n = std::atoi(next());
   }
 
   std::vector<int> devices;
@@ -68,6 +70,12 @@ int main(int argc, char** argv) {
       devices.push_back(std::atoi(tok));
     }
   }
+  // 虚拟 N worker：同一物理卡重复 N 次（通道自动环回，窃取/水位逻辑完整）
+  // 仅验证控制面逻辑，性能数字无意义（标注 VIRTUAL）
+  if (virtual_n > 1) {
+    const int phys = devices.front();
+    devices.assign(virtual_n, phys);
+  }
   spec.num_gpus = (int)devices.size();
 
   AdaptiveBatchPolicy pol;
@@ -75,8 +83,9 @@ int main(int argc, char** argv) {
   pol.max_mb = cfg.batch_max_mb;
   pol.target_batches = 8.0;
 
-  std::printf("[multigpu] gpus=%s arrival=%s skew=%s tasks=%llu tick=%.4f "
+  std::printf("[multigpu%s] gpus=%s arrival=%s skew=%s tasks=%llu tick=%.4f "
               "steal_thr=%.2f\n",
+              virtual_n > 1 ? " VIRTUAL(逻辑worker,无性能意义)" : "",
               gpus.c_str(), spec.arrival.c_str(), spec.load_skew.c_str(),
               (unsigned long long)spec.total, tick_ms, steal_threshold);
   auto tasks = generate_tasks(spec);
