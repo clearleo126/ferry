@@ -1,15 +1,20 @@
 // 合成稀疏任务流生成器（Workload B，对应 实验设计.txt 第十节-B）
-// 三个可控维度（实验矩阵输入）：
-//   arrival: steady | bursty | skewed
+// 四个可控维度（实验矩阵输入）：
+//   arrival: steady | bursty | skewed | trace
 //     steady : 均匀到达（泊松近似，指数间隔）
 //     bursty : 指数间隔 + 周期性突发（每 burst_period 个任务集中一次大到达）
 //     skewed : 帕累托间隔（80/20 长尾，模拟真实稀疏负载的偏斜到达）
+//     trace  : 真实生产到达（Mooncake FAST'25 trace，经 tools/trace_to_arrivals.py
+//              归一化为 arrive_ticks csv；行数须 >= 任务总数，多余忽略。
+//              环境变量 FERRY_TRACE_CSV 指定路径，默认 data/arxiv_arrivals.csv）
 //   sparsity: 任务负载字节量级别（low/medium/high -> 单任务数据量）
 //   skew    : 任务计算量偏斜（balanced / imbalanced -> 计算迭代次数分布）
 #pragma once
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <string>
 #include <vector>
@@ -27,7 +32,7 @@ struct Task {
 
 // 到达模式参数
 struct ArrivalSpec {
-  std::string arrival = "steady";    // steady|bursty|skewed
+  std::string arrival = "steady";    // steady|bursty|skewed|trace
   std::string sparsity = "medium";   // low|medium|high
   std::string load_skew = "balanced";// balanced|imbalanced
   uint64_t total = 1 << 16;          // 任务总数
@@ -42,12 +47,47 @@ struct ArrivalSpec {
   }
 };
 
+// 读 trace 归一化到达序列（arrive_ticks csv；每行一个 double，首行表头）
+// 返回升序数组；失败返回空（调用方报错退出）
+inline std::vector<double> load_trace_arrivals(const std::string& path) {
+  std::vector<double> out;
+  FILE* f = std::fopen(path.c_str(), "r");
+  if (!f) return out;
+  char line[64];
+  bool header = true;
+  while (std::fgets(line, sizeof(line), f)) {
+    if (header) { header = false; continue; }  // "arrive_ticks"
+    char* end = nullptr;
+    const double v = std::strtod(line, &end);
+    if (end && end != line) out.push_back(v);
+  }
+  std::fclose(f);
+  return out;
+}
+
 // 生成任务流（确定种子，可复现）
 inline std::vector<Task> generate_tasks(const ArrivalSpec& spec,
                                         uint64_t seed = 42) {
   std::mt19937_64 rng(seed);
   std::vector<Task> tasks(spec.total);
   const size_t payload = spec.payload_bytes();
+
+  // trace 模式：真实到达序列（不足时报错——宁可失败不可静默改分布）
+  std::vector<double> trace_arr;
+  if (spec.arrival == "trace") {
+    const char* env = std::getenv("FERRY_TRACE_CSV");
+    const std::string path = env && *env ? env : "data/arxiv_arrivals.csv";
+    trace_arr = load_trace_arrivals(path);
+    if (trace_arr.size() < spec.total) {
+      std::fprintf(stderr,
+                   "[generate_tasks] trace csv %s 只有 %zu 行 < 任务数 %llu；"
+                   "先用 tools/trace_to_arrivals.py --tasks %llu 重新生成\n",
+                   path.c_str(), trace_arr.size(),
+                   (unsigned long long)spec.total,
+                   (unsigned long long)spec.total);
+      std::exit(2);
+    }
+  }
 
   // 计算量：balanced 均匀 100~200；imbalanced 帕累托（80% 轻 20% 重）
   std::uniform_int_distribution<int> uni_work(100, 200);
@@ -78,7 +118,9 @@ inline std::vector<Task> generate_tasks(const ArrivalSpec& spec,
       tk.work = uni_work(rng);
     }
 
-    if (spec.arrival == "steady") {
+    if (spec.arrival == "trace") {
+      tk.arrive_t = trace_arr[i];  // 真实序列（已排序）
+    } else if (spec.arrival == "steady") {
       t += 1.0;  // 每 tick 一个任务
     } else if (spec.arrival == "bursty") {
       if (i % burst_period == 0) {
@@ -90,19 +132,21 @@ inline std::vector<Task> generate_tasks(const ArrivalSpec& spec,
       t += pareto_gap(rng) * 2.0;
     }
     tk.arrive_t = t;
+  }
 
-    // 目标卡：偏斜到达 → 80% 落在 rng 前 20% 的卡上
+  // 目标卡：偏斜到达 → 80% 落在 rng 前 20% 的卡上（与到达内容解耦，单独循环）
+  for (uint64_t i = 0; i < spec.total; ++i) {
     if (dest_skew && spec.num_gpus > 1) {
       const double u = (double)(rng() % 1000) / 1000.0;
       if (u < 0.8) {
         // 落去前 1/5 的卡（至少 1 张）
         const int hot = std::max(1, spec.num_gpus / 5);
-        tk.dest = (int)(rng() % (uint64_t)hot);
+        tasks[i].dest = (int)(rng() % (uint64_t)hot);
       } else {
-        tk.dest = (int)(rng() % (uint64_t)spec.num_gpus);
+        tasks[i].dest = (int)(rng() % (uint64_t)spec.num_gpus);
       }
     } else {
-      tk.dest = (int)(rr % (uint64_t)std::max(1, spec.num_gpus));
+      tasks[i].dest = (int)(rr % (uint64_t)std::max(1, spec.num_gpus));
       ++rr;
     }
   }

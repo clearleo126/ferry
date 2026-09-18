@@ -1,2 +1,4 @@
 build/
 .trae/
+data/*.jsonl
+watch_gpu*.log
