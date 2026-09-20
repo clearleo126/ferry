@@ -141,11 +141,33 @@ int main(int argc, char** argv) {
   const AblRow* no_m2 = &rows[5];  // ns=2 ad=0 ov=1（去 M2：固定粒度）
   const AblRow* no_m3 = &rows[6];  // ns=2 ad=1 ov=0（去 M3：零重叠）
   std::printf(
-      "  => M1 贡献: %.2fx  M2 贡献: %.2fx  M3 贡献: %.2fx  完整C vs B: %.2fx\n",
+      "  => M1(n_streams) 贡献: %.2fx  M2 贡献: %.2fx  M3 贡献: %.2fx  "
+      "完整C vs B: %.2fx\n",
       no_m1->st.makespan_ms / full->st.makespan_ms,
       no_m2->st.makespan_ms / full->st.makespan_ms,
       no_m3->st.makespan_ms / full->st.makespan_ms,
       b.makespan_ms / full->st.makespan_ms);
+
+  // ---- M1 正确操作化：P1 单流交替协议（去"独立 H2D 流的分向重叠"）----
+  // n_streams 开关测不到 M1（channel 的 H2D 恒为独立流）；真正的去 M1 =
+  // D2H/H2D 在同一流内严格交替。跑 ad=1 的 ov{0,1} 两行与上面同列对照。
+  {
+    ExecStats p1_ov1 = run_ferry_abl(src_dev, dst_dev, tasks, inner_scale, pol,
+                                     tick_ms, /*pending_ahead=*/4, 1, true,
+                                     /*overlap=*/true, /*m1_p1=*/true);
+    ExecStats p1_ov0 = run_ferry_abl(src_dev, dst_dev, tasks, inner_scale, pol,
+                                     tick_ms, /*pending_ahead=*/4, 1, true,
+                                     /*overlap=*/false, /*m1_p1=*/true);
+    std::printf(
+        "  => M1(P1 单流交替,去分向重叠) 贡献: %.2fx  "
+        "(P1+ov1 %.2fms vs channel+ov1 %.2fms；P1+ov0 %.2fms)\n",
+        p1_ov1.makespan_ms / full->st.makespan_ms, p1_ov1.makespan_ms,
+        full->st.makespan_ms, p1_ov0.makespan_ms);
+    csv_escape_print(out, AblRow{"p1-ad1-ov1", 1, 1, 1, p1_ov1});
+    csv_escape_print(out, AblRow{"p1-ad1-ov0", 1, 1, 0, p1_ov0});
+    if (csv_path) std::fflush(out);
+    std::fflush(stdout);
+  }
 
   // ---- R5：overlap ratio 三项独立计时（实验设计 v3 第 8 节）----
   // ratio = 1 − T_pipe/(T_comm_alone + T_compute_alone)

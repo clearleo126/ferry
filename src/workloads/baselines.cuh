@@ -242,17 +242,22 @@ inline ExecStats run_baseline_b(int src_dev, int dst_dev,
   return st;
 }
 
-// ---- 消融版 C 执行器（R4）：三机制开关参数化 ----
-//   n_streams : 1 = 去 M1（单流，无通信-通信流水）；2 = 双流流水
+// ---- 消融版 C 执行器（R4/W1）：机制开关参数化 ----
+//   n_streams : D2H 流数（1/2）——注意：**不能隔离 M1**（见下）
 //   adaptive  : false = 去 M2（固定批粒度，粒度 = pol.max_mb）；true = 自适应
 //   overlap   : false = 去 M3（迁移完全结束后才计算，零重叠）；true = event 依赖重叠
+//   m1_p1     : true = 去 M1：改用 P1 单流交替协议（D2H→H2D 同一流内严格交替，
+//               无独立 H2D 流 → 无 D2H/H2D 分向重叠）。这是 M1 的**正确操作化**：
+//               bench_comm 已证 channel(19.15 GB/s) vs p1(10.36 GB/s) = 1.85×，
+//               差异来源是"独立 H2D 流带来的双向重叠"，与 D2H 流数无关
+//               （H2D 本来就单流；n_in_streams=1 时 channel 仍保留独立 H2D 流）
 // 门控语义与 run_ferry 一致（批内最后任务到达）。
 inline ExecStats run_ferry_abl(int src_dev, int dst_dev,
                                const std::vector<Task>& tasks,
                                int inner_scale, const AdaptiveBatchPolicy& pol,
                                double tick_ms = 0.001, size_t pending_ahead = 4,
                                int n_streams = 2, bool adaptive = true,
-                               bool overlap = true) {
+                               bool overlap = true, bool m1_p1 = false) {
   ExecStats st;
   const size_t n = tasks.size();
   ExecCtx c = make_ctx(src_dev, dst_dev, tasks, tick_ms);
@@ -263,6 +268,18 @@ inline ExecStats run_ferry_abl(int src_dev, int dst_dev,
   cudaStream_t cs;
   CUDA_CHECK(cudaSetDevice(dst_dev));
   CUDA_CHECK(cudaStreamCreate(&cs));
+
+  // M1 开关（P1 单流交替协议）所需的单一 pinned 缓冲 + 单一流 + event 队列
+  char* p1_pinned = nullptr;
+  cudaStream_t p1_st = nullptr;
+  cudaEvent_t p1_ev = nullptr;
+  std::vector<cudaEvent_t> p1_evs;
+  if (m1_p1) {
+    CUDA_CHECK(cudaSetDevice(src_dev));
+    CUDA_CHECK(cudaMallocHost(&p1_pinned, slot_bytes));
+    CUDA_CHECK(cudaStreamCreate(&p1_st));
+    CUDA_CHECK(cudaSetDevice(dst_dev));
+  }
 
   std::vector<double> done(n, 0.0);
   std::vector<cudaEvent_t> batch_done;
@@ -292,11 +309,39 @@ inline ExecStats run_ferry_abl(int src_dev, int dst_dev,
         --inflight;
       }
     }
-    ch.submit(c.d_payload + off * c.payload_bytes, batch * c.payload_bytes,
-              reinterpret_cast<char*>(c.d_in) + off * c.payload_bytes);
+    if (m1_p1) {
+      // 去 M1：P1 单流交替（D2H→H2D 同一流严格交替；单一 pinned 缓冲，
+      // H2D(chunk i) 必须先于 D2H(chunk i+1) 完成 → 无分向重叠）
+      CUDA_CHECK(cudaSetDevice(src_dev));
+      const size_t total_b = batch * c.payload_bytes;
+      const size_t base = off * c.payload_bytes;
+      for (size_t sent = 0; sent < total_b;) {
+        const size_t nb = std::min(slot_bytes, total_b - sent);
+        CUDA_CHECK(cudaMemcpyAsync(p1_pinned, c.d_payload + base + sent, nb,
+                                   cudaMemcpyDeviceToHost, p1_st));
+        CUDA_CHECK(cudaMemcpyAsync(
+            reinterpret_cast<char*>(c.d_in) + base + sent, p1_pinned, nb,
+            cudaMemcpyHostToDevice, p1_st));
+        sent += nb;
+      }
+      CUDA_CHECK(cudaSetDevice(dst_dev));
+    } else {
+      ch.submit(c.d_payload + off * c.payload_bytes, batch * c.payload_bytes,
+                reinterpret_cast<char*>(c.d_in) + off * c.payload_bytes);
+    }
     if (overlap) {
       // M3：计算挂 event 依赖，与下一批迁移重叠
-      ch.wait_last_arrival(cs);
+      if (m1_p1) {
+        // event 必须在 src 设备上下文创建并 record 到 src 流（约束 #5）
+        CUDA_CHECK(cudaSetDevice(src_dev));
+        CUDA_CHECK(cudaEventCreateWithFlags(&p1_ev, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(p1_ev, p1_st));
+        p1_evs.push_back(p1_ev);
+        CUDA_CHECK(cudaSetDevice(dst_dev));
+        CUDA_CHECK(cudaStreamWaitEvent(cs, p1_ev, 0));
+      } else {
+        ch.wait_last_arrival(cs);
+      }
       CUDA_CHECK(cudaSetDevice(dst_dev));
       task_kernel<<<(int)((batch + 255) / 256), 256, 0, cs>>>(
           c.d_in + off * (c.payload_bytes / sizeof(float)),
@@ -311,7 +356,11 @@ inline ExecStats run_ferry_abl(int src_dev, int dst_dev,
       ++inflight;
     } else {
       // 去 M3：传输完全结束 → 计算 → 同步（零重叠）
-      ch.sync();
+      if (m1_p1) {
+        CUDA_CHECK(cudaStreamSynchronize(p1_st));
+      } else {
+        ch.sync();  // 内部会把上下文切到 src，必须显式切回（约束 #6）
+      }
       CUDA_CHECK(cudaSetDevice(dst_dev));
       task_kernel<<<(int)((batch + 255) / 256), 256, 0, cs>>>(
           c.d_in + off * (c.payload_bytes / sizeof(float)),
@@ -346,6 +395,14 @@ inline ExecStats run_ferry_abl(int src_dev, int dst_dev,
   st.backlog_max = overlap ? (double)pending_ahead : 0.0;
 
   for (auto e : batch_done) cudaEventDestroy(e);
+  if (m1_p1) {
+    for (auto e : p1_evs) cudaEventDestroy(e);
+    CUDA_CHECK(cudaSetDevice(src_dev));
+    CUDA_CHECK(cudaStreamSynchronize(p1_st));
+    cudaFreeHost(p1_pinned);
+    cudaStreamDestroy(p1_st);
+    CUDA_CHECK(cudaSetDevice(dst_dev));
+  }
   cudaStreamDestroy(cs);
   free_ctx(c);
   return st;
