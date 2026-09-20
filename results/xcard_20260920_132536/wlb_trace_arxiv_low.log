@@ -1,0 +1,6 @@
+[scenario] arrival=trace sparsity=low skew=balanced tasks=32768 tick=0.001ms
+  baseline-A makespan=    16.33ms  tput=  2006185 t/s  p50=    16.33  p99=     16.33  migr=      1  bytes=   128.00MB
+  baseline-B makespan=    19.81ms  tput=  1653993 t/s  p50=     9.98  p99=     19.62  migr=    512  bytes=   128.00MB
+  ferry-C    makespan=     6.19ms  tput=  5295337 t/s  p50=     6.04  p99=      6.16  migr=     43  bytes=   128.00MB
+  => C vs A: 2.64x   C vs B: 3.20x   migrations C/B: 0.0840
+

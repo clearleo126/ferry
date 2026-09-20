@@ -1,0 +1,13 @@
+[ablation] arrival=steady sparsity=medium skew=balanced tasks=32768 tick=0.0005 fixed=1.0MB src=2 dst=3
+  baseline-B     makespan=    53.40ms tput=   613656 p50=   18.72 p99=    36.68 migr=   512
+  ns1-ad0-ov0    makespan=    53.84ms tput=   608661 p50=   18.88 p99=    37.12 migr=   512  (vs B 0.99x)
+  ns1-ad0-ov1    makespan=    27.31ms tput=  1199853 p50=   18.99 p99=    26.86 migr=   512  (vs B 1.96x)
+  ns1-ad1-ov0    makespan=    54.40ms tput=   602401 p50=   19.32 p99=    37.67 migr=   512  (vs B 0.98x)
+  ns1-ad1-ov1    makespan=    27.34ms tput=  1198392 p50=   19.01 p99=    26.86 migr=   512  (vs B 1.95x)
+  ns2-ad0-ov0    makespan=    54.00ms tput=   606789 p50=   19.01 p99=    37.28 migr=   512  (vs B 0.99x)
+  ns2-ad0-ov1    makespan=    27.36ms tput=  1197721 p50=   19.03 p99=    26.89 migr=   512  (vs B 1.95x)
+  ns2-ad1-ov0    makespan=    53.98ms tput=   607006 p50=   18.95 p99=    37.26 migr=   512  (vs B 0.99x)
+  ns2-ad1-ov1    makespan=    27.36ms tput=  1197807 p50=   19.02 p99=    26.88 migr=   512  (vs B 1.95x)
+  => M1 贡献: 1.00x  M2 贡献: 1.00x  M3 贡献: 1.97x  完整C vs B: 1.95x
+  => overlap ratio 0.370  (T_pipe=27.31  T_comm_alone=26.88  T_compute_alone=16.49 ms; batches=512 arrival_span=16.38ms tick=0.0005)
+  => overlap CSV: results/xcard_20260920_132536/ablation_xcard_fixed1.csv_overlap.csv

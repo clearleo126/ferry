@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 # trace_to_arrivals.py: Mooncake FAST'25 生产 trace -> Ferry 归一化到达序列
 #
-# 输入：data/{mooncake_trace,toolagent_trace}.jsonl（真实请求时间戳）
+# 输入：data/{mooncake_trace,toolagent_trace}.jsonl
 # 输出：data/{arxiv,toolagent}_arrivals.csv，每行 "arrive_ticks"（升序，可重复）
 #
+# 【trace 结构实测】两个 trace 均为 **1180 个等间隔时间戳**（arXiv 步长 3053、
+# toolagent 3000 单位），每桶携带 ~20 条请求（范围 1–47 / 1–64）。即发布方按
+# 固定周期聚合采样，而非逐请求时间戳。因此：
+#   - 不能靠"切最密集窗口"取数（7200 单位窗口内只有 2–3 个采样点 → 退化成
+#     几个巨型突发，到达过程信息全丢）
+#   - 正确做法：用**整条 trace 的 1180 个桶**当到达过程，真实的时间密度变化
+#     = 各桶请求量（1..47）的波动
+#
 # 口径（与 实验设计.txt【6】对齐）：
-#   1. 取 trace 中"最密集的窗口"（默认 2 小时 / 7200s）：真实突发密度最高的
-#      连续区间，保证窗口内含真实高峰（而不是均匀切片稀释突发）
-#   2. 每个真实请求按 input_length 加权映射为若干合成任务（请求越长 ->
-#      decode 步数越多 -> 产生的 miss 回填任务越多），任务按请求到达时刻
-#      集中投放（一次请求的 decode 是连续的，任务间隔远小于窗口粒度）
-#   3. 归一化：arrive_ticks = (t - t_min) / max(1, window_s / ticks_per_window)
-#      默认 ticks_per_window=4096（对应默认 tick=0.0005s 时 arrival_span
-#      ≈ 2s，落在【6】要求的 [0.5,2]x service_span 校准带内，可再由
-#      --tick 微调，不改分布形状）
+#   1. 桶 -> 任务量：桶内 sum(input_length) 加权（请求越长 → KV 越大 →
+#      miss 回填任务越多），按权重摊到 --tasks 目标总量；空桶保底 1 个任务
+#      （真实"有请求但极轻"的时段不能被抹成 0）
+#   2. 桶 -> 时刻：线性映射 arrive_t = bucket_idx * ticks_per_span/(nbuckets-1)
+#      ——保留等间隔结构，只压缩绝对时间尺度（标准 trace-replay 做法：
+#      trace 提供相对时间密度，绝对跨度对齐服务跨度）
+#   3. 桶内所有任务同刻到达（发布方聚合粒度即如此，如实保留）
 import argparse
 import collections
 import json
@@ -21,8 +27,9 @@ import os
 import sys
 
 
-def load_timestamps(path: str):
-    ts = []
+def load_buckets(path: str):
+    """按 timestamp 聚合；返回 [(t, sum_input_len, n_req), ...] 升序"""
+    acc = collections.OrderedDict()
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -31,63 +38,66 @@ def load_timestamps(path: str):
             try:
                 r = json.loads(line)
             except json.JSONDecodeError:
-                continue  # trace 已知含 1 行坏 JSON（toolagent:18954）
-            ts.append((float(r["timestamp"]), int(r.get("input_length", 1))))
-    ts.sort()
-    return ts
+                continue  # trace 已知含坏行（toolagent:18954）
+            t = float(r["timestamp"])
+            il = max(1, int(r.get("input_length", 1)))
+            if t in acc:
+                acc[t][0] += il
+                acc[t][1] += 1
+            else:
+                acc[t] = [il, 1]
+    buckets = sorted((t, v[0], v[1]) for t, v in acc.items())
+    return buckets
 
 
-def pick_densest_window(reqs, window_s: float):
-    """滑动窗口找请求密度最高的 [t0, t0+window_s]。
-    双指针：右端扩窗，左端收缩；窗口得分 = 请求量（密度代理）"""
-    n = len(reqs)
-    best_i, best_cnt = 0, 0
-    j = 0
-    for i in range(n):
-        lo = reqs[i][0]
-        while j < n and reqs[j][0] - lo <= window_s:
-            j += 1
-        cnt = j - i
-        if cnt > best_cnt:
-            best_cnt, best_i = cnt, i
-    t0 = reqs[best_i][0]
-    return [r for r in reqs if t0 <= r[0] <= t0 + window_s], t0
+def densest_run(buckets, k):
+    """取请求量之和最大的连续 k 个桶（--buckets 限流时用，保住繁忙时段）"""
+    if k >= len(buckets):
+        return buckets
+    best_i, best_w = 0, -1
+    for i in range(len(buckets) - k + 1):
+        w = sum(b[1] for b in buckets[i:i + k])
+        if w > best_w:
+            best_w, best_i = w, i
+    return buckets[best_i:best_i + k]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trace", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--window-s", type=float, default=7200.0,
-                    help="真实窗口长度（秒），默认 2 小时")
-    ap.add_argument("--ticks-per-window", type=float, default=4096.0,
-                    help="窗口归一化到的 tick 总数（配合 --tick 校准 arrival_span）")
     ap.add_argument("--tasks", type=int, default=32768,
-                    help="目标合成任务总量（按 input_length 加权摊到窗口请求上）")
-    ap.add_argument("--tasks-per-req-cap", type=int, default=4096,
-                    help="单请求最多映射的任务数（防超长请求垄断任务量）")
+                    help="目标合成任务总量（按桶内 input_length 加权摊派）")
+    ap.add_argument("--ticks-per-span", type=float, default=32768.0,
+                    help="整条 trace 归一化到的 tick 跨度（配合 --tick 校准 "
+                         "arrival_span ~ service_span；默认与 steady 模式同量级）")
+    ap.add_argument("--buckets", type=int, default=0,
+                    help="只取最繁忙的 K 个连续桶（0 = 全量 1180 桶）")
+    ap.add_argument("--tasks-per-bucket-cap", type=int, default=4096,
+                    help="单桶最多任务数（防极端桶垄断任务量）")
     args = ap.parse_args()
 
-    reqs = load_timestamps(args.trace)
-    if not reqs:
+    buckets = load_buckets(args.trace)
+    if not buckets:
         sys.exit(f"no valid records in {args.trace}")
-    win, t0 = pick_densest_window(reqs, args.window_s)
+    total_buckets = len(buckets)
+    if args.buckets > 0:
+        buckets = densest_run(buckets, args.buckets)
 
-    # input_length 加权 -> 每请求任务数：总量凑到 --tasks，形状 = 长度分布
-    total_in = sum(max(1, il) for _, il in win)
-    per_req = []
-    for _, il in win:
-        w = max(1, il)
-        k = max(1, min(args.tasks_per_req_cap,
-                       int(round(args.tasks * w / total_in))))
-        per_req.append(k)
+    # 桶内 input_length 加权 -> 任务数
+    total_w = sum(b[1] for b in buckets)
+    per_bucket = []
+    for _, w, _ in buckets:
+        k = max(1, min(args.tasks_per_bucket_cap,
+                       int(round(args.tasks * w / total_w))))
+        per_bucket.append(k)
 
-    scale = args.ticks_per_window / max(1.0, args.window_s)
+    nb = len(buckets)
+    step = args.ticks_per_span / max(1, nb - 1)
     rows = []
-    for (t, _), k in zip(win, per_req):
-        at = (t - t0) * scale
-        for _ in range(k):
-            rows.append(at)
+    for i, k in enumerate(per_bucket):
+        at = i * step
+        rows.extend([at] * k)
     rows.sort()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
@@ -96,16 +106,16 @@ def main():
         for r in rows:
             f.write(f"{r:.6f}\n")
 
-    # 摘要：到达密度（每 128-tick 桶）p50/p99/max，供论文引用
-    bins = collections.Counter(int(r // 128) for r in rows)
-    dens = sorted(bins.values())
+    # 摘要：真实时间密度（桶任务量的中位/极值 -> 突发比），供论文引用
+    pb = sorted(per_bucket)
+    req = sorted(b[2] for b in buckets)
     print(f"{args.trace} -> {args.out}")
-    print(f"  window: [{t0:.0f}s, +{args.window_s:.0f}s] reqs={len(win)} "
-          f"tasks={len(rows)} (tasks/req p50={sorted(per_req)[len(per_req)//2]}, "
-          f"cap={args.tasks_per_req_cap})")
-    print(f"  arrive_ticks: [0, {rows[-1]:.1f}] "
-          f"tasks/128tick: p50={dens[len(dens)//2]} p99={dens[int(0.99*len(dens))]} "
-          f"max={dens[-1]}")
+    print(f"  buckets={nb}/{total_buckets} step={step:.2f}tick "
+          f"tasks={len(rows)} (per-bucket p50={pb[nb//2]} max={pb[-1]})")
+    print(f"  arrive_ticks span=[0, {rows[-1]:.1f}] "
+          f"bucket-burst=max/p50={pb[-1]/max(1,pb[nb//2]):.2f}x")
+    print(f"  real req/bucket: p50={req[nb//2]} max={req[-1]} "
+          f"burst={req[-1]/max(1,req[nb//2]):.2f}x")
 
 
 if __name__ == "__main__":

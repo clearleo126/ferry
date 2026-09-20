@@ -26,9 +26,35 @@ v4 = v3 场景与口径 + R4/R5/虚拟 N 卡控制面实测回填 + 约束 #8（
 ① H4 成立：A 的步末同步在突发/偏斜到达下灾难性劣化，C 优势放大至 8–9.4×——「只报平均
    吞吐会掩盖问题」有直接证据。
 ② M2（批粒度自适应）收益边界清晰：中小总量时段数砍至 0.26；大总量下批已贴近饱和上限，
-   段数比=1.0，收益让渡给 M1（流水）。支撑「M1 报吞吐倍数、M2 报段数/尾延迟」的归因分工。
-跨卡 vs 环回：C/B 从环回 1.44–2.08× 升至跨卡 1.76–2.74×——真实 PCIe 往返下批处理+重叠
-收益更显著（通信越贵，控制面越值钱）。
+   段数比=1.0。**修正（W1）**：原写"收益让渡给 M1（流水）"不成立——大批下 M1 实测 ≈1.0×
+   （单流已饱和，见下）。正确表述：M2 只主张段数/尾延迟，不主张吞吐；大批下吞吐收益来自
+   批化本身与 M3 重叠，非 M1。
+跨卡 vs 环回：R3 阶段 C/B 从环回 1.44–2.08× 升至跨卡 1.76–2.74×，曾据此推断"真实 PCIe 往返
+收益更显著"。**W1 直接测量否定该推断**：跨卡消融（M1 0.99× M2 1.00× M3 1.83×）与环回
+（0.99/1.00/1.86）逐项相同，T_comm 25.18 vs 24.53ms——两条路径都走同一 host-pinned 通道
+（无 P2P），跨卡并不更贵。先前差异应归因于 R3 与环回的配置不同（任务量/payload），非拓扑。
+主张应收紧为：**收益来自批化+重叠本身，与"跨卡拓扑"无关；host-staged 是瓶颈，拓扑不额外收费**。
+
+真实到达闭环（W2，GPU2↔GPU3 真卡；Mooncake FAST'25 trace，见 tools/trace_to_arrivals.py）：
+- trace 结构实测：两个 trace 均为 1180 个等间隔时间桶（arXiv 3053 / toolagent 3000 单位），
+  每桶 ~20 条请求（1–47 / 1–64）→ 发布方按固定周期聚合采样。故不能用"切密集窗口"
+  （7200 单位窗口内仅 2–3 个采样点，退化为 3 个巨型突发）；正确做法 = 整条 trace 的
+  1180 桶当到达过程（真实密度波动 = 桶请求量 1..47），时间轴压缩对齐服务跨度。
+- Workload B trace（32768 任务，GPU2→GPU3，tick 0.0005）：
+  arxiv    low  C/A 2.64× C/B 3.20×（p99 6.16 vs 19.62）；medium 1.44× / 2.28×（p99 23.32 vs 52.74）；
+           high 1.11× / 1.44×（p99 92.33 vs 132.17）
+  toolagent low C/A 2.84× C/B 3.23×（p99 6.14 vs 19.75）；medium 1.53× / 2.27×（p99 23.43 vs 52.86）；
+           high 1.11× / 1.35×（p99 101.04 vs 135.68）
+  → 真实到达下 C/B 1.35–3.23× 与合成同量级；H4 在真实到达下复现（medium 档 p99 收紧 2.26×）；
+    toolagent（真实突发 3.20× > arxiv 2.35×）在 low/medium 档 C/A 略高（2.84 vs 2.64 / 1.53 vs 1.44），
+    与"越突发静态划分越差"一致。合成矩阵保留（控制变量正当性），trace 列补真实性。
+- N 卡控制面真卡（GPU2,3，32768 任务，steal_thr 0.25）：
+  steady balanced  ：A imb 0.000 → B 0.138(steals 2253) → C 0.020(steals 11)；C/A 1.53× C/B 1.85×
+  steady imbalanced：A imb 0.800 → B 0.153(steals 10612) → C 0.138(steals 52)；C/A 1.52× C/B 1.88×
+  trace  imbalanced：A imb 0.800 → B 0.070(steals 11957) → C 0.136(steals 51)；C/A 1.62× C/B 2.06×
+  → 真卡上静态划分偏斜可达 imb=0.800；C 仅 51–52 次批窃取把负载拉回 ~0.14，B 需 ~1.2 万次
+    单任务窃取（B 靠蛮力达到更低 imb 但 makespan 慢 2×）。批粒度重分配优势在真卡确认（W2 闭合）。
+  结果目录：results/xcard_20260920_132536/（wlb_* 与 mg_* 全部日志）
 
 【1. 一句话主张（冻结）】
 面向 LLM 稀疏注意力持续 decode 的 host-staged 多 GPU 运行时：完整 KV 历史驻 pinned host，
@@ -36,12 +62,21 @@ GPU 只驻留每请求每层热工作集；miss 经 PCIe 以流水化批传输�
 批处理跨 GPU 重分配、计算通信重叠为多卡控制面，在 4×3090（无 P2P、~12 GB/s）上
 提升吞吐、降低通信放大、压低突发/偏斜尾延迟。
 
-【2. 机制归因（v2 校订，维持）】
-三个机制与消融开关一一对应：
-  M1 流水化批传输：dual-stream host-staged channel（开关 n_in_streams∈{1,2}）→ 报吞吐倍数
-  M2 带宽感知批粒度：自适应批大小削减段数（开关 MoveStrategy/固定粒度）→ 报段数+尾延迟
-  M3 计算-通信重叠：event 依赖的 compute/copy 流水（开关 seq/pipe）→ 报重叠倍数与 overlap ratio
-批粒度不与流水混为一谈（v1 的「batched 2.0×」实为 M1 的功劳，probe --bw 已证）。
+【2. 机制归因（v2 校订 + W1 复核后收紧）】
+三个机制与消融开关，附**端到端实测贡献**（跨卡 GPU2→GPU3，同环回）：
+  M1 流水化批传输：dual-stream host-staged channel（开关 n_in_streams∈{1,2}）
+     → **端到端实测 ≈1.00×**（0.25/1/4MB 三档批粒度；跨卡=环回）。根因：H2D 走独立
+     copy_out_ 流 + event 依赖 D2H，单条 D2H 流已实现分向重叠 → 第二条 D2H 流无增益。
+     ⚠️ 故 n_in_streams 开关**未隔离**该机制（见【13】W5）。主张降级：只报 probe 层
+     通道能力（双流 20.36 GB/s = 1.82× 单流），不进端到端倍数归因。
+  M2 带宽感知批粒度：自适应批大小削减段数（开关 MoveStrategy/固定粒度）
+     → 段数 1024→267（0.26，中小总量）；端到端吞吐 ≈1.00× → **只报段数/尾延迟**
+  M3 计算-通信重叠：event 依赖的 compute/copy 流水（开关 seq/pipe）
+     → **端到端主贡献：1.28×（0.25MB 批）→ 1.83×（4MB 批）**，随批增大而增大；
+       overlap ratio 0.29–0.50
+批粒度不与流水混为一谈（v1 的「batched 2.0×」实为通道流水的功劳，probe --bw 已证；
+W1 进一步表明该"流水"来自分向（D2H/H2D）重叠，而非 D2H 流数）。
+端到端收益分解（v4 收紧）：批化自身 1.17–1.26× + M3 重叠 1.2–2.0×；M1/M2 不报吞吐倍数。
 
 【3. 边界 / Shetty / 投稿】
 不做：GNN、SpMM kernel、MoE EP、PD 分离、NVSHMEM、SGLang/HiSparse 移植、8×256K 整模、
@@ -67,6 +102,11 @@ C Ferry：自适应批 + 双流流水 + event 依赖计算；批门控 = 批内�
 payload：low/med/high = 4KB/16KB/64KB。到达校准：tick 使 arrival_span ∈ [0.5,2]×
 service_span；p50<0 作废。bursty = 64 任务同 tick 集中 + 行间指数静默；skewed = 帕累托。
 tasks 64K–256K（总迁移量 64MB–4GB 覆盖饱和区）。
+trace（新增，真实性列）：arrival=trace 读 FERRY_TRACE_CSV（默认 data/arxiv_arrivals.csv，
+csv 为归一化 arrive_ticks；行数不足直接报错退出，禁止静默改分布）。转换器
+tools/trace_to_arrivals.py 用整条 Mooncake trace 的 1180 个聚合桶当到达过程，
+桶内 sum(input_length) 加权摊任务到 --tasks，ticks-per-span 对齐 steady 量级（32768）。
+两种真实负载：arxiv（桶突发 2.89×）/ toolagent（3.19×），互为对照。
 
 【7. Workload A（已实现已跨卡）】
 QSA-style miss 流：多请求持续 decode，每 step 每层选 128–512 个 C4 block；步间 reuse≈66%；
@@ -137,9 +177,31 @@ R4 ✓ 消融矩阵（run_ablation，8 组合 + CSV）。环回（steady/16KB/32
 R5 ✓ overlap ratio 三项独立计时（baselines.cuh run_overlap_ratio；run_ablation 末尾输出+CSV）。
    环回（GPU0，steady/16KB/32K/tick 0.0005）：ratio=0.400；T_pipe=24.59 T_comm=24.53
    T_compute=16.45ms——T_comm≈T_pipe（环回通信是绝对瓶颈），ratio 打满理论上限
-   1−T_pipe/(T_comm+T_comp)≈0.40 → 流水本身零损耗；跨卡 T_comm 变长后 ratio 预期更高。
+   1−T_pipe/(T_comm+T_comp)≈0.40 → 流水本身零损耗。
+   跨卡（GPU2→GPU3，同配置）：ratio=0.401；T_pipe=24.94 T_comm=25.18 T_compute=16.45ms
+   ——与环回逐项相同（差 <3%）。**修正**：原写"跨卡 T_comm 变长后 ratio 预期更高"，
+   实测不成立：两条路径都走同一 host-pinned 通道（无 P2P），跨卡并不比环回更贵。
    口径提醒：三项均含到达门控（开环回放），报数必须带 tick，否则被到达稀疏度稀释。
-   CSV: results/ablation_r5_steady_medium.csv(+_overlap.csv)。
+   CSV: results/ablation_r5_steady_medium.csv(+_overlap.csv)、xcard_*/ablation_xcard_*。
+W1 ✓ 跨卡消融（GPU2→GPU3，steady/16KB/32K，results/xcard_*/ablation_xcard*.log）：
+   完整C vs B 2.14×；M1 0.99×  M2 1.00×  M3 1.83×——**与环回（0.99/1.00/1.86）几乎相同**。
+   这是否定性结论，须如实记录：原预期"M1/M2 贡献在真实跨卡复现（R3 侧面支持）"不成立。
+   机制解释（与 probe 自洽）：4MB 批已远超 ≥1MB 饱和点，单条 D2H 流已打满 PCIe，
+   第二条 D2H 流无增益；且 H2D 汇聚流本就是单条 → M1 在此批粒度下天然 ≈1.0×。
+   【小批区追测，结论更强】为验"M1 只在小传输区有效"，补三组：
+     a) 16KB payload + --fixed-mb 0.25 → 受 ≥64 任务下限顶回 1MB 批（无效测试，batches=512
+        但每批 1MB）；b) low sparsity（4KB）自适应 → 批按**字节**定目标（≈8–16MB），
+        payload 变小不改变批字节（batches=43）；c) low sparsity + --fixed-mb 0.25 →
+        真正 0.25MB 批（batches=512，128MB/512）：M1 = **1.00×**，M3 = 1.28×，C/B 1.26×。
+   故 **M1 ≈1.0× 在 0.25/1/4MB 三档批粒度下均成立**，非"大批才消失"。
+   根因（关键方法论修正）：channel 的 H2D 走**独立** copy_out_ 流并以 event 依赖 D2H，
+   因此**单条 D2H 流已实现 D2H/H2D 双向重叠**；再加第二条 D2H 流无额外收益。
+   即 **n_in_streams 开关并未隔离"M1 流水化"这一机制**——真正的流水（分向重叠）在
+   所有行里都已默认开启。故 M1 的正确操作化应是"有无独立 H2D 流 + event 依赖"，
+   而非 D2H 流数。⚠️ 待解释：probe 层双流 1.82× 与端到端 1.00× 的口径差异
+   （probe 的对照可能是"单流内串行 D2H→H2D"，而 channel 实现天然分向重叠）。
+   论文归因（收紧后）：端到端主收益 = 批化（1.17–1.26×）+ 重叠 M3（1.2–2.0×，随批增大）；
+   M1 只报 probe 层通道能力，M2 只报段数/尾延迟（不报吞吐）。
 N 卡控制面 ✓（multigpu.cuh + run_multigpu；结构：每卡执行线程（本地队列+双端窃取+通道矩阵）
    + host 主线程到达分发；任务带 dest；三模式 A/B/C 对齐单卡语义；
    C = 本地优先批消费 + 水位批窃取 + 双流流水 + 在途窗口）。
@@ -154,10 +216,21 @@ N 卡控制面 ✓（multigpu.cuh + run_multigpu；结构：每卡执行线程�
    ② 根因：ctx 共享 taken_ 在 take_local 与 submit_batch（隔 drain_one 长同步窗）之间
    被其他线程 clear 覆盖 → 任务消失；改 take_local 按值返回 vector。附修约束 #6 与
    计算流 H2D 依赖（wait_last_arrival，流级异步不破坏重叠）。
-剩余（真窗口三项，均挂监控 ./watch_gpu_window.sh 4 auto mg，4 卡全空自动跑）：
-   ⏳ W1 跨卡消融关键行（M1/M2 跨卡贡献复现；≥2 卡窗口即可）
-   ⏳ W2 偏斜真实 2/4 卡数字（窃取/再平衡路径真卡验证）
+真实到达模式 ✓（trace 管线 + 跨卡闭环）：converter（tools/trace_to_arrivals.py，
+   整条 Mooncake trace 1180 桶当到达过程，非切窗口）+ synthetic.cuh 的 arrival=trace
+   分支（FERRY_TRACE_CSV，行数不足即报错退出）+ 环回验收（C/A 1.44× C/B 2.14×）。
+   跨卡 trace 墙 W2 结果见【0】。
+剩余：
+   ✓ W2 偏斜真实 2 卡数字（GPU2,3 真卡）：A imb 0.800 → C 仅 51 次批窃取拉回 0.136，
+     B 需 11957 次单任务窃取；C/A 1.52–1.62× C/B 1.85–2.06×。**W2 闭合**
+   ✓ W1 跨卡消融：M1/M2 ≈1.0× 与环回一致（否定性结论，见上）；M3 1.83×。**W1 闭合**
    ⏳ W3 4 卡矩阵（R6：扩展效率 = N 卡吞吐/单卡吞吐；需全空窗口）
+   ⏳ W4（可选）Workload A 真实 selection 模式：跑 Quest indexer 抽真实 per-step
+       per-layer top-K 页选择序列回放，替换手写 reuse≈66%。（需 7B 模型，等窗口或 WSL 小模型）
+   ⏳ W5（新增，M1 归因）复核 probe --bw 的"双流 1.82×"口径，与端到端 1.00× 对齐：
+       若 probe 对照实为"单流内串行 D2H→H2D"，则需重定义为"独立 H2D 流 + event 依赖"
+       的消融行（当前 n_in_streams 开关不能隔离该机制）。**M1 主张在此澄清前应降级为
+       通道层能力**，不在端到端归因中报倍数。
 
 【14. 推荐叙事（冻结）】
 「Shetty 等解决了单 GPU 上可线性化、有进度保证的有界并发队列；但 LLM 稀疏注意力的持续
