@@ -1,9 +1,10 @@
 // run_multigpu: N 卡控制面实验（P2 最后一块的验收工具）
-// 三模式 A/B/C × 到达偏斜，输出：makespan/吞吐/p50/p99/窃取数/迁移量/均衡度
+// 五模式 A/B/C/D1/D2 × 到达偏斜，输出：makespan/吞吐/p50/p99/窃取数/迁移量/均衡度
 // 用法：
 //   ./build/run_multigpu [--arrival steady] [--skew imbalanced]
-//                        [--tasks 32768] [--inner 2] [--tick 0.0005]
-//                        [--gpus 0,1] [--mode all]
+//                         [--tasks 32768] [--inner 2] [--tick 0.0005]
+//                         [--steal-thr 0.25] [--gpus 0,1,2,3]
+// 输出固定含 5 行（A/B/C/D1/D2）+ C/A、C/B 汇总 + [B1] 窃取粒度汇总。
 // 环回（单卡 --gpus 0）验证逻辑；2/4 卡时为真实控制面。
 #include <cstdio>
 #include <cstdlib>
@@ -101,8 +102,24 @@ int main(int argc, char** argv) {
                               steal_threshold, inner_scale);
   print_row("ferry-C", c);
 
+  // B1 公平对照（W6）：与 C 同执行引擎，仅改窃取粒度。
+  // D1=one-steal（B 的粒度）→ C/D1 隔离"批窃取"本身的贡献；
+  // D2=steal-half（Hendler-Shavit 粒度）→ 回应"为何不偷一半"。
+  MultiStats d1 = run_multigpu(devices, tasks, 3, pol, tick_ms,
+                               steal_threshold, inner_scale);
+  print_row("one-steal-D1", d1);
+  MultiStats d2 = run_multigpu(devices, tasks, 4, pol, tick_ms,
+                               steal_threshold, inner_scale);
+  print_row("half-steal-D2", d2);
+
   std::printf("  => C/A %.2fx  C/B %.2fx  steals(B/C) %llu/%llu\n",
               a.makespan_ms / c.makespan_ms, b.makespan_ms / c.makespan_ms,
               (unsigned long long)b.steals, (unsigned long long)c.steals);
+  // B1 汇总：D1/D2 与 C 同引擎同批，唯一差异是窃取粒度
+  std::printf("  => [B1] D1 %.2fms(steals %llu) D2 %.2fms(steals %llu) "
+              "| C/D1 %.2fx  C/D2 %.2fx\n",
+              d1.makespan_ms, (unsigned long long)d1.steals,
+              d2.makespan_ms, (unsigned long long)d2.steals,
+              d1.makespan_ms / c.makespan_ms, d2.makespan_ms / c.makespan_ms);
   return 0;
 }
