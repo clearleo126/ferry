@@ -32,10 +32,11 @@ v4 = v3 场景与口径 + R4/R5/虚拟 N 卡控制面实测回填 + 约束 #8（
    （单流已饱和，见下）。正确表述：M2 只主张段数/尾延迟，不主张吞吐；大批下吞吐收益来自
    批化本身与 M3 重叠，非 M1。
 跨卡 vs 环回：R3 阶段 C/B 从环回 1.44–2.08× 升至跨卡 1.76–2.74×，曾据此推断"真实 PCIe 往返
-收益更显著"。**W1 直接测量否定该推断**：跨卡消融（M1 0.99× M2 1.00× M3 1.83×）与环回
-（0.99/1.00/1.86）逐项相同，T_comm 25.18 vs 24.53ms——两条路径都走同一 host-pinned 通道
-（无 P2P），跨卡并不更贵。先前差异应归因于 R3 与环回的配置不同（任务量/payload），非拓扑。
-主张应收紧为：**收益来自批化+重叠本身，与"跨卡拓扑"无关；host-staged 是瓶颈，拓扑不额外收费**。
+收益更显著"。**W1 直接否定该拓扑归因**：原 `n_in_streams` 对照在跨卡与环回均为无效
+M1 消融（约 0.99–1.00×），两条路径都走同一 host-pinned 通道（无 P2P），T_comm 25.18
+vs 24.53ms。改用 `m1_p1` 后得到正确 M1=1.85×；先前 R3 差异应归因于配置不同（任务量/
+payload），非拓扑。主张应收紧为：**收益来自批化+重叠本身，与"跨卡拓扑"无关；host-staged
+是瓶颈，拓扑不额外收费。**
 
 真实到达闭环（W2，GPU2↔GPU3 真卡；Mooncake FAST'25 trace，见 tools/trace_to_arrivals.py）：
 - trace 结构实测：两个 trace 均为 1180 个等间隔时间桶（arXiv 3053 / toolagent 3000 单位），
@@ -101,7 +102,8 @@ RQ4（增强）强顺序 vs 放松顺序权衡。
 A 静态+bulk-sync：全局 barrier（等全部任务到达）后一次性 bulk 迁移（经 host-staged 通道，
   禁止 D2D 绕过）+ 单 kernel。旧实现不等到达即传、或用 D2D 隐藏通信成本，均为伪影。
 B 动态非批处理：逐段迁移 + 逐段 sync；段门控 = 段内最后任务已到达；单流。
-C Ferry：自适应批 + 双流流水 + event 依赖计算；批门控 = 批内最后任务已到达；
+C Ferry：自适应批 + 独立 H2D 汇聚流 + D2H 完成 event 依赖的分向流水 + event 依赖计算；
+  批门控 = 批内最后任务已到达；
   在途窗口 pending_ahead。
 门控总则：任何批/段在其最后任务到达前不得提交；出现负延迟即作废重调参。
 
@@ -129,11 +131,13 @@ Workload A 专属：hit rate、miss 字节/token、p50/p99 step。
 扩展效率 = N 卡吞吐 / 单卡吞吐（4 卡窗口出）。
 
 【9. 实验矩阵与消融开关】
-开关：n_in_streams{1,2} × MoveStrategy{non-batched,fixed,adaptive} × overlap{seq,pipe}
-      × queue{per-thread,wave} × 粒度{C4,固定页,固定1–4MB,自适应}
+开关：m1_p1{false,true} × adaptive{false,true} × overlap{seq,pipe}
+      × n_in_streams{1,2} × queue{per-thread,wave} × 粒度{C4,固定页,固定1–4MB,自适应}
+      其中 n_in_streams 仅表示 D2H 流数量，不作为 M1 消融；
 输入：arrival{steady,bursty,skewed/mixed} × hot{1,2,4}× × sparsity{4,16,64}KB × skew{bal,imb}
 硬件：1（环回）/ 2（已出）/ 4（待窗口）。
-必做消融（R4）：去 M1（n_in_streams=1）；去 M2（固定粒度）；去 M3（seq）；去本地优先（B 语义）。
+必做消融（R4）：去 M1（m1_p1=true，P1 单流交替、无独立 H2D 分向重叠）；
+去 M2（adaptive=false，固定粒度）；去 M3（overlap=seq）；去本地优先（B 语义）。
 建议：批大小曲线、hot 档位、per-thread vs wave。
 不扫：语义模式、反压阈值、NVSHMEM、serving SLO、GNN/MoE 参数。
 
@@ -173,14 +177,17 @@ Workload A 专属：hit rate、miss 字节/token、p50/p99 step。
 里程碑：R1 门控+payload ✓（无负延迟，C/A 1.96–2.83× 环回）；R2 跨卡接线 ✓；
 R3 2 卡矩阵 + Workload A 跨卡 ✓（见【0】）；R4 消融 ✓（下）；R5 overlap ratio ✓（下）；
 N 卡控制面 ✓（结构+逻辑验收，见下）。
-R4 ✓ 消融矩阵（run_ablation，8 组合 + CSV）。环回（steady/16KB/32K 任务）：
-   完整C vs B 2.16×；M3 贡献 1.86×；M1/M2 环回下 ≈1.0×（D2H+H2D 同根 PCIe，双流受限；
-   跨卡预期复现，R3 侧面支持：跨卡 C/B 2.22×>环回 2.08×）。CSV: results/ablation_steady_medium.csv。
-   B 基线公平性归因链（防「B 做弱了」质疑）：B(52.6ms, 逐段sync+单流) → ns1-ad0-ov0
-   (45.5ms, 批化但全机制关) = 1.17× 纯批化收益；→ 完整C(24.6ms) 再 1.84× 来自三机制。
-   即 C/B 2.16× 约一半来自批化、一半来自 M1/M2/M3——B 不是稻草人。
-   附带修复：摘要行索引 bug（原 no_m3 取到 ov=1 行 → M3 贡献恒报 1.00×；修复后 1.86×）；
-   tag 改 ns{n}-ad{0,1}-ov{0,1}（原「M1+A+O」的 M1 是 n_streams=1，易与机制 M1 混淆）。
+R4 ✓ 消融矩阵（run_ablation，基础 8 组合 + 正确 M1 对照，CSV）。跨卡
+   steady/16KB/32K 任务最终归因链：
+   B(53.48ms，逐段 sync+单流) → 批化但机制关闭(45.50ms) = 1.18× 纯批化收益；
+   P1 单流交替+overlap(43.83ms) 得到 M1 单独 1.04×；
+   channel+overlap=false(45.27ms) 得到 M3 单独约 1.00×；
+   完整 C(23.74ms) 相对批化基线为 **1.92× 的 M1×M3 协同**，完整 C/B=2.25×。
+   因此 M2 只主张段数/尾延迟，M1 与 M3 的端到端收益必须联合归因。
+   CSV: results/ablation_steady_medium.csv。
+   B 基线公平性归因链保留：B 不是通过不公平地扩大段数制造的稻草人。
+   附带修复：摘要行索引 bug（原 no_m3 取到 ov=1 行）；历史 tag
+   `ns{n}-ad{0,1}-ov{0,1}` 中的 “M1” 仅指 n_streams=1，现统一避免与机制 M1 混淆。
 R5 ✓ overlap ratio 三项独立计时（baselines.cuh run_overlap_ratio；run_ablation 末尾输出+CSV）。
    环回（GPU0，steady/16KB/32K/tick 0.0005）：ratio=0.400；T_pipe=24.59 T_comm=24.53
    T_compute=16.45ms——T_comm≈T_pipe（环回通信是绝对瓶颈），ratio 打满理论上限
@@ -191,27 +198,15 @@ R5 ✓ overlap ratio 三项独立计时（baselines.cuh run_overlap_ratio；run_
    口径提醒：三项均含到达门控（开环回放），报数必须带 tick，否则被到达稀疏度稀释。
    CSV: results/ablation_r5_steady_medium.csv(+_overlap.csv)、xcard_*/ablation_xcard_*。
 W1 ✓ 跨卡消融（GPU2→GPU3，steady/16KB/32K，results/xcard_*/ablation_xcard*.log）：
-   完整C vs B 2.14×；M1 0.99×  M2 1.00×  M3 1.83×——**与环回（0.99/1.00/1.86）几乎相同**。
-   这是否定性结论，须如实记录：原预期"M1/M2 贡献在真实跨卡复现（R3 侧面支持）"不成立。
-   机制解释（与 probe 自洽）：4MB 批已远超 ≥1MB 饱和点，单条 D2H 流已打满 PCIe，
-   第二条 D2H 流无增益；且 H2D 汇聚流本就是单条 → M1 在此批粒度下天然 ≈1.0×。
-   【小批区追测，结论更强】为验"M1 只在小传输区有效"，补三组：
-     a) 16KB payload + --fixed-mb 0.25 → 受 ≥64 任务下限顶回 1MB 批（无效测试，batches=512
-        但每批 1MB）；b) low sparsity（4KB）自适应 → 批按**字节**定目标（≈8–16MB），
-        payload 变小不改变批字节（batches=43）；c) low sparsity + --fixed-mb 0.25 →
-        真正 0.25MB 批（batches=512，128MB/512）：M1 = **1.00×**，M3 = 1.28×，C/B 1.26×。
-   故 **M1 ≈1.0× 在 0.25/1/4MB 三档批粒度下均成立**，非"大批才消失"。
-   根因（关键方法论修正）：channel 的 H2D 走**独立** copy_out_ 流并以 event 依赖 D2H，
-   因此**单条 D2H 流已实现 D2H/H2D 双向重叠**；再加第二条 D2H 流无额外收益。
-   即 **n_in_streams 开关并未隔离"M1 流水化"这一机制**——真正的流水（分向重叠）在
-   所有行里都已默认开启。故 M1 的正确操作化应是"有无独立 H2D 流 + event 依赖"，
-   而非 D2H 流数。⚠️ 待解释：probe 层双流 1.82× 与端到端 1.00× 的口径差异
-   （probe 的对照可能是"单流内串行 D2H→H2D"，而 channel 实现天然分向重叠）。
-   论文归因（收紧后）：端到端主收益 = 批化（1.17–1.26×）+ 重叠 M3（1.2–2.0×，随批增大）；
-   M1 只报 probe 层通道能力，M2 只报段数/尾延迟（不报吞吐）。
+   原 `n_in_streams` 对照为 M1 的无效操作化（0.99–1.00×），因为 channel 的独立
+   `copy_out_` H2D 流在所有行中都存在。经 W5 新增 `m1_p1` 后，跨卡正确结果与环回
+   一致：M1=1.85×，M3 单独约 1.00×，M1×M3 协同约 1.92×。
+   因而 W1 的最终方法论结论是：M1 必须用 P1 单流交替协议隔离；`n_in_streams`
+   仅是 D2H 并行度参数，不能写成“去 M1”。跨卡与环回都走同一 host-pinned 路径，
+   不应把收益差异归因于 PCIe 拓扑。
 N 卡控制面 ✓（multigpu.cuh + run_multigpu；结构：每卡执行线程（本地队列+双端窃取+通道矩阵）
    + host 主线程到达分发；任务带 dest；三模式 A/B/C 对齐单卡语义；
-   C = 本地优先批消费 + 水位批窃取 + 双流流水 + 在途窗口）。
+   C = 本地优先批消费 + 水位批窃取 + 独立 H2D 汇聚流分向流水 + 在途窗口）。
    环回验收：A/B/C 全完成，C/B 2.19×，C/A 1.15×（无偏斜下 A 的 bulk 优势正常）。
    逻辑验收 ✓（--virtual N：同物理卡多逻辑 worker，仅验证控制面，无性能意义）：
    virtual 2（imb）：A imb=0.802 → B 0.065(steals 12062) → C 0.002(steals 61)；
@@ -245,6 +240,7 @@ N 卡控制面 ✓（multigpu.cuh + run_multigpu；结构：每卡执行线程�
 「Shetty 等解决了单 GPU 上可线性化、有进度保证的有界并发队列；但 LLM 稀疏注意力的持续
 decode 把任务变成 host 完整 KV 与 GPU 热工作集之间的 miss 回填：静态划分与大同步在到达
 偏斜、层间 locality 漂移和细粒度 PCIe 往返下放大通信、抬高尾延迟。我们提出不依赖 P2P 的
-host-staged 多 GPU 运行时：miss 回填以双流流水化批传输执行，批粒度按待迁数据量自适应落在
-通道饱和区，计算以 event 依赖与回填流水重叠；在 4×RTX 3090 上稳定提升吞吐、降低 miss
-通信放大，并补齐突发/偏斜下的尾延迟与扩展效率评估。」
+host-staged 多 GPU 运行时：miss 回填由独立 H2D 汇聚流与 D2H 完成 event 实现分向重叠，
+批粒度按待迁数据量自适应落在通道饱和区，计算再以 event 依赖与回填流水重叠；当前已在
+2 卡真实跨卡和 4×3090 集群环境的环回/控制面上验证机制与突发/偏斜收益，4 卡扩展效率
+仍作为待全空窗口的专门矩阵，不提前宣称。」
