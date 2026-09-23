@@ -7,12 +7,14 @@
 //   - 水位：occ = 队列长度；< steal_threshold 时触发窃取
 //   - 窃取决策（对称拓扑，无路由）：找最长队列的源卡，拔 choose_batch 大小一批
 //
-// 三模式（与单卡 baselines.cuh 语义对齐）：
+// 三模式 + B1 公平对照（与单卡 baselines.cuh 语义对齐）：
 //   A 静态划分：任务按 dest 固定分卡（偏斜到达 → 到达即失衡），
 //     每卡等本地全部任务到达（本地 barrier）后一次 bulk 迁移+单 kernel
 //   B 动态逐任务：空闲卡（队列空）每次从最忙卡借 1 任务（单任务迁移+sync）
 //   C Ferry：本地优先消费；occ < threshold 时从最忙卡拔一批
 //     （自适应批粒度），双流流水 + event 重叠 + 在途窗口
+//   D1/D2：与 C 同一执行引擎，仅改窃取粒度（one-steal / steal-half），
+//     用于隔离"批窃取"贡献（B1 公平基线，见实验设计 W6）
 //
 // 数据放置：全量 payload 池在 GPU0（模拟"远端生产侧"）；
 // 每卡 dst 各有 in/out/work 缓冲（任务按需从池迁到消费卡）。
@@ -268,8 +270,13 @@ class MultiGpuCtx {
   char* pool_buf() { return d_pool_; }
 };
 
-// ---- 三模式 N 卡驱动 ----
-// mode: 0=A 1=B 2=C
+// ---- 五模式 N 卡驱动 ----
+// mode: 0=A 1=B 2=C 3=D1 4=D2
+//   A/B/C 语义见文件头；D1/D2 为 B1 公平对照（实验设计 W6）：
+//   与 C 完全同一执行引擎（自适应批 + 独立 H2D 流水 + 在途窗口 + 事件收割），
+//   唯一变量 = 窃取粒度：
+//     D1 = 单任务窃取（与 B 同粒度）→ 隔离"批窃取"本身的贡献
+//     D2 = 偷一半（victim/2，不按消费批截断）→ StealHalf(Hendler-Shavit) 粒度对照
 inline MultiStats run_multigpu(const std::vector<int>& devices,
                                const std::vector<Task>& tasks, int mode,
                                const AdaptiveBatchPolicy& pol,
@@ -426,9 +433,17 @@ inline MultiStats run_multigpu(const std::vector<int>& devices,
           submit_batch(ids, /*seq=*/true);
         }
       } else {
-        // C：Ferry。本地优先批消费 + 水位触发批窃取 + 流水重叠。
+        // C 族（mode 2/3/4）：同一执行引擎（自适应批 + 双流流水 + 在途窗口 +
+        // 事件收割），B1 公平对照的唯一变量 = 窃取粒度。
+        //   steal() 的实际拔取量 = min(请求量, victim/2+1, capacity)，
+        //   故请求量 1 / batch / SIZE_MAX 分别对应 one-steal / 批窃取 / steal-half。
         const size_t thr = (size_t)(steal_threshold * 64);
         uint64_t idle_iters = 0;
+        auto steal_req = [&](size_t batch) -> size_t {
+          if (mode == 3) return 1;           // D1：单任务窃取（B 的粒度）
+          if (mode == 4) return SIZE_MAX;    // D2：偷一半（不按批截断）
+          return batch;                      // C ：批窃取（Ferry 主张）
+        };
         while (true) {
           if (ctx.all_done()) break;
           // 批粒度：自适应（按剩余总量）
@@ -439,8 +454,8 @@ inline MultiStats run_multigpu(const std::vector<int>& devices,
               (size_t)(gmb * (1 << 20) / ctx.payload_bytes()), 16);
           std::vector<size_t> ids = ctx.take_local(g, batch);
           if (ids.empty()) {
-            // 本地空：水位=0 < 阈值 → 批窃取
-            size_t got = ctx.steal(g, batch);
+            // 本地空：水位=0 < 阈值 → 按模式粒度窃取
+            size_t got = ctx.steal(g, steal_req(batch));
             if (got > 0) {
               steals.fetch_add(1);
               ids = ctx.take_local(g, batch);
@@ -461,9 +476,9 @@ inline MultiStats run_multigpu(const std::vector<int>& devices,
               continue;
             }
           }
-          // 水位低：预窃一批补充（不影响本批 ids）
+          // 水位低：按模式粒度预窃一批补充（不影响本批 ids）
           if (ctx.occ(g) < thr) {
-            if (ctx.steal(g, batch) > 0) steals.fetch_add(1);
+            if (ctx.steal(g, steal_req(batch)) > 0) steals.fetch_add(1);
           }
           // 在途窗口满 → 先收最早一批
           while (inflight >= pending_ahead) drain_one();
