@@ -119,19 +119,21 @@ inline std::vector<Task> generate_tasks(const ArrivalSpec& spec,
     }
 
     if (spec.arrival == "trace") {
-      tk.arrive_t = trace_arr[i];  // 真实序列（已排序）
-    } else if (spec.arrival == "steady") {
-      t += 1.0;  // 每 tick 一个任务
-    } else if (spec.arrival == "bursty") {
-      if (i % burst_period == 0) {
-        // 新的一行：从静默中醒来，本行 64 个任务全部落在同一 tick
-        t += exp_gap(rng) * 16.0;  // 行间静默（均值 16 tick）
+      tk.arrive_t = trace_arr[i];  // 真实序列（已排序）；不得被 t 覆盖
+    } else {
+      if (spec.arrival == "steady") {
+        t += 1.0;  // 每 tick 一个任务
+      } else if (spec.arrival == "bursty") {
+        if (i % burst_period == 0) {
+          // 新的一行：从静默中醒来，本行 64 个任务全部落在同一 tick
+          t += exp_gap(rng) * 16.0;  // 行间静默（均值 16 tick）
+        }
+        // 行内：不推进 t（0 间隔集中到达）
+      } else {  // skewed
+        t += pareto_gap(rng) * 2.0;
       }
-      // 行内：不推进 t（0 间隔集中到达）
-    } else {  // skewed
-      t += pareto_gap(rng) * 2.0;
+      tk.arrive_t = t;
     }
-    tk.arrive_t = t;
   }
 
   // 目标卡：偏斜到达 → 80% 落在 rng 前 20% 的卡上（与到达内容解耦，单独循环）
