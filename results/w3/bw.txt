@@ -1,0 +1,4 @@
+[bench_comm] dev=0 slot=2MB x4 slots, total 256 MB
+[bench_comm] correctness (256 MB, 128 segments): PASS
+[bench_comm] throughput slot=2MB slots=4 total=256MB: channel 10.31 GB/s | p1-batched 5.79 GB/s | ratio 1.782 (PASS >=0.95x)
+[bench_comm] correctness (64 MB, 32 segments): PASS

@@ -1,0 +1,19 @@
+[topo] 0<->1  host-staged  5.74 GB/s (batched) / 5.80 GB/s (non-batched)  speedup 0.99x
+[topo] 0<->2  host-staged  5.74 GB/s (batched) / 5.80 GB/s (non-batched)  speedup 0.99x
+[topo] 0<->3  host-staged  5.74 GB/s (batched) / 5.80 GB/s (non-batched)  speedup 0.99x
+[topo] 1<->2  host-staged  5.75 GB/s (batched) / 5.80 GB/s (non-batched)  speedup 0.99x
+[topo] 1<->3  host-staged  5.74 GB/s (batched) / 5.80 GB/s (non-batched)  speedup 0.99x
+[topo] 2<->3  host-staged  5.75 GB/s (batched) / 5.80 GB/s (non-batched)  speedup 0.99x
+=== Ferry Topology Report ===
+driver 12.8  runtime 12.8
+GPU 0  NVIDIA GeForce RTX 3090  cc 8.6  24135 MB  82 SMs  pci 0000:46:00
+GPU 1  NVIDIA GeForce RTX 3090  cc 8.6  24135 MB  82 SMs  pci 0000:81:00
+GPU 2  NVIDIA GeForce RTX 3090  cc 8.6  24135 MB  82 SMs  pci 0000:c1:00
+GPU 3  NVIDIA GeForce RTX 3090  cc 8.6  24135 MB  82 SMs  pci 0000:c2:00
+--- peer matrix ---
+0 -> 1 : p2p no (en=n, 0.00 GB/s)  host-staged 5.74 GB/s (non-batched 5.80)
+0 -> 2 : p2p no (en=n, 0.00 GB/s)  host-staged 5.74 GB/s (non-batched 5.80)
+0 -> 3 : p2p no (en=n, 0.00 GB/s)  host-staged 5.74 GB/s (non-batched 5.80)
+1 -> 2 : p2p no (en=n, 0.00 GB/s)  host-staged 5.75 GB/s (non-batched 5.80)
+1 -> 3 : p2p no (en=n, 0.00 GB/s)  host-staged 5.74 GB/s (non-batched 5.80)
+2 -> 3 : p2p no (en=n, 0.00 GB/s)  host-staged 5.75 GB/s (non-batched 5.80)
