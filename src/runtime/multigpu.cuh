@@ -15,6 +15,8 @@
 //     （自适应批粒度），双流流水 + event 重叠 + 在途窗口
 //   D1/D2：与 C 同一执行引擎，仅改窃取粒度（one-steal / steal-half），
 //     用于隔离"批窃取"贡献（B1 公平基线，见实验设计 W6）
+//   E：与 C 同一执行引擎、同窃取语义，仅改批大小决策（实时状态四路输入，
+//     见实验设计 W7/B2 成本感知批粒度）
 //
 // 数据放置：全量 payload 池在 GPU0（模拟"远端生产侧"）；
 // 每卡 dst 各有 in/out/work 缓冲（任务按需从池迁到消费卡）。
@@ -66,6 +68,7 @@ struct MultiStats {
   uint64_t steals = 0;        // 窃取批次数（B/C 的重分配量）
   double imbalance = 0.0;     // 各卡完成任务数的变异系数（负载均衡指标）
   int n_gpus = 0;
+  double mean_batch_tasks = 0.0;  // C 族遥测：平均每批任务数（B2 决策差异证据）
 };
 
 class MultiGpuCtx {
@@ -192,6 +195,17 @@ class MultiGpuCtx {
     return local_[g].size();
   }
 
+  // 最忙其他卡的队列长度（B2 成本感知决策输入：源卡剩余）
+  size_t busiest_other(int g) {
+    std::unique_lock<std::mutex> lk(mtx_);
+    size_t best = 0;
+    for (int s = 0; s < n_; ++s) {
+      if (s == g) continue;
+      best = std::max(best, local_[s].size());
+    }
+    return best;
+  }
+
   void mark_done(const std::vector<size_t>& ids, double now_ms) {
     std::unique_lock<std::mutex> lk(mtx_);
     for (size_t id : ids) done_ms_[id] = now_ms;
@@ -270,13 +284,16 @@ class MultiGpuCtx {
   char* pool_buf() { return d_pool_; }
 };
 
-// ---- 五模式 N 卡驱动 ----
-// mode: 0=A 1=B 2=C 3=D1 4=D2
+// ---- 六模式 N 卡驱动 ----
+// mode: 0=A 1=B 2=C 3=D1 4=D2 5=E
 //   A/B/C 语义见文件头；D1/D2 为 B1 公平对照（实验设计 W6）：
 //   与 C 完全同一执行引擎（自适应批 + 独立 H2D 流水 + 在途窗口 + 事件收割），
 //   唯一变量 = 窃取粒度：
 //     D1 = 单任务窃取（与 B 同粒度）→ 隔离"批窃取"本身的贡献
 //     D2 = 偷一半（victim/2，不按消费批截断）→ StealHalf(Hendler-Shavit) 粒度对照
+//   E（mode 5）为 B2 成本感知对照（实验设计 W7）：
+//   与 C 同引擎同窃取语义（按消费批窃取），唯一变量 = 批大小决策：
+//     C = choose_mb(NT 常量)；E = 按积压/源剩余/在途/饱和区实时决策
 inline MultiStats run_multigpu(const std::vector<int>& devices,
                                const std::vector<Task>& tasks, int mode,
                                const AdaptiveBatchPolicy& pol,
@@ -310,6 +327,7 @@ inline MultiStats run_multigpu(const std::vector<int>& devices,
   // 每卡执行线程
   std::vector<std::thread> execs;
   std::atomic<uint64_t> migrations{0}, steals{0};
+  std::atomic<uint64_t> batch_tasks_sum{0};  // C 族遥测：累计批内任务数
   std::atomic<size_t> migrated_bytes{0};
   std::vector<uint64_t> done_cnt(n, 0);
 
@@ -433,25 +451,46 @@ inline MultiStats run_multigpu(const std::vector<int>& devices,
           submit_batch(ids, /*seq=*/true);
         }
       } else {
-        // C 族（mode 2/3/4）：同一执行引擎（自适应批 + 双流流水 + 在途窗口 +
-        // 事件收割），B1 公平对照的唯一变量 = 窃取粒度。
-        //   steal() 的实际拔取量 = min(请求量, victim/2+1, capacity)，
-        //   故请求量 1 / batch / SIZE_MAX 分别对应 one-steal / 批窃取 / steal-half。
+        // C 族（mode 2/3/4/5）：同一执行引擎（双流流水 + 在途窗口 + 事件收割）。
+        //   B1（W6）对照的唯一变量 = 窃取粒度：steal() 实际拔取 =
+        //   min(请求量, victim/2+1, capacity)，请求量 1 / batch / SIZE_MAX
+        //   分别对应 one-steal(D1) / 批窃取(C) / steal-half(D2)。
+        //   B2（W7，mode 5 = costaware-E）的唯一变量 = 批大小决策：
+        //   C 用 NT 常量，E 用实时状态（积压/源剩余/在途/饱和区）。
         const size_t thr = (size_t)(steal_threshold * 64);
         uint64_t idle_iters = 0;
         auto steal_req = [&](size_t batch) -> size_t {
           if (mode == 3) return 1;           // D1：单任务窃取（B 的粒度）
           if (mode == 4) return SIZE_MAX;    // D2：偷一半（不按批截断）
-          return batch;                      // C ：批窃取（Ferry 主张）
+          return batch;                      // C/E：按消费批窃取
         };
         while (true) {
           if (ctx.all_done()) break;
-          // 批粒度：自适应（按剩余总量）
-          const double pend_mb =
-              (double)(NT - 0) * (double)ctx.payload_bytes() / (1 << 20);
-          const double gmb = pol.choose_mb(pend_mb);
-          size_t batch = std::max<size_t>(
-              (size_t)(gmb * (1 << 20) / ctx.payload_bytes()), 16);
+          size_t batch;
+          if (mode == 5) {
+            // E（B2 成本感知批粒度）：四路输入按实验设计 W7 决策——
+            //   ① 消费卡积压 my_occ + ② 源卡剩余 busiest_other → 可见工作量
+            //   ③ 在途窗口占用 inflight → 反压（可见量摊到所有在途槽）
+            //   ④ 通道饱和区 saturation_mb → 吞吐下界（工作不足时不硬凑大批）
+            // 规则：eff = visible/(1+inflight)，夹到 [min(饱和点, 可见量), max_mb]
+            const size_t my_occ = ctx.occ(g);
+            const size_t src_occ = ctx.busiest_other(g);
+            const double visible_mb =
+                (double)(my_occ + src_occ) * (double)ctx.payload_bytes() / (1 << 20);
+            double eff = visible_mb / (1.0 + (double)inflight);
+            const double lo = std::min(pol.saturation_mb, visible_mb);
+            eff = std::max(eff, lo);
+            eff = std::min(eff, pol.max_mb);
+            batch = std::max<size_t>(
+                (size_t)(eff * (1 << 20) / ctx.payload_bytes()), 1);
+          } else {
+            // C/D1/D2：批粒度 = 剩余总量（NT，全程常量）——B2 要替换的对象
+            const double pend_mb =
+                (double)(NT - 0) * (double)ctx.payload_bytes() / (1 << 20);
+            const double gmb = pol.choose_mb(pend_mb);
+            batch = std::max<size_t>(
+                (size_t)(gmb * (1 << 20) / ctx.payload_bytes()), 16);
+          }
           std::vector<size_t> ids = ctx.take_local(g, batch);
           if (ids.empty()) {
             // 本地空：水位=0 < 阈值 → 按模式粒度窃取
@@ -482,6 +521,7 @@ inline MultiStats run_multigpu(const std::vector<int>& devices,
           }
           // 在途窗口满 → 先收最早一批
           while (inflight >= pending_ahead) drain_one();
+          batch_tasks_sum.fetch_add(ids.size());
           submit_batch(ids, /*seq=*/false);
         }
         // 收尾：收割在途
@@ -502,6 +542,9 @@ inline MultiStats run_multigpu(const std::vector<int>& devices,
   st.migrated_bytes = migrated_bytes.load();
   st.steals = steals.load();
   st.throughput = (double)NT / (st.makespan_ms / 1000.0);
+  st.mean_batch_tasks =
+      st.migrations ? (double)batch_tasks_sum.load() / (double)st.migrations
+                    : 0.0;
 
   // p50/p99 与均衡度
   {

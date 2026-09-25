@@ -20,6 +20,10 @@ struct AdaptiveBatchPolicy {
   double min_mb = 1.0;   // 下界（P1 拐点左端）
   double max_mb = 4.0;   // 上界（P1 拐点右端）
   double target_batches = 4.0;  // 目标批数（摊薄往返又不至于长尾）
+  // 通道饱和点（probe --bw 实测拐点；B2 成本感知决策的下界依据）。
+  // 批字节 ≥ 此值时 host-staged 通道带宽进入饱和区（集群 PCIe4 ≈1MB，
+  // vast PCIe3 ≈1MB 且 1–16MB 缓升），低于此值带宽打折。
+  double saturation_mb = 1.0;
 
   // 依据「剩余待迁移量」选择本批大小（MB）
   // 逻辑：目标约 target_batches 批完成；夹到 [min_mb, max_mb]
