@@ -1,0 +1,46 @@
+config,metric,value,unit,note
+x2,baseline_B_makespan,96.72,ms,src=0 dst=1 steady medium 32768 tick=0.0005
+x2,full_C_makespan,45.29,ms,ns2-ad1-ov1（完整 C）
+x2,full_C_vs_B,2.14,x,
+x2,M1_nstreams_contrib,0.99,x,n_streams 开关测不到 M1（与实验设计一致）
+x2,M2_contrib,1.00,x,自适应粒度
+x2,M3_contrib,1.93,x,overlap=seq
+x2,M1_p1_contrib,1.90,x,P1 单流交替（正确去 M1）
+x2,P1_ov1_makespan,85.86,ms,
+x2,P1_ov0_makespan,87.24,ms,
+x2,overlap_ratio,0.264,,1 - T_pipe/(T_comm+T_compute)
+x2,T_pipe,45.29,ms,
+x2,T_comm_alone,45.10,ms,
+x2,T_compute_alone,16.46,ms,
+x2,batches,139,count,
+x2,arrival_span,16.38,ms,
+x23_phb,baseline_B_makespan,96.78,ms,src=2 dst=3（PHB 互联对）steady medium 32768
+x23_phb,full_C_makespan,45.43,ms,ns2-ad1-ov1（完整 C）
+x23_phb,full_C_vs_B,2.13,x,
+x23_phb,M1_nstreams_contrib,0.99,x,
+x23_phb,M2_contrib,1.00,x,
+x23_phb,M3_contrib,1.93,x,
+x23_phb,M1_p1_contrib,1.89,x,P1 单流交替
+x23_phb,P1_ov1_makespan,85.87,ms,
+x23_phb,P1_ov0_makespan,87.27,ms,
+x23_phb,overlap_ratio,0.263,,
+x23_phb,T_pipe,45.40,ms,
+x23_phb,T_comm_alone,45.17,ms,
+x23_phb,T_compute_alone,16.42,ms,
+x23_phb,batches,139,count,
+x23_phb,arrival_span,16.38,ms,
+x4,baseline_B_makespan,96.54,ms,src=0 dst=2 steady medium 32768 tick=0.0005
+x4,full_C_makespan,45.26,ms,ns2-ad1-ov1（完整 C）
+x4,full_C_vs_B,2.13,x,
+x4,M1_nstreams_contrib,0.99,x,n_streams 开关测不到 M1
+x4,M2_contrib,1.00,x,自适应粒度
+x4,M3_contrib,1.93,x,overlap=seq
+x4,M1_p1_contrib,1.90,x,P1 单流交替（正确去 M1）
+x4,P1_ov1_makespan,85.81,ms,
+x4,P1_ov0_makespan,87.15,ms,
+x4,overlap_ratio,0.264,,1 - T_pipe/(T_comm+T_compute)
+x4,T_pipe,45.28,ms,
+x4,T_comm_alone,45.05,ms,
+x4,T_compute_alone,16.46,ms,
+x4,batches,139,count,
+x4,arrival_span,16.38,ms,

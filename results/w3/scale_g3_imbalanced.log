@@ -1,0 +1,5 @@
+[multigpu] gpus=0,1,2 arrival=steady skew=imbalanced tasks=32768 tick=0.0005 steal_thr=0.25
+  static-A   makespan=   387.49ms tput=    84564 p50=  377.88 p99=   387.17 steals=      0 migr=      3 bytes=  512.00MB imb=1.128
+  dyn-B      makespan=   549.78ms tput=    59601 p50=  281.45 p99=   538.53 steals=  17876 migr=  32768 bytes=  512.00MB imb=0.029
+  ferry-C    makespan=   301.13ms tput=   108816 p50=  180.39 p99=   292.69 steals=     81 migr=    143 bytes=  512.00MB imb=0.111
+  => C/A 1.29x  C/B 1.83x  steals(B/C) 17876/81

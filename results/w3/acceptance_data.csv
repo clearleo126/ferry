@@ -1,0 +1,78 @@
+section,item,gpu_a,gpu_b,size_mb,value,unit,note
+interconnect,type,0,1,,NODE,,nvidia-smi topo -m
+interconnect,type,0,2,,NODE,,nvidia-smi topo -m
+interconnect,type,0,3,,NODE,,nvidia-smi topo -m
+interconnect,type,1,2,,NODE,,nvidia-smi topo -m
+interconnect,type,1,3,,NODE,,nvidia-smi topo -m
+interconnect,type,2,3,,PHB,,nvidia-smi topo -m
+interconnect,nvlink,,,   ,0,count,无 NV# 即无 NVLink
+pcie_link,link_width_max,0,,,16,lane,4 卡全 x16（非 x4 挂 switch）
+pcie_link,link_width_max,1,,,16,lane,4 卡全 x16
+pcie_link,link_width_max,2,,,16,lane,4 卡全 x16
+pcie_link,link_width_max,3,,,16,lane,4 卡全 x16
+pcie_link,link_gen_max,0,,,3,gen,Host Max=3 / Device Max=4 → 本机受限于 PCIe 3.0
+pcie_link,link_gen_max,1,,,3,gen,Host Max=3
+pcie_link,link_gen_max,2,,,3,gen,Host Max=3
+pcie_link,link_gen_max,3,,,3,gen,Host Max=3
+pcie_link,link_gen_current_underload,0,,,3,gen,空闲为 1，负载下升到 3（确认可跑满 gen3）
+pcie_link,link_gen_current_underload,1,,,3,gen,空闲为 1，负载下升到 3
+numa,node_count,,,   ,1,count,AMD EPYC 7282 单 socket；4 卡同 NUMA0
+p2p,peer_access_sum,all,all,,0,count,16/16 组查询全 0（PASS）
+host_staged_pairwise,batched,0,1,,5.74,GB/s,probe 默认报告 2MB 粒度
+host_staged_pairwise,batched,0,2,,5.74,GB/s,
+host_staged_pairwise,batched,0,3,,5.74,GB/s,
+host_staged_pairwise,batched,1,2,,5.74,GB/s,
+host_staged_pairwise,batched,1,3,,5.74,GB/s,
+host_staged_pairwise,batched,2,3,,5.73,GB/s,
+host_staged_pairwise,nonbatched,0,1,,5.81,GB/s,speedup 0.99x
+host_staged_pairwise,nonbatched,0,2,,5.82,GB/s,speedup 0.99x
+host_staged_pairwise,nonbatched,0,3,,5.80,GB/s,speedup 0.99x
+host_staged_pairwise,nonbatched,1,2,,5.81,GB/s,speedup 0.99x
+host_staged_pairwise,nonbatched,1,3,,5.81,GB/s,speedup 0.99x
+host_staged_pairwise,nonbatched,2,3,,5.82,GB/s,speedup 0.99x
+bench_comm,channel,0,0,,10.31,GB/s,GPU0 环回 256MB slot2MB x4
+bench_comm,p1_batched,0,0,,5.79,GB/s,单流交替 D2H->H2D
+bench_comm,ratio,0,0,,1.782,x,工具判定 (PASS >=0.95x)
+probe_bw,gbps_batched,0,3,0.016,1.21,GB/s,nonbatched=1.22 speedup=0.991
+probe_bw,gbps_batched,0,3,0.032,2.14,GB/s,nonbatched=2.15 speedup=0.993
+probe_bw,gbps_batched,0,3,0.064,2.54,GB/s,nonbatched=2.35 speedup=1.084
+probe_bw,gbps_batched,0,3,0.128,4.04,GB/s,nonbatched=3.93 speedup=1.029
+probe_bw,gbps_batched,0,3,0.25,4.55,GB/s,nonbatched=4.76 speedup=0.956
+probe_bw,gbps_batched,0,3,0.5,5.14,GB/s,nonbatched=5.34 speedup=0.963
+probe_bw,gbps_batched,0,3,1.0,5.51,GB/s,nonbatched=5.47 speedup=1.007
+probe_bw,gbps_batched,0,3,2.0,5.73,GB/s,nonbatched=5.80 speedup=0.987
+probe_bw,gbps_batched,0,3,4.0,5.85,GB/s,nonbatched=5.84 speedup=1.002
+probe_bw,gbps_batched,0,3,8.0,5.91,GB/s,nonbatched=5.93 speedup=0.997
+probe_bw,gbps_batched,0,3,16.0,5.95,GB/s,nonbatched=5.97 speedup=0.997
+reference,single_stream_saturated,,,,11.9,GB/s,集群 4x3090（本机 5.95 → 0.50x）
+reference,bench_comm_channel,,,,19.15,GB/s,集群 4x3090（本机 10.31 → 0.54x）
+reference,bench_comm_p1_batched,,,,10.36,GB/s,集群 4x3090（本机 5.79 → 0.56x）
+reference,bench_comm_ratio,,,,1.85,x,集群 4x3090（本机 1.782 → -3.7%）
+smoke,2gpu_makespan_C,0,1,,318.85,ms,gpus 0,1 tasks 32768 steady balanced；C/A 1.22x C/B 1.45x
+smoke,4gpu_makespan_C,0,3,,471.27,ms,gpus 0-3 tasks 65536 steady imbalanced；C/A 1.49x C/B 1.86x
+smoke,4gpu_steals_C,all,all,,177,count,B 为 42622 次单任务窃取；A imb 1.380 -> C 0.036
+hardware,cpu_model,all,all,,EPYC 7282,model,AMD Zen2 Rome；family23/model49/stepping0
+hardware,cpu_sockets,all,all,,1,count,
+hardware,cpu_cores_threads,all,all,,16C/32T,count,SMT=2
+hardware,cpu_freq_min,all,all,,1500,MHz,scaling_min_freq
+hardware,cpu_freq_max,all,all,,2800,MHz,scaling_max_freq；boost enabled
+hardware,cpu_l2_cache,all,all,,8,MiB,16x512K
+hardware,cpu_l3_cache,all,all,,64,MiB,4x16M
+hardware,mem_total,all,all,,251.5,GiB,MemTotal 263785016 kB
+hardware,mem_total_mb,all,all,,39,GiB,swap
+hardware,mem_speed_type_channels,all,all,,,,容器内取不到（无 dmidecode/lshw、无 /sys/firmware/dmi）；需宿主机 dmidecode -t 17
+hardware,hugepages_total,all,all,,0,count,
+hardware,thp_enabled,all,all,,never,,透明大页关闭
+hardware,kernel,all,all,,5.15.0-139-generic,,
+hardware,gpu_sm_count_per_card,all,all,,82,count,RTX 3090
+hardware,gpu_max_sm_clock,all,all,,2100,MHz,空闲 210
+hardware,gpu_max_mem_clock,all,all,,9751,MHz,空闲 405；GDDR6X 标称 936 GB/s
+hardware,gpu_power_default_limit,all,all,,350,W,单卡
+hardware,gpu_power_max_limit,all,all,,400,W,单卡
+hardware,nvlink,all,all,,0,count,4 卡均无 NVLink
+instance,instance_id,all,all,,52221097,id,vast.ai
+instance,machine_id,all,all,,2982,id,vast.ai 宿主机编号
+instance,vram_platform,all,all,,257.6,GB,平台口径（容器内 251.5 GiB）
+instance,vcpu_platform,all,all,,32,count,
+instance,net_up,all,all,,879.2,Mbps,平台侧
+instance,net_down,all,all,,714.6,Mbps,平台侧

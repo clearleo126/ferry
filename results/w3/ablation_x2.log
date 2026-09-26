@@ -1,0 +1,14 @@
+[ablation] arrival=steady sparsity=medium skew=balanced tasks=32768 tick=0.0005 fixed=4.0MB src=0 dst=1
+  baseline-B     makespan=    96.72ms tput=   338782 p50=   40.47 p99=    79.58 migr=   512
+  ns1-ad0-ov0    makespan=    87.15ms tput=   375989 p50=   36.11 p99=    70.31 migr=   128  (vs B 1.11x)
+  ns1-ad0-ov1    makespan=    44.86ms tput=   730401 p50=   35.33 p99=    43.34 migr=   128  (vs B 2.16x)
+  ns1-ad1-ov0    makespan=    87.46ms tput=   374673 p50=   36.14 p99=    70.37 migr=   139  (vs B 1.11x)
+  ns1-ad1-ov1    makespan=    44.98ms tput=   728536 p50=   36.51 p99=    44.51 migr=   139  (vs B 2.15x)
+  ns2-ad0-ov0    makespan=    87.21ms tput=   375746 p50=   36.16 p99=    70.36 migr=   128  (vs B 1.11x)
+  ns2-ad0-ov1    makespan=    45.17ms tput=   725363 p50=   35.64 p99=    43.65 migr=   128  (vs B 2.14x)
+  ns2-ad1-ov0    makespan=    87.46ms tput=   374647 p50=   36.14 p99=    70.38 migr=   139  (vs B 1.11x)
+  ns2-ad1-ov1    makespan=    45.29ms tput=   723528 p50=   36.80 p99=    44.81 migr=   139  (vs B 2.14x)
+  => M1(n_streams) 贡献: 0.99x  M2 贡献: 1.00x  M3 贡献: 1.93x  完整C vs B: 2.14x
+  => M1(P1 单流交替,去分向重叠) 贡献: 1.90x  (P1+ov1 85.86ms vs channel+ov1 45.29ms；P1+ov0 87.24ms)
+  => overlap ratio 0.264  (T_pipe=45.29  T_comm_alone=45.10  T_compute_alone=16.46 ms; batches=139 arrival_span=16.38ms tick=0.0005)
+  => overlap CSV: results/w3/ablation_x2.csv_overlap.csv
