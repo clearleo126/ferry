@@ -27,7 +27,6 @@ INTERVAL=120          # 轮询间隔（秒），避免频繁打扰 nvidia-smi
 cd "$(dirname "$0")"
 BUILD_DIR="build"
 STAMP="$(date +%Y%m%d_%H%M%S)"
-RESULT_DIR="results/${JOB}_$(date +%Y%m%d_%H%M%S)"
 TRIGGER_FLAG="/tmp/ferry_window_triggered_${STAMP}"
 
 echo "[watch] start $(date)  threshold=${THRESHOLD} mode=${MODE} interval=${INTERVAL}s"
@@ -40,6 +39,10 @@ free_gpus() {
 trigger_r3() {
   local gpus="$1"
   local ndev="$2"
+  # ⚠️ 每轮独立目录：RESULT_DIR 必须在触发时算，不能放在脚本启动处——
+  #    否则同一进程的第二轮窗口会复用同名目录，把第一轮数据静默覆盖
+  #    （2026-09-27 实际踩过：第二轮把 mg_bursty_balanced.log 截成 2 行）。
+  local RESULT_DIR="results/${JOB}_$(date +%Y%m%d_%H%M%S)"
   echo ""
   echo "=========================================="
   echo "[watch] 窗口开启! $(date)  job=${JOB}"
