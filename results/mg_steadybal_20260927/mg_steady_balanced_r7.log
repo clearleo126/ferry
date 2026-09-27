@@ -1,0 +1,10 @@
+[multigpu] gpus=0,1,2,3 arrival=steady skew=balanced tasks=32768 tick=0.0005 steal_thr=0.25 sat=1.00MB
+  static-A   makespan=   244.11ms tput=   134235 p50=  214.42 p99=   243.35 steals=      0 migr=      4 bytes=  512.00MB imb=0.000
+  dyn-B      makespan=   306.48ms tput=   106917 p50=  152.58 p99=   289.42 steals=   1556 migr=  32768 bytes=  512.00MB imb=0.111
+  ferry-C    makespan=   180.83ms tput=   181207 p50=  107.12 p99=   165.05 steals=     29 migr=    148 bytes=  512.00MB imb=0.058
+  one-steal-D1 makespan=   204.63ms tput=   160132 p50=  116.92 p99=   189.29 steals=    679 migr=    802 bytes=  512.00MB imb=0.046
+  half-steal-D2 makespan=   208.91ms tput=   156850 p50=  123.30 p99=   194.94 steals=     26 migr=    148 bytes=  512.00MB imb=0.117
+  costaware-E makespan=   181.40ms tput=   180635 p50=  107.52 p99=   165.21 steals=     30 migr=    158 bytes=  512.00MB imb=0.055
+  => C/A 1.35x  C/B 1.69x  steals(B/C) 1556/29
+  => [B1] D1 204.63ms(steals 679) D2 208.91ms(steals 26) | C/D1 1.13x  C/D2 1.16x
+  => [B2] C 180.83ms(mean batch 221.4) E 181.40ms(mean batch 207.4) | C/E 1.00x  E p99 165.21 vs C p99 165.05
