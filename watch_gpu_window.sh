@@ -11,6 +11,7 @@
 #   ./watch_gpu_window.sh 4 notify   # 4 卡窗口，触发时发桌面通知
 #   ./watch_gpu_window.sh 2 auto     # 触发后自动跑 R3 矩阵（写 results 目录）
 #   ./watch_gpu_window.sh 4 auto mg  # 4 卡真空闲自动跑 N 卡控制面矩阵
+#   ./watch_gpu_window.sh 4 auto b2  # 4 卡真空闲跑 mg 4 行 + B2/P1 饱和点扫描（B2_REPS 控重复数）
 #
 # 后台常驻：
 #   nohup ./watch_gpu_window.sh 4 auto mg >> watch_gpu.log 2>&1 &
@@ -20,7 +21,7 @@ set -u
 
 THRESHOLD="${1:-3}"
 MODE="${2:-notify}"   # notify | auto
-JOB="${3:-r3}"        # r3 | mg（N 卡控制面矩阵）
+JOB="${3:-r3}"        # r3 | mg（N 卡控制面矩阵） | b2（mg + B2/P1 专项）
 INTERVAL=120          # 轮询间隔（秒），避免频繁打扰 nvidia-smi
 
 cd "$(dirname "$0")"
@@ -53,14 +54,25 @@ trigger_r3() {
   if [ "$MODE" != "auto" ]; then
     echo "[watch] mode=notify，不自动执行。手动跑："
     echo "  cd $(pwd)/$BUILD_DIR"
-    echo "  ./run_multigpu --gpus $gpus --tasks 32768 --tick 0.0005"
+    # ⚠️ 必须逗号分隔（空格会被 run_multigpu 静默截断成单卡，见 说明文档 §6 第 2 条）
+    echo "  ./run_multigpu --gpus $(IFS=,; echo $gpus) --tasks 32768 --tick 0.0005"
     return 0
   fi
 
-  # 读空闲卡列表（gpus 为空格分隔字符串）
-  mapfile -t GPUS <<< "$gpus"
+  # 读空闲卡列表（gpus 为空格分隔字符串）。
+  # ⚠️ 必须用 read -ra 按空白切分：mapfile 是按"行"切分的，传入的单行
+  #    "0 1 2 3" 会被当成 1 个元素，导致 dev_csv="0 1 2 3"（带空格）→
+  #    run_multigpu 的 --gpus 只解析出 "0" → 静默跑成单卡。
+  local -a GPUS
+  read -ra GPUS <<< "$gpus"
   local dev_csv
   dev_csv=$(IFS=,; echo "${GPUS[*]}")
+  # 自检：元素数必须等于探测器报告的卡数，否则立即失败（不再静默产废数据）
+  if [ "${#GPUS[@]}" -ne "$ndev" ]; then
+    echo "[watch] ✗ 致命：解析出 ${#GPUS[@]} 张卡，但探测器报告 $ndev 张（gpus='$gpus'）"
+    return 1
+  fi
+  echo "[watch] 解析卡列表: ${GPUS[*]}  ->  --gpus $dev_csv  (n=$ndev)"
 
   # ---- mg 作业：N 卡控制面矩阵（R6 的前半）----
   if [ "$JOB" = "mg" ]; then
@@ -94,6 +106,59 @@ trigger_r3() {
       echo "[watch]   wlA $arr done"
     done
     echo "[watch] mg 矩阵完成: $RESULT_DIR ($(date))"
+    return 0
+  fi
+
+  # ---- b2 作业：4 卡窗口的"一次吃满"组合（窗口极稀缺，2026-09-26 实测
+  #      1440 次轮询里 4 卡窗口仅出现 1 次，故一次窗口内同时产出两类数据）----
+  #   step1  mg 4 行  → 集群 PCIe4 的绝对主数字（vast 只有 PCIe3）
+  #   step2  B2 专项  → W7 成本感知批粒度 + P1 饱和点扫描（7 次/档）
+  #  判据：某 sat 档出现拐点且 E 优于 C ≥1.05× ⇒ P1/P2 成立；
+  #        曲线仍平 ⇒ B2 降级（详见 实验设计.txt【15】）。
+  #  注：PCIe3/PCIe4 饱和点不同，sat 档位特意含 0.125/0.25 低档。
+  if [ "$JOB" = "b2" ]; then
+    mkdir -p "$RESULT_DIR"
+    local REP="${B2_REPS:-7}"
+    echo "[watch] auto 模式：b2 组合开始（${REP} 次/档），结果 -> $RESULT_DIR"
+    # step0 通道带宽复测（P1 的横轴依据，也用于判断 knee 是否漂移）
+    CUDA_VISIBLE_DEVICES="$dev_csv" "$BUILD_DIR/probe" --bw \
+      --csv "$RESULT_DIR/probe_bw.csv" > "$RESULT_DIR/probe.log" 2>&1
+    echo "[watch] step0 done: probe_bw.csv"
+    # step1 PCIe4 绝对主数字：N 卡控制面 4 格
+    for arr in steady bursty; do
+      for skew in balanced imbalanced; do
+        CUDA_VISIBLE_DEVICES="$dev_csv" "$BUILD_DIR/run_multigpu" \
+          --gpus "$dev_csv" --arrival "$arr" --skew "$skew" \
+          --tasks 32768 --tick 0.0005 --inner 2 --sparsity 16KB \
+          > "$RESULT_DIR/mg_${arr}_${skew}.log" 2>&1
+        echo "[watch] step1: mg $arr/$skew done"
+      done
+    done
+    # step2 B2 专项：steady/imb × sat 扫描 × REP
+    for sat in 0.125 0.25 0.5 1 2; do
+      for r in $(seq 1 "$REP"); do
+        CUDA_VISIBLE_DEVICES="$dev_csv" "$BUILD_DIR/run_multigpu" \
+          --gpus "$dev_csv" --arrival steady --skew imbalanced \
+          --tasks 32768 --tick 0.0005 --inner 2 --sparsity 16KB --sat-mb "$sat" \
+          > "$RESULT_DIR/b2_steady_imb_sat${sat}_r${r}.log" 2>&1
+      done
+      echo "[watch] step2: steady/imb sat=${sat}MB × ${REP} done ($(date +%H:%M:%S))"
+    done
+    # step3 B2 对照：bursty/imb 中档
+    for r in $(seq 1 "$REP"); do
+      CUDA_VISIBLE_DEVICES="$dev_csv" "$BUILD_DIR/run_multigpu" \
+        --gpus "$dev_csv" --arrival bursty --skew imbalanced \
+        --tasks 32768 --tick 0.0005 --inner 2 --sparsity 16KB --sat-mb 1 \
+        > "$RESULT_DIR/b2_bursty_imb_sat1_r${r}.log" 2>&1
+    done
+    echo "[watch] step3: bursty/imb sat=1MB × ${REP} done"
+    # step4 废数据自检：首行 --gpus 必须是逗号形式（见 说明文档 §6 第 2 条）
+    local bad=0
+    for f in "$RESULT_DIR"/*.log; do
+      grep -q "gpus=[0-9],[0-9]" "$f" || { echo "[watch] ✗ 参数回显异常: $f"; bad=$((bad+1)); }
+    done
+    echo "[watch] 自检：${bad} 个文件回显异常（应为 0）"
+    echo "[watch] b2 组合完成: $RESULT_DIR ($(date))"
     return 0
   fi
 
