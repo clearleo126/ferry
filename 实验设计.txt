@@ -195,8 +195,10 @@ GPU 只驻留每请求每层热工作集；miss 经 PCIe 以流水化批传输�
 Related work 必引（差异化定位）：StealHalf（Hendler-Shavit SPAA'02，粒度理论）+ Llumnix
 （OSDI'24，请求级活迁移）+ Mooncake（FAST'25，放置决策）+ Preble（SOSP'24，复用 vs 均衡）
 + HiSparse（arXiv:2608.07009，单卡分层 KV，与本文多卡控制面互补）。
-投稿：**ICDCS 主投**（安稳路线，先把 B2/C 闭环做实）；IPDPS'27（摘要 10/1、全文 10/8 AoE）
-仅在 B2 成本感知决策 + B1 公平基线数据闭环后作为机会性投稿，不为其压缩验证深度；
+投稿：**ICDCS 主投**（唯一目标，安稳路线）。**IPDPS'27 已放弃（2026-09-30 决定）**：
+原定"摘要 10/1、全文 10/8 AoE 机会性投稿"取消——C1 闭合 + WlA-E 复活后主结论已扎实，
+不再以压缩验证深度换时间线；B2 在 Workload B 的负结果也已按"regime 无耦合对象"诚实收束。
+剩余工作按科学必要性排（C2 dest 叙事 > P4 跨平台对照 > D1/D2 接入 WlA），不按 deadline 排。
 ICS 备选（persistent kernel/profiling）；ICML 不做默认。
 
 【4. RQ】
