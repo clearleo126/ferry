@@ -1,0 +1,7 @@
+[wla-mg] gpus=0 arrival=steady skew=balanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4
+  static-A  makespan=  2988.66ms steps/s=   16.1 p50=174.392 p99= 206.862 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.000
+  dyn-B     makespan=   507.35ms steps/s=   94.6 p50= 18.809 p99= 151.394 steals=   6 migr=  144.0MB(  6 reqs) refill=  79550 seg  1242.97MB imb=0.295
+  ferry-C   makespan=   337.63ms steps/s=  142.2 p50= 14.329 p99=  38.150 steals=   5 migr=  312.0MB( 13 reqs) refill=  59863 seg  1242.97MB imb=0.102
+  => C/A 8.85x  C/B 1.50x
+  => [C1-结构] migr(MB): A=0.0 B=144.0 C=312.0 | steals: B=6 C=5 | refill_seg: A=589824 B=79550 C=59863  [PASS]
+  => hit_rate=0.865  refill_bytes A=9216.00 B=1242.97 C=1242.97 MB (应全等：trace 固定)

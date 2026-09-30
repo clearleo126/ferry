@@ -127,6 +127,12 @@ add_executable(run_multigpu
 )
 target_link_libraries(run_multigpu PRIVATE ferry_workloads ferry_comm ferry_runtime ferry_config ferry_common)
 
+# run_wla_multigpu: Workload A N 卡闭环（C1：请求级迁移 + 连续批 decode）
+add_executable(run_wla_multigpu
+  src/benches/run_wla_multigpu.cu
+)
+target_link_libraries(run_wla_multigpu PRIVATE ferry_workloads ferry_comm ferry_runtime ferry_config ferry_common)
+
 # ------------------------------------------------------------------
 # 后续模块（P2 中逐步添加，先占位说明）
 #   workloads/: Workload A/B 生成器
