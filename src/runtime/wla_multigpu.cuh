@@ -23,7 +23,10 @@
 //     miss 逐 C4 回填 + 逐次 sync（细粒度对照面）
 //   C ferry：水位批偷 k 请求（k 个热集合并迁移，一批一 sync）；
 //     每 (req,step) miss 聚合 + 自适应批合并回填 + 双流重叠（wait_last_arrival）
-//   D1/D2/E（B1/B2 对照）预留：同引擎改窃取粒度/批决策，C1 闭合后接入
+//   E costaware（mode 3）：与 C 同引擎同窃取语义，唯一变量 = 窃取决策——
+//     只迁"剩余工作量 ≥ margin × 迁移成本"的请求（T2 迁移带宽与 T3 剩余
+//     工作的真实耦合；WlA 的 payload 随窃取迁移，这是该决策第一次有
+//     可测代价与可证伪预测的 regime，见 实验设计【15】）
 //
 // tick/窃取互斥（in_tick_ 协议 + 协作让渡窗口）：
 //   卡 g 的 tick 持 in_tick_[g]=true（ctx 锁内置位/清除）；窃取者等 victim
@@ -93,7 +96,20 @@ struct WlaMultiStats {
   size_t refill_bytes = 0;         // H2D miss 字节
   double imbalance = 0.0;          // 各卡完成请求数变异系数
   double hit_rate = 0.0;
+  uint64_t steal_refused = 0;      // E 遥测：因"剩余工作 < 迁移成本"拒绝的窃取
   int n_gpus = 0;
+};
+
+// E（mode 3）成本感知窃取策略：与 C 的唯一差异 = 窃取决策。
+//   四路输入（对齐 multigpu W7 的四路框架）：
+//   ① victim 盈余（cur - fair）                    —— 窃取量上界（防乒乓）
+//   ② 每请求剩余工作 (steps-next_step)×step_ema    —— 迁移收益
+//   ③ 迁移成本 2×seg/mig_bw（host-staged 双向 D2D）—— T2 的真实带宽项
+//   ④ 窃取者步成本 step_ema（含回填争用的实测边际成本）
+struct WlaStealPolicy {
+  bool cost_filter = false;   // E 开关：false = C 语义（不按成本过滤）
+  double mig_bw_gbs = 11.0;   // D2D 有效带宽（probe --bw 实测口径）
+  double margin = 2.0;        // value ≥ margin×cost 才迁（补偿争用低估）
 };
 
 // 偏移（与 kv_exec.cuh 同布局；独立命名避免头冲突）
@@ -246,7 +262,7 @@ class WlaMultiGpuCtx {
 
   // ---- 窃取 + D2D 迁移（仅卡 g 线程调用；全程序串行化） ----
   // 拔 victim 队尾最多 k 个请求（push_front 到本卡），迁移其热集段
-  size_t steal_migrate(int g, size_t k) {
+  size_t steal_migrate(int g, size_t k, const WlaStealPolicy& pol) {
     std::lock_guard<std::mutex> slk(steal_lock_);
     int v = -1;
     std::vector<int> moved;
@@ -272,8 +288,30 @@ class WlaMultiGpuCtx {
       const size_t cur = local_[v].size();
       const size_t fair = fair_share();
       if (cur <= fair) return 0;  // victim 无盈余（防乒乓：不让其跌破公平份额）
-      const size_t take = std::min(std::min(k, cur - fair), cur / 2 + 1);
+      size_t take = std::min(std::min(k, cur - fair), cur / 2 + 1);
       if (take == 0) return 0;
+      if (pol.cost_filter) {
+        // E：价值过滤 —— 只迁"剩余工作 ≥ margin × 迁移成本"的请求。
+        // 候选自队尾起（最近到达 = 剩余步最多），取通过过滤的最长前缀
+        const double cost_ms =
+            2.0 * (double)seg_ / (pol.mig_bw_gbs * 1e9) * 1e3;
+        const double step_ms = step_ms_ema_.load();
+        size_t ok = 0;
+        for (size_t j = 0; j < take; ++j) {
+          const int r = local_[v][local_[v].size() - 1 - j];
+          const double value =
+              (double)(sp_.steps - next_step_[r]) * step_ms;
+          if (value >= pol.margin * cost_ms)
+            ++ok;
+          else
+            break;
+        }
+        if (ok == 0) {
+          steal_refused_.fetch_add(1);
+          return 0;
+        }
+        take = ok;
+      }
       if (std::getenv("FERRY_WLA_DEBUG"))
         std::fprintf(stderr,
                      "[steal] g=%d v=%d take=%zu cur(v)=%zu fair=%zu "
@@ -337,6 +375,13 @@ class WlaMultiGpuCtx {
   uint64_t steals() const { return steals_.load(); }
   uint64_t migrated_reqs() const { return migrated_reqs_.load(); }
   size_t migrated_bytes() const { return migrated_bytes_.load(); }
+  uint64_t steal_refused() const { return steal_refused_.load(); }
+  // E 决策输入④：tick 实测的每请求步成本（含回填/迁移的通道争用）
+  void update_step_ema(double tick_ms, size_t executed) {
+    if (executed == 0) return;
+    const double per = tick_ms / (double)executed;
+    step_ms_ema_.store(0.9 * step_ms_ema_.load() + 0.1 * per);
+  }
 
  private:
   struct Req {
@@ -369,15 +414,21 @@ class WlaMultiGpuCtx {
   std::atomic<size_t> completed_{0};
   std::atomic<uint64_t> steals_{0}, migrated_reqs_{0};
   std::atomic<size_t> migrated_bytes_{0};
+  std::atomic<double> step_ms_ema_{2.0};   // E 决策输入④：每请求步成本 EMA
+  std::atomic<uint64_t> steal_refused_{0}; // E 遥测：价值不足拒绝的窃取数
 };
 
-// ---- 三模式 N 卡驱动（mode: 0=A 1=B 2=C）----
+// ---- N 卡驱动（mode: 0=A 1=B 2=C 3=E）----
+// E 与 C 同引擎（mengine=2 控制流），唯一差异 = 窃取决策（cost_filter）
 inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                                       const MissSpec& sp, int mode,
                                       const AdaptiveBatchPolicy& pol,
+                                      const WlaStealPolicy& spol_in,
                                       const std::string& skew,
                                       const std::string& arrival, double gap_ms,
                                       int steal_batch, int attn_iters) {
+  WlaStealPolicy spol = spol_in;
+  spol.cost_filter = (mode == 3);  // E 开关；A/B/C 恒 false（语义不变）
   MissTrace tr = replay_miss_stream(sp);
   WlaMultiGpuCtx ctx(devices, sp, skew, arrival, gap_ms);
 
@@ -531,11 +582,11 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
         std::vector<int> resident = ctx.tick_begin(g);
         if (resident.empty()) {
           ctx.tick_end(g, resident, ht.toc_ms() - t0);  // 清 in_tick（空快照）
-          // 本地空：B 偷 1 / C 偷批；A 只等到达
+          // 本地空：B 偷 1 / C/E 偷批；A 只等到达
           if (mode == 1) {
-            if (ctx.steal_migrate(g, 1) > 0) continue;
-          } else if (mode == 2) {
-            if (ctx.steal_migrate(g, (size_t)steal_batch) > 0) continue;
+            if (ctx.steal_migrate(g, 1, spol) > 0) continue;
+          } else if (mode == 2 || mode == 3) {
+            if (ctx.steal_migrate(g, (size_t)steal_batch, spol) > 0) continue;
           }
           if (!ctx.all_arrived()) {
             ctx.wait_arrival(g);
@@ -562,6 +613,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
         CUDA_CHECK(cudaStreamSynchronize(cs));
         const double t_tick1 = ht.toc_ms() - t0;
         ctx.tick_end(g, resident, t_tick1);
+        ctx.update_step_ema(t_tick1 - t_tick0, executed);  // E 决策输入④
         for (size_t i = 0; i < executed; ++i)
           step_durs[g].push_back(t_tick1 - t_tick0);
         if (std::getenv("FERRY_WLA_DEBUG"))
@@ -570,9 +622,10 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                        ctx.all_done() ? (size_t)sp.num_requests : (size_t)0,
                        t_tick1);
         ctx.yield_steal_window();  // 有 thief 在等 → 有界让渡窃取窗口
-        // C：水位 < 公平份额 → tick 间隙批窃取（提前纠偏，非等空）
-        if (mode == 2 && !ctx.all_done() && ctx.occ(g) < ctx.fair_share())
-          ctx.steal_migrate(g, (size_t)steal_batch);
+        // C/E：水位 < 公平份额 → tick 间隙批窃取（提前纠偏，非等空）
+        if ((mode == 2 || mode == 3) && !ctx.all_done() &&
+            ctx.occ(g) < ctx.fair_share())
+          ctx.steal_migrate(g, (size_t)steal_batch, spol);
       }
       cudaStreamDestroy(cs);
     });
@@ -584,6 +637,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
 
   st.makespan_ms = ht.toc_ms() - t0;
   st.steals = ctx.steals();
+  st.steal_refused = ctx.steal_refused();
   st.migrated_reqs = ctx.migrated_reqs();
   st.migrated_bytes = ctx.migrated_bytes();
   st.refill_events = refill_events.load();
