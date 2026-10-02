@@ -1,0 +1,10 @@
+[wla-mg] gpus=0,1,2,3 arrival=bursty skew=imbalanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=delta
+  static-A  makespan=  3819.98ms steps/s=   12.6 p50=204.168 p99= 250.851 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.835 ref=0 live=0
+  dyn-B     makespan=   848.84ms steps/s=   56.5 p50= 33.657 p99= 104.347 steals=  17 migr=  232.1MB( 17 reqs) refill=  79550 seg  1242.97MB imb=0.250 ref=0 live=14855
+  ferry-C   makespan=   685.67ms steps/s=   70.0 p50= 20.169 p99=  45.640 steals=  15 migr=  447.3MB( 35 reqs) refill=  59863 seg  1242.97MB imb=0.243 ref=0 live=28625
+  costaware-E makespan=   599.70ms steps/s=   80.0 p50= 17.837 p99=  43.552 steals=  10 migr=  303.0MB( 30 reqs) refill=  59863 seg  1242.97MB imb=0.300 ref=8 live=19392
+  => C/A 5.57x  C/B 1.24x  E/A 6.37x
+  => [C1-结构] migr(MB): A=0.0 B=232.1 C=447.3 E=303.0 | steals: B=17 C=15 E=10 | refill_seg: A=589824 B=79550 C=59863  [PASS]
+  => [WlA-E] migr C=447.3 vs E=303.0 MB | steals C=15 E=10 | E refused=8 | E/C 1.143x
+  => hit_rate=0.865  refill_bytes A=9216.00 B=1242.97 C=1242.97 MB (full 模式应全等：trace 固定；delta/drop 按设计可差)
+  => [kv-mode=delta] migr C=447.3 MB live=28625 | trace基线=1242.97 MB | refill B=1242.97(+0.0) C=1242.97(+0.0) MB [delta 自检 PASS：状态交接完整] | cold_B=0.0 cold_C=0.0

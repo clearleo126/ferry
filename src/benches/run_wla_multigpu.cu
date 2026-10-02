@@ -8,7 +8,9 @@
 //                      [--layers 12] [--sel 64] [--hot 128] [--attn 8]
 //                      [--arrival steady|bursty] [--skew balanced|imbalanced]
 //                      [--gap 1.0] [--steal-batch 4] [--mig-bw 11.0]
-//                      [--mig-margin 2.0]
+//                      [--mig-margin 2.0] [--kv-mode full|delta|drop]
+// kv-mode（迁移内容轴）：full=整段 24MB（默认，既有数据语义）；delta=只发
+// 驻留槽+状态交接（Raft nextIndex）；drop=不搬数据冷启动（冷启动代价建模）。
 // 输出固定含 4 行（A/B/C/E）+ C/A、C/B 汇总 + [C1-结构] 判据行
 // + [WlA-E] 成本感知对照行（migr/steals/refused/C-E 比）。
 // ⚠️ --gpus 只认逗号（空格静默降级为单卡，见 说明文档 §6 第 2 条）
@@ -26,12 +28,13 @@ void print_row(const char* name, const ferry::WlaMultiStats& st) {
   std::printf(
       "  %-9s makespan=%9.2fms steps/s=%7.1f p50=%7.3f p99=%8.3f "
       "steals=%4llu migr=%7.1fMB(%3llu reqs) refill=%7llu seg %8.2fMB "
-      "imb=%.3f ref=%llu\n",
+      "imb=%.3f ref=%llu live=%llu\n",
       name, st.makespan_ms, st.throughput_steps, st.p50_step_ms,
       st.p99_step_ms, (unsigned long long)st.steals,
       st.migrated_bytes / 1048576.0, (unsigned long long)st.migrated_reqs,
       (unsigned long long)st.refill_events, st.refill_bytes / 1048576.0,
-      st.imbalance, (unsigned long long)st.steal_refused);
+      st.imbalance, (unsigned long long)st.steal_refused,
+      (unsigned long long)st.live_slots);
   std::fflush(stdout);
 }
 
@@ -45,6 +48,7 @@ int main(int argc, char** argv) {
   int steal_batch = 4;
   double gap = 1.0, mig_bw = 11.0, mig_margin = 2.0;
   char arrival[32] = "steady", skew[32] = "imbalanced";
+  char kvmode_s[32] = "full";
 
   for (int i = 1; i < argc; ++i) {
     auto next = [&]() -> const char* { return argv[++i]; };
@@ -74,6 +78,8 @@ int main(int argc, char** argv) {
       mig_bw = std::atof(next());
     } else if (std::strcmp(argv[i], "--mig-margin") == 0) {
       mig_margin = std::atof(next());
+    } else if (std::strcmp(argv[i], "--kv-mode") == 0) {
+      std::strncpy(kvmode_s, next(), sizeof(kvmode_s) - 1);
     }
   }
 
@@ -88,6 +94,18 @@ int main(int argc, char** argv) {
     devices.push_back(std::atoi(tok));
   if (devices.size() < 2) {
     std::fprintf(stderr, "需要 >=2 张卡（--gpus 用逗号分隔，如 --gpus 0,1,2,3）\n");
+    return 2;
+  }
+
+  ferry::WlaKvMode kvmode;
+  if (std::strcmp(kvmode_s, "full") == 0)
+    kvmode = ferry::WlaKvMode::Full;
+  else if (std::strcmp(kvmode_s, "delta") == 0)
+    kvmode = ferry::WlaKvMode::Delta;
+  else if (std::strcmp(kvmode_s, "drop") == 0)
+    kvmode = ferry::WlaKvMode::Drop;
+  else {
+    std::fprintf(stderr, "未知 kv-mode '%s'（full|delta|drop）\n", kvmode_s);
     return 2;
   }
 
@@ -107,30 +125,38 @@ int main(int argc, char** argv) {
   std::printf(
       "[wla-mg] gpus=%s arrival=%s skew=%s reqs=%d steps=%d layers=%d sel=%d "
       "hot=%d attn=%d gap=%.1fms steal-batch=%d mig-bw=%.1fGB/s "
-      "mig-margin=%.1f\n",
+      "mig-margin=%.1f kv-mode=%s\n",
       gpu_buf, arrival, skew, reqs, steps, layers, sel, hot, attn, gap,
-      steal_batch, mig_bw, mig_margin);
+      steal_batch, mig_bw, mig_margin, kvmode_s);
   std::fflush(stdout);
 
   WlaMultiStats a = run_wla_multigpu(devices, sp, 0, pol, spol, skew, arrival,
-                                     gap, steal_batch, attn);
+                                     gap, steal_batch, attn, kvmode);
   print_row("static-A", a);
   WlaMultiStats b = run_wla_multigpu(devices, sp, 1, pol, spol, skew, arrival,
-                                     gap, steal_batch, attn);
+                                     gap, steal_batch, attn, kvmode);
   print_row("dyn-B", b);
   WlaMultiStats c = run_wla_multigpu(devices, sp, 2, pol, spol, skew, arrival,
-                                     gap, steal_batch, attn);
+                                     gap, steal_batch, attn, kvmode);
   print_row("ferry-C", c);
   WlaMultiStats e = run_wla_multigpu(devices, sp, 3, pol, spol, skew, arrival,
-                                     gap, steal_batch, attn);
+                                     gap, steal_batch, attn, kvmode);
   print_row("costaware-E", e);
 
   std::printf("  => C/A %.2fx  C/B %.2fx  E/A %.2fx\n",
               a.makespan_ms / c.makespan_ms, b.makespan_ms / c.makespan_ms,
               a.makespan_ms / e.makespan_ms);
-  // 结构判据（C1 闭合的硬检查；见 wla_multigpu.cuh 头注释）
-  const bool struct_ok = a.migrated_bytes == 0 && b.migrated_bytes > 0 &&
-                         c.migrated_bytes > 0;
+  // 结构判据（C1 闭合的硬检查；见 wla_multigpu.cuh 头注释）——按 kv-mode：
+  //   full/delta：migr A=0 < B,C（窃取搬 KV）
+  //   drop     ：migr 恒 0（按设计），判据改为 refill > trace 基线
+  //              （冷启动代价显式可见 = 收益侧有账）
+  const bool drop_mode = (kvmode == ferry::WlaKvMode::Drop);
+  const bool struct_ok =
+      drop_mode
+          ? (c.refill_bytes > c.trace_miss_bytes &&
+             b.refill_bytes > b.trace_miss_bytes)
+          : (a.migrated_bytes == 0 && b.migrated_bytes > 0 &&
+             c.migrated_bytes > 0);
   std::printf(
       "  => [C1-结构] migr(MB): A=%.1f B=%.1f C=%.1f E=%.1f | steals: "
       "B=%llu C=%llu E=%llu | refill_seg: A=%llu B=%llu C=%llu  [%s]\n",
@@ -148,9 +174,27 @@ int main(int argc, char** argv) {
       (unsigned long long)c.steals, (unsigned long long)e.steals,
       (unsigned long long)e.steal_refused, c.makespan_ms / e.makespan_ms);
   std::printf("  => hit_rate=%.3f  refill_bytes A=%.2f B=%.2f C=%.2f MB "
-              "(应全等：trace 固定)\n",
+              "(full 模式应全等：trace 固定；delta/drop 按设计可差)\n",
               a.hit_rate, a.refill_bytes / 1048576.0,
               b.refill_bytes / 1048576.0, c.refill_bytes / 1048576.0);
+  // kv-mode 轴汇总：delta 字节节省（成本侧）与 drop 冷启动（收益侧）两账。
+  // delta 自检：状态交接完整 ⇒ refill 应恰等于 trace 基线（差 = 0）。
+  // drop 冷启动 = refill − trace 基线（>0 即"丢热集"的代价被显式计量）。
+  const double cold_mb = (double)(c.refill_bytes - c.trace_miss_bytes) /
+                         1048576.0;
+  const double cold_b_mb = (double)(b.refill_bytes - b.trace_miss_bytes) /
+                           1048576.0;
+  std::printf(
+      "  => [kv-mode=%s] migr C=%.1f MB live=%llu | trace基线=%.2f MB | "
+      "refill B=%.2f(+%.1f) C=%.2f(%+.1f) MB %s | cold_B=%.1f cold_C=%.1f\n",
+      kvmode_s, c.migrated_bytes / 1048576.0,
+      (unsigned long long)c.live_slots, c.trace_miss_bytes / 1048576.0,
+      b.refill_bytes / 1048576.0, cold_b_mb, c.refill_bytes / 1048576.0,
+      cold_mb,
+      (kvmode == ferry::WlaKvMode::Delta && cold_mb == 0.0)
+          ? "[delta 自检 PASS：状态交接完整]"
+          : "",
+      cold_b_mb, cold_mb);
   std::fflush(stdout);
   return 0;
 }

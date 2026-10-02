@@ -46,11 +46,24 @@
 //   双侧约束（thief occ < fair 且 victim 只出盈余）后迁移自限：偷完
 //   victim 仍 ≥ fair，不会触发反向窃取。
 //
-// 建模简化（论文须写明）：
-//   miss/hit 序列由 trace 预生成（LRU 状态全局唯一，种子固定），与执行卡
-//   无关 → refill_bytes 三模式相同（结构性不变量），模式差异 = migrated_bytes、
-//   refill_events（聚合度）与时间。迁移复制整个热集段（槽区容量固定），
-//   不逐槽追踪有效位。
+// KV 迁移内容（--kv-mode，C1 之后的第二个建模轴：迁移到底该发什么）：
+//   full  ：整段 24MB 复制；命中判定沿用 trace 的 is_miss（全局 LRU）。
+//           **全部既有数据（7 次矩阵）即此模式，语义冻结不动**。
+//   delta ：逐卡维护 LRU 镜像（与 missstream 生成器同算法同容量），迁移只发
+//           "实际驻留"的槽（Raft nextIndex 类比：对端缺什么才发什么），
+//           并把镜像交接给消费卡 → 命中/未命中由**本卡缓存状态**决定。
+//   drop  ：同 delta 的镜像，但迁移**不搬数据也不交接状态** → 消费卡冷启动，
+//           后续选中未命中 ⇒ 冷启动代价首次被显式建模。
+//   为什么需要 delta/drop：full 模式下匹配 trace 的全局 LRU，**"丢热集"没有
+//   任何惩罚**，于是"带 KV 迁 vs 不带 KV 迁"这个轴在模型里不存在（T1/T2 只有
+//   成本一侧有账）。delta/drop 把收益侧补上，交叉点即 Raft 式问题的答案：
+//   发多少才算够。
+//   自检：无迁移发生时（B 档 balanced），delta 的 refill_bytes 必须复现 full
+//   （同一 LRU 算法、同一初始态）——不复现即镜像实现有误。
+//
+// 建模简化（论文须写明）：full 模式下 miss/hit 由 trace 预生成（LRU 状态全局
+//   唯一），refill_bytes 三模式相同是**设计不变量**；delta/drop 下该不变量
+//   按设计被打破（正是本轴要测的东西）。迁移按整槽单位复制（不做事级打包）。
 #pragma once
 
 #include <cuda_fp16.h>
@@ -65,6 +78,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "comm/host_staged_channel.cuh"
@@ -85,6 +99,9 @@ __global__ inline void wla_attn_kernel(const __half* in, __half* out,
   out[i] = __float2half(v);
 }
 
+// 迁移内容模式（见头注释"KV 迁移内容"）
+enum class WlaKvMode { Full = 0, Delta = 1, Drop = 2 };
+
 struct WlaMultiStats {
   double makespan_ms = 0.0;
   double p50_step_ms = 0.0, p99_step_ms = 0.0;
@@ -97,6 +114,8 @@ struct WlaMultiStats {
   double imbalance = 0.0;          // 各卡完成请求数变异系数
   double hit_rate = 0.0;
   uint64_t steal_refused = 0;      // E 遥测：因"剩余工作 < 迁移成本"拒绝的窃取
+  uint64_t live_slots = 0;         // delta：实际迁移的驻留槽数（vs 整段 = L*hot）
+  size_t trace_miss_bytes = 0;     // trace 基线 miss 字节（冷启动代价的参照）
   int n_gpus = 0;
 };
 
@@ -129,8 +148,8 @@ class WlaMultiGpuCtx {
  public:
   WlaMultiGpuCtx(const std::vector<int>& devices, const MissSpec& sp,
                  const std::string& skew, const std::string& arrival,
-                 double gap_ms)
-      : devs_(devices), n_(devices.size()), sp_(sp) {
+                 double gap_ms, WlaKvMode kvmode)
+      : devs_(devices), n_(devices.size()), sp_(sp), kvmode_(kvmode) {
     R_ = sp.num_requests;
     c4_ = sp.c4_bytes();
     max_blocks_ = 64 + (uint64_t)sp.steps * 8;
@@ -196,6 +215,19 @@ class WlaMultiGpuCtx {
         if (v != c)
           mig_[v][c] = std::make_unique<HostStagedChannel>(devs_[v], devs_[c],
                                                            4, 4 << 20, 2);
+    }
+    // LRU 镜像（delta/drop 才需要；full 保持零开销）
+    if (kvmode_ != WlaKvMode::Full) {
+      lru_dq_.resize(n_);
+      lru_set_.resize(n_);
+      for (int g = 0; g < n_; ++g) {
+        lru_dq_[g].resize(R_);
+        lru_set_[g].resize(R_);
+        for (int r = 0; r < R_; ++r) {
+          lru_dq_[g][r].resize(sp_.num_layers);
+          lru_set_[g][r].resize(sp_.num_layers);
+        }
+      }
     }
     // 状态
     local_.resize(n_);
@@ -291,14 +323,26 @@ class WlaMultiGpuCtx {
       size_t take = std::min(std::min(k, cur - fair), cur / 2 + 1);
       if (take == 0) return 0;
       if (pol.cost_filter) {
-        // E：价值过滤 —— 只迁"剩余工作 ≥ margin × 迁移成本"的请求。
+        // E：价值过滤 —— 只迁"剩余工作 ≥ margin × 真实迁移成本"的请求。
+        // 成本必须按当前 kv-mode 的真实代价计（否则 E 基于未支付的成本决策，
+        // 与本项目"双侧记账"的立场矛盾）：
+        //   full  = 2×seg（D2H+H2D 双跳整段）
+        //   delta = 2×live×c4（双跳只发驻留槽）
+        //   drop  = live×c4（消费卡冷启动回填，单跳 H2D）
         // 候选自队尾起（最近到达 = 剩余步最多），取通过过滤的最长前缀
-        const double cost_ms =
-            2.0 * (double)seg_ / (pol.mig_bw_gbs * 1e9) * 1e3;
+        const double bw_ms_per_byte = 1e3 / (pol.mig_bw_gbs * 1e9);
         const double step_ms = step_ms_ema_.load();
         size_t ok = 0;
         for (size_t j = 0; j < take; ++j) {
           const int r = local_[v][local_[v].size() - 1 - j];
+          double cost_ms;
+          if (kvmode_ == WlaKvMode::Full) {
+            cost_ms = 2.0 * (double)seg_ * bw_ms_per_byte;
+          } else {
+            const double live_b = (double)kv_live(v, r) * (double)c4_;
+            cost_ms = (kvmode_ == WlaKvMode::Delta ? 2.0 : 1.0) * live_b *
+                      bw_ms_per_byte;
+          }
           const double value =
               (double)(sp_.steps - next_step_[r]) * step_ms;
           if (value >= pol.margin * cost_ms)
@@ -324,15 +368,36 @@ class WlaMultiGpuCtx {
       for (auto it = moved.rbegin(); it != moved.rend(); ++it)
         local_[g].push_front(*it);
     }
-    // D2D 迁移（victim 段 -> host -> 本卡段）；一批一 sync
+    // D2D 迁移（victim 段 -> host -> 本卡段）；一批一 sync。
+    // kv-mode 分支（见头注释）：
+    //   full  = 整段复制（既有语义，数据冻结）
+    //   delta = 只发实际驻留槽（Raft nextIndex）+ 镜像交接（carry）
+    //   drop  = 不发数据，镜像清空 → 消费卡冷启动
     HostStagedChannel* ch = mig_[v][g].get();
-    for (int r : moved)
-      ch->submit(d_cache_[v] + (size_t)r * seg_, seg_,
-                 d_cache_[g] + (size_t)r * seg_);
+    size_t moved_bytes = 0;
+    for (int r : moved) {
+      if (kvmode_ == WlaKvMode::Full) {
+        ch->submit(d_cache_[v] + (size_t)r * seg_, seg_,
+                   d_cache_[g] + (size_t)r * seg_);
+        moved_bytes += seg_;
+      } else if (kvmode_ == WlaKvMode::Delta) {
+        for (int l = 0; l < sp_.num_layers; ++l)
+          for (uint64_t blk : kv_set(v, r, l)) {
+            const size_t off = wla_slot_off(sp_, r, l, blk);
+            ch->submit(d_cache_[v] + off, c4_, d_cache_[g] + off);
+            moved_bytes += c4_;
+            live_slots_.fetch_add(1);
+          }
+        kv_handoff(v, g, r, /*carry=*/true);
+      } else {  // Drop
+        kv_handoff(v, g, r, /*carry=*/false);
+        moved_bytes += 0;  // 不搬数据；代价显式转嫁到消费卡的回填侧
+      }
+    }
     ch->sync();
     CUDA_CHECK(cudaSetDevice(devs_[g]));
     migrated_reqs_.fetch_add(moved.size());
-    migrated_bytes_.fetch_add(moved.size() * seg_);
+    migrated_bytes_.fetch_add(moved_bytes);
     steals_.fetch_add(1);
     return moved.size();
   }
@@ -376,6 +441,54 @@ class WlaMultiGpuCtx {
   uint64_t migrated_reqs() const { return migrated_reqs_.load(); }
   size_t migrated_bytes() const { return migrated_bytes_.load(); }
   uint64_t steal_refused() const { return steal_refused_.load(); }
+  uint64_t live_slots() const { return live_slots_.load(); }
+  WlaKvMode kv_mode() const { return kvmode_; }
+  // 状态化命中判定（delta/drop）：语义与 missstream 生成器逐字一致
+  // （命中则 LRU touch；未命中则按容量逐出最旧再插入）
+  bool kv_touch(int g, int r, int l, uint64_t blk) {
+    auto& dq = lru_dq_[g][r][l];
+    auto& st = lru_set_[g][r][l];
+    const bool hit = st.count(blk) > 0;
+    if (hit) {
+      for (auto it = dq.begin(); it != dq.end(); ++it)
+        if (*it == blk) {
+          dq.erase(it);
+          break;
+        }
+      dq.push_back(blk);
+    } else {
+      if ((int)dq.size() >= sp_.hot_blocks) {
+        st.erase(dq.front());
+        dq.pop_front();
+      }
+      dq.push_back(blk);
+      st.insert(blk);
+    }
+    return hit;
+  }
+  // 迁移时热集状态交接（carry=true）或清空（drop → 消费卡冷启动）。
+  // 安全性：调用点在 victim 出 tick 且请求已移出其队列之后 → victim 不会再
+  // 触碰该请求的镜像（其余请求的元素互不相交，容器不重分配）。
+  void kv_handoff(int v, int c, int r, bool carry) {
+    if (kvmode_ == WlaKvMode::Full) return;
+    for (int l = 0; l < sp_.num_layers; ++l) {
+      if (carry) {
+        lru_dq_[c][r][l] = lru_dq_[v][r][l];
+        lru_set_[c][r][l] = lru_set_[v][r][l];
+      } else {
+        lru_dq_[c][r][l].clear();
+        lru_set_[c][r][l].clear();
+      }
+    }
+  }
+  size_t kv_live(int g, int r) const {
+    size_t tot = 0;
+    for (int l = 0; l < sp_.num_layers; ++l) tot += lru_set_[g][r][l].size();
+    return tot;
+  }
+  const std::unordered_set<uint64_t>& kv_set(int g, int r, int l) const {
+    return lru_set_[g][r][l];
+  }
   // E 决策输入④：tick 实测的每请求步成本（含回填/迁移的通道争用）
   void update_step_ema(double tick_ms, size_t executed) {
     if (executed == 0) return;
@@ -416,6 +529,11 @@ class WlaMultiGpuCtx {
   std::atomic<size_t> migrated_bytes_{0};
   std::atomic<double> step_ms_ema_{2.0};   // E 决策输入④：每请求步成本 EMA
   std::atomic<uint64_t> steal_refused_{0}; // E 遥测：价值不足拒绝的窃取数
+  std::atomic<uint64_t> live_slots_{0};    // delta 遥测：实际迁移的驻留槽数
+  WlaKvMode kvmode_;
+  // 逐卡逐请求逐层 LRU 镜像（与 missstream 生成器同算法同容量 = hot_blocks）
+  std::vector<std::vector<std::vector<std::deque<uint64_t>>>> lru_dq_;
+  std::vector<std::vector<std::vector<std::unordered_set<uint64_t>>>> lru_set_;
 };
 
 // ---- N 卡驱动（mode: 0=A 1=B 2=C 3=E）----
@@ -426,16 +544,18 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                                       const WlaStealPolicy& spol_in,
                                       const std::string& skew,
                                       const std::string& arrival, double gap_ms,
-                                      int steal_batch, int attn_iters) {
+                                      int steal_batch, int attn_iters,
+                                      WlaKvMode kvmode = WlaKvMode::Full) {
   WlaStealPolicy spol = spol_in;
   spol.cost_filter = (mode == 3);  // E 开关；A/B/C 恒 false（语义不变）
   MissTrace tr = replay_miss_stream(sp);
-  WlaMultiGpuCtx ctx(devices, sp, skew, arrival, gap_ms);
+  WlaMultiGpuCtx ctx(devices, sp, skew, arrival, gap_ms, kvmode);
 
   const int n = devices.size();
   WlaMultiStats st;
   st.n_gpus = n;
   st.hit_rate = tr.hit_rate;
+  st.trace_miss_bytes = tr.miss_bytes;
 
   HostTimer ht;
   ht.tick();
@@ -476,6 +596,16 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
       };
 
       // 执行请求 r 的第 s 步（模式分支 = 单卡 kv_exec 的多卡版）
+      // 命中判定：full = trace 的全局 LRU（既有语义）；delta/drop = 本卡
+      // LRU 镜像 kv_touch（状态化：迁移 drop 后未命中的块须回填 → 收益侧
+      // 有账）。A 模式恒 trace 判定（A 无迁移，镜像与之等价但保持旧口径）。
+      const bool stateful = (kvmode != WlaKvMode::Full) && (mode != 0);
+      auto is_miss = [&](int r, int s, int l, int k) -> bool {
+        const MissEvent& e =
+            tr.events[((size_t)r * sp.steps + s) * L * G + (size_t)l * G + k];
+        if (!stateful) return e.is_miss;
+        return !ctx.kv_touch(g, r, l, e.block_id);
+      };
       auto exec_step = [&](int r, int s) {
         const size_t base_ev = ((size_t)r * sp.steps + s) * L * G;
         if (mode == 0) {
@@ -499,7 +629,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
           for (int l = 0; l < L; ++l) {
             for (int k = 0; k < G; ++k) {
               const MissEvent& e = tr.events[base_ev + (size_t)l * G + k];
-              if (!e.is_miss) continue;
+              if (!is_miss(r, s, l, k)) continue;
               ch->submit(ctx.slab() + wla_slab_off(sp, r, l, e.block_id), c4,
                          ctx.cache(g) + wla_slot_off(sp, r, l, e.block_id));
               ch->sync();
@@ -519,8 +649,9 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
           std::vector<Ref> miss_list;
           for (int l = 0; l < L; ++l)
             for (int k = 0; k < G; ++k) {
-              const MissEvent& e = tr.events[base_ev + (size_t)l * G + k];
-              if (e.is_miss) miss_list.push_back({l, e.block_id});
+              if (is_miss(r, s, l, k))
+                miss_list.push_back(
+                    {l, tr.events[base_ev + (size_t)l * G + k].block_id});
             }
           std::sort(miss_list.begin(), miss_list.end(), [](const Ref& a,
                                                            const Ref& b) {
@@ -638,6 +769,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   st.makespan_ms = ht.toc_ms() - t0;
   st.steals = ctx.steals();
   st.steal_refused = ctx.steal_refused();
+  st.live_slots = ctx.live_slots();
   st.migrated_reqs = ctx.migrated_reqs();
   st.migrated_bytes = ctx.migrated_bytes();
   st.refill_events = refill_events.load();
