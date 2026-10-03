@@ -1,7 +1,14 @@
 // run_wla_multigpu: Workload A N 卡闭环实验（C1 —— 实验设计 v6 剩余主项）
-// 单进程依次跑 A/B/C 三模式（同 trace 种子 → miss/hit 序列相同，受控对照）
+// 单进程依次跑 A/B/C/E/LLX/RR 六模式（同 trace 种子 → miss/hit 序列相同，受控对照）
 // 输出每模式：makespan / steps/s / p50/p99 step / 窃取数 / 迁移字节 / 回填段数
 // + 结构判据行（migr_bytes A=0 < B,C；refill_seg B>>C；steals B>>C）
+//
+// 外部基线（v9）：
+//   RR  (round-robin)   ：同 C 引擎，分发 = 轮转，无重分配 —— 最弱外部基线
+//   LLX (Llumnix-style) ：同 C 引擎，分发 = least-loaded + 周期全局重平衡
+//                         （策略复刻 OSDI'24 Llumnix，非系统移植；迁移走同一条
+//                          host-staged D2D 通道、同 step 边界、同整段成本）
+//   [--rebal-interval 50] [--rebal-thr 0.25] 仅 LLX 生效
 //
 // 用法：
 //   ./run_wla_multigpu [--gpus 0,1,2,3] [--requests 48] [--steps 16]
@@ -9,10 +16,11 @@
 //                      [--arrival steady|bursty] [--skew balanced|imbalanced]
 //                      [--gap 1.0] [--steal-batch 4] [--mig-bw 11.0]
 //                      [--mig-margin 2.0] [--kv-mode full|delta|drop]
+//                      [--rebal-interval 50] [--rebal-thr 0.25]
 // kv-mode（迁移内容轴）：full=整段 24MB（默认，既有数据语义）；delta=只发
 // 驻留槽+状态交接（Raft nextIndex）；drop=不搬数据冷启动（冷启动代价建模）。
-// 输出固定含 4 行（A/B/C/E）+ C/A、C/B 汇总 + [C1-结构] 判据行
-// + [WlA-E] 成本感知对照行（migr/steals/refused/C-E 比）。
+// 输出固定含 6 行（A/B/C/E/LLX/RR）+ 汇总 + [C1-结构] 判据行
+// + [WlA-E] 成本感知对照行 + [BASE] 外部基线对照行（LLX/RR vs C 与 vs A）。
 // ⚠️ --gpus 只认逗号（空格静默降级为单卡，见 说明文档 §6 第 2 条）
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +55,7 @@ int main(int argc, char** argv) {
   int reqs = 48, steps = 16, layers = 12, sel = 64, hot = 128, attn = 8;
   int steal_batch = 4;
   double gap = 1.0, mig_bw = 11.0, mig_margin = 2.0;
+  double rebal_interval = 50.0, rebal_thr = 0.25;
   char arrival[32] = "steady", skew[32] = "imbalanced";
   char kvmode_s[32] = "full";
 
@@ -80,6 +89,10 @@ int main(int argc, char** argv) {
       mig_margin = std::atof(next());
     } else if (std::strcmp(argv[i], "--kv-mode") == 0) {
       std::strncpy(kvmode_s, next(), sizeof(kvmode_s) - 1);
+    } else if (std::strcmp(argv[i], "--rebal-interval") == 0) {
+      rebal_interval = std::atof(next());
+    } else if (std::strcmp(argv[i], "--rebal-thr") == 0) {
+      rebal_thr = std::atof(next());
     }
   }
 
@@ -125,9 +138,9 @@ int main(int argc, char** argv) {
   std::printf(
       "[wla-mg] gpus=%s arrival=%s skew=%s reqs=%d steps=%d layers=%d sel=%d "
       "hot=%d attn=%d gap=%.1fms steal-batch=%d mig-bw=%.1fGB/s "
-      "mig-margin=%.1f kv-mode=%s\n",
+      "mig-margin=%.1f kv-mode=%s rebal=%.0fms/thr%.2f\n",
       gpu_buf, arrival, skew, reqs, steps, layers, sel, hot, attn, gap,
-      steal_batch, mig_bw, mig_margin, kvmode_s);
+      steal_batch, mig_bw, mig_margin, kvmode_s, rebal_interval, rebal_thr);
   std::fflush(stdout);
 
   WlaMultiStats a = run_wla_multigpu(devices, sp, 0, pol, spol, skew, arrival,
@@ -142,6 +155,14 @@ int main(int argc, char** argv) {
   WlaMultiStats e = run_wla_multigpu(devices, sp, 3, pol, spol, skew, arrival,
                                      gap, steal_batch, attn, kvmode);
   print_row("costaware-E", e);
+  // 外部基线（v9）：LLX=Llumnix-style（分发+重平衡），RR=round-robin（仅分发）
+  WlaMultiStats llx = run_wla_multigpu(devices, sp, 4, pol, spol, skew, arrival,
+                                       gap, steal_batch, attn, kvmode,
+                                       rebal_interval, rebal_thr);
+  print_row("llumnix-LLX", llx);
+  WlaMultiStats rr = run_wla_multigpu(devices, sp, 5, pol, spol, skew, arrival,
+                                      gap, steal_batch, attn, kvmode);
+  print_row("roundrobin-RR", rr);
 
   std::printf("  => C/A %.2fx  C/B %.2fx  E/A %.2fx\n",
               a.makespan_ms / c.makespan_ms, b.makespan_ms / c.makespan_ms,
@@ -173,6 +194,23 @@ int main(int argc, char** argv) {
       c.migrated_bytes / 1048576.0, e.migrated_bytes / 1048576.0,
       (unsigned long long)c.steals, (unsigned long long)e.steals,
       (unsigned long long)e.steal_refused, c.makespan_ms / e.makespan_ms);
+  // 外部基线对照（v9）：公平性 = 与 C 同引擎同通道同迁移成本；
+  //   LLX 差异 = 分发(least-loaded) + 周期全局重平衡（Llumnix 策略复刻）
+  //   RR  差异 = 分发(round-robin)，无任何运行时重分配
+  // 期望：imb 档 LLX/RR ≫ A（重分配有效）；LLX vs C 的差 = 调度策略本身的
+  // 贡献（若 LLX ≈ C，说明"全局周期重平衡"与"分布式水位窃取"在该 regime
+  // 等效——结论同样成立且诚实）。
+  std::printf(
+      "  => [BASE] LLX %.2fms(steals %llu rebal %llu/%llu) RR %.2fms(steals "
+      "%llu) | C/LLX %.2fx C/RR %.2fx A/LLX %.2fx A/RR %.2fx | migr LLX=%.1f "
+      "RR=%.1f MB | imb LLX=%.3f RR=%.3f\n",
+      llx.makespan_ms, (unsigned long long)llx.steals,
+      (unsigned long long)llx.rebal_noop,
+      (unsigned long long)(llx.rebal_calls - llx.rebal_noop), rr.makespan_ms,
+      (unsigned long long)rr.steals, c.makespan_ms / llx.makespan_ms,
+      c.makespan_ms / rr.makespan_ms, a.makespan_ms / llx.makespan_ms,
+      a.makespan_ms / rr.makespan_ms, llx.migrated_bytes / 1048576.0,
+      rr.migrated_bytes / 1048576.0, llx.imbalance, rr.imbalance);
   std::printf("  => hit_rate=%.3f  refill_bytes A=%.2f B=%.2f C=%.2f MB "
               "(full 模式应全等：trace 固定；delta/drop 按设计可差)\n",
               a.hit_rate, a.refill_bytes / 1048576.0,

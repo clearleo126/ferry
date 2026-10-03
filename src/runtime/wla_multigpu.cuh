@@ -102,6 +102,10 @@ __global__ inline void wla_attn_kernel(const __half* in, __half* out,
 // 迁移内容模式（见头注释"KV 迁移内容"）
 enum class WlaKvMode { Full = 0, Delta = 1, Drop = 2 };
 
+// 到达分发路径：Affinity = 按 dest 亲和（A/B/C/E 既有语义）；
+// RoundRobin = 轮转（RR 基线的唯一差异项）
+enum class WlaDispatch { Affinity = 0, RoundRobin = 1 };
+
 struct WlaMultiStats {
   double makespan_ms = 0.0;
   double p50_step_ms = 0.0, p99_step_ms = 0.0;
@@ -117,6 +121,8 @@ struct WlaMultiStats {
   uint64_t live_slots = 0;         // delta：实际迁移的驻留槽数（vs 整段 = L*hot）
   size_t trace_miss_bytes = 0;     // trace 基线 miss 字节（冷启动代价的参照）
   int n_gpus = 0;
+  uint64_t rebal_calls = 0;        // LLX 遥测：重平衡触发次数（含 noop）
+  uint64_t rebal_noop = 0;         // LLX 遥测：未达失衡阈值直接返回的次数
 };
 
 // E（mode 3）成本感知窃取策略：与 C 的唯一差异 = 窃取决策。
@@ -252,11 +258,31 @@ class WlaMultiGpuCtx {
   }
 
   // ---- 到达分发（主线程） ----
-  void dispatch(double now_ms) {
+  // kind：Affinity = 按 reqs_[r].dest（既有语义，A/B/C/E 冻结不动）；
+  //       RoundRobin = 忽略亲和，轮转分发（RR 基线的唯一差异项）
+  void dispatch(double now_ms, WlaDispatch kind = WlaDispatch::Affinity) {
     std::unique_lock<std::mutex> lk(mtx_);
     size_t i = next_arrive_.load();
     while (i < (size_t)R_ && reqs_[i].arrive_ms <= now_ms) {
-      local_[reqs_[i].dest].push_back((int)i);
+      int dest = reqs_[i].dest;
+      if (kind == WlaDispatch::RoundRobin) dest = rr_counter_++ % n_;
+      local_[dest].push_back((int)i);
+      ++i;
+    }
+    next_arrive_.store(i);
+    cv_.notify_all();
+  }
+  // LLX 初始分发：least-loaded（Llumnix 的 dispatch 策略）。
+  // 到达时刻各请求剩余步相同 → 常驻数 = 精确 virtual usage。
+  void dispatch_least_loaded(double now_ms) {
+    std::unique_lock<std::mutex> lk(mtx_);
+    size_t i = next_arrive_.load();
+    while (i < (size_t)R_ && reqs_[i].arrive_ms <= now_ms) {
+      int dest = 0;
+      size_t best = SIZE_MAX;
+      for (int g = 0; g < n_; ++g)
+        if (local_[g].size() < best) { best = local_[g].size(); dest = g; }
+      local_[dest].push_back((int)i);
       ++i;
     }
     next_arrive_.store(i);
@@ -295,20 +321,31 @@ class WlaMultiGpuCtx {
   // ---- 窃取 + D2D 迁移（仅卡 g 线程调用；全程序串行化） ----
   // 拔 victim 队尾最多 k 个请求（push_front 到本卡），迁移其热集段
   size_t steal_migrate(int g, size_t k, const WlaStealPolicy& pol) {
+    return steal_from(g, /*v_sel=*/-1, k, pol);
+  }
+
+  // 指定 victim 的窃取内核（LLX 重平衡复用：src 由全局视角指定，
+  // 而非 thief 自选最忙卡；公平性：同一让渡协议、同一条 D2D 通道）
+  // v_sel=-1 = 自选最忙卡（C/E 语义）；v_sel>=0 = 指定源卡（LLX 语义）
+  size_t steal_from(int g, int v_sel, size_t k, const WlaStealPolicy& pol) {
     std::lock_guard<std::mutex> slk(steal_lock_);
-    int v = -1;
+    int v = v_sel;
     std::vector<int> moved;
     {
       std::unique_lock<std::mutex> lk(mtx_);
-      size_t best = 0;
-      for (int s = 0; s < n_; ++s) {
-        if (s == g) continue;
-        if (local_[s].size() > best) {
-          best = local_[s].size();
-          v = s;
+      if (v < 0) {  // 自选最忙卡（C/E 既有语义）
+        size_t best = 0;
+        for (int s = 0; s < n_; ++s) {
+          if (s == g) continue;
+          if (local_[s].size() > best) {
+            best = local_[s].size();
+            v = s;
+          }
         }
+        if (v < 0) return 0;
+      } else {
+        if (v == g || local_[v].empty()) return 0;  // 指定源（LLX）
       }
-      if (v < 0) return 0;
       // 告诉 victim：有 thief 在等窗口（victim 在 tick_end 后有界让渡）
       steal_pending_.store(true);
       // 等 victim 出 tick（cv wait 释放 ctx 锁 → victim 可完成 tick）
@@ -318,7 +355,8 @@ class WlaMultiGpuCtx {
       cv_.notify_all();  // 唤醒让渡中的 victim
       if (in_tick_[v] || completed_.load() >= (size_t)R_) return 0;
       const size_t cur = local_[v].size();
-      const size_t fair = fair_share();
+      // LLX 指定源时按全局份额判定盈余；C/E 自选时沿用公平份额（冻结语义）
+      const size_t fair = (v_sel < 0) ? fair_share() : 0;
       if (cur <= fair) return 0;  // victim 无盈余（防乒乓：不让其跌破公平份额）
       size_t take = std::min(std::min(k, cur - fair), cur / 2 + 1);
       if (take == 0) return 0;
@@ -496,6 +534,53 @@ class WlaMultiGpuCtx {
     step_ms_ema_.store(0.9 * step_ms_ema_.load() + 0.1 * per);
   }
 
+  // ---- LLX（Llumnix-style）周期全局重平衡 ----
+  // 对齐 Llumnix 的 LlumSched：周期收集各实例负载 → 失衡超阈值 → 选
+  // (src, dst, k) 三元组 → 走与 C 同一条迁移路径（steal_from，dst 视角）。
+  // virtual usage = Σ 常驻请求剩余步（异质请求工作量的统一度量；
+  // 队列长度是其粗粒度代理，此处用精版本）。
+  // 阈值：max-min 相对失衡 > imbalance_thr 才动手（Llumnix 的 freeness 判
+  // 定；防乒乓：只从高于均值的卡迁、只迁到均值以下、量 = 拉平差额的一半）。
+  // 返回本轮实际迁移请求数（遥测）。
+  size_t rebalance_llumnix(double imbalance_thr = 0.25) {
+    rebal_calls_.fetch_add(1);
+    std::vector<size_t> usage(n_, 0);
+    {
+      std::unique_lock<std::mutex> lk(mtx_);
+      for (int g = 0; g < n_; ++g)
+        for (int r : local_[g])
+          usage[g] += (size_t)(sp_.steps - next_step_[r]);
+    }
+    size_t smax = 0, smin = SIZE_MAX;
+    int dst = -1, src = -1;
+    for (int g = 0; g < n_; ++g) {
+      if (usage[g] > smax) { smax = usage[g]; src = g; }
+      if (usage[g] < smin) { smin = usage[g]; dst = g; }
+    }
+    if (src < 0 || dst < 0 || src == dst) { rebal_noop_.fetch_add(1); return 0; }
+    const double mean = std::accumulate(usage.begin(), usage.end(), 0.0) / n_;
+    if (mean == 0.0 || (double)(smax - smin) / mean <= imbalance_thr) {
+      rebal_noop_.fetch_add(1);
+      return 0;
+    }
+    // 迁移量：拉平 src→mean 差额的请求数（按剩余步均值折算，≥1）
+    const size_t over = usage[src] - (size_t)mean;
+    size_t k = over / std::max<size_t>(mean > 0 ? (size_t)(mean / local_[src].size() + 1) : 1, 1);
+    k = std::max<size_t>(std::min<size_t>(k, 4), 1);  // 上限 4（对齐 steal_batch）
+    // dst 视角执行迁移（与 C 同路径：dst 是消费方）——无 E 成本过滤
+    WlaStealPolicy pol;  // cost_filter=false
+    return (steal_from(dst, src, k, pol) > 0) ? 1 : 0;
+  }
+  uint64_t rebal_calls() const { return rebal_calls_.load(); }
+  uint64_t rebal_noop() const { return rebal_noop_.load(); }
+  // 各卡常驻请求数快照（LLX 遥测/调试）
+  std::vector<size_t> occ_snapshot() {
+    std::unique_lock<std::mutex> lk(mtx_);
+    std::vector<size_t> o(n_);
+    for (int g = 0; g < n_; ++g) o[g] = local_[g].size();
+    return o;
+  }
+
  private:
   struct Req {
     int dest;
@@ -530,14 +615,30 @@ class WlaMultiGpuCtx {
   std::atomic<double> step_ms_ema_{2.0};   // E 决策输入④：每请求步成本 EMA
   std::atomic<uint64_t> steal_refused_{0}; // E 遥测：价值不足拒绝的窃取数
   std::atomic<uint64_t> live_slots_{0};    // delta 遥测：实际迁移的驻留槽数
+  size_t rr_counter_ = 0;                  // RR 分发轮转游标（dispatch 线程独占）
+  std::atomic<uint64_t> rebal_calls_{0};   // LLX 遥测：重平衡触发次数
+  std::atomic<uint64_t> rebal_noop_{0};    // LLX 遥测：未达失衡阈值直接返回的次数
   WlaKvMode kvmode_;
   // 逐卡逐请求逐层 LRU 镜像（与 missstream 生成器同算法同容量 = hot_blocks）
   std::vector<std::vector<std::vector<std::deque<uint64_t>>>> lru_dq_;
   std::vector<std::vector<std::vector<std::unordered_set<uint64_t>>>> lru_set_;
 };
 
-// ---- N 卡驱动（mode: 0=A 1=B 2=C 3=E）----
+// ---- N 卡驱动（mode: 0=A 1=B 2=C 3=E 4=LLX 5=RR）----
 // E 与 C 同引擎（mengine=2 控制流），唯一差异 = 窃取决策（cost_filter）
+//
+// 外部基线（v9 新增，回应"无外部参照"评审风险）：
+//   RR (mode 5, round-robin)：与 C 同引擎同通道，唯一差异 = 初始分发
+//     round-robin（忽略 skew/亲和性），无任何运行时重分配 —— 最弱基线，
+//     证明"不是拿静态划分当稻草人打"。
+//   LLX (mode 4, Llumnix-style)：与 C 同引擎同通道，唯一差异 = 分发与重
+//     平衡策略（对齐 Llumnix OSDI'24 的三层决策：初始 least-loaded 分发 +
+//     周期全局重平衡 + virtual-usage 均衡目标）。复刻**策略**而非系统
+//     （原实现依赖 vLLM+Ray；且其 pre-copy 假设迁移离关键路径，在本平台
+//     不成立——这正是要测的东西）。公平性：迁移走同一条 host-staged D2D
+//     通道、同样在 step 边界交接、同样付整段迁移成本（T2 双侧记账）。
+//     反证自检：宽裕场景（balanced 档）LLX 应显著优于 RR —— 否则实现存疑。
+//
 inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                                       const MissSpec& sp, int mode,
                                       const AdaptiveBatchPolicy& pol,
@@ -545,9 +646,16 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                                       const std::string& skew,
                                       const std::string& arrival, double gap_ms,
                                       int steal_batch, int attn_iters,
-                                      WlaKvMode kvmode = WlaKvMode::Full) {
+                                      WlaKvMode kvmode = WlaKvMode::Full,
+                                      double rebal_interval_ms = 50.0,
+                                      double rebal_thr = 0.25) {
   WlaStealPolicy spol = spol_in;
-  spol.cost_filter = (mode == 3);  // E 开关；A/B/C 恒 false（语义不变）
+  spol.cost_filter = (mode == 3);  // E 开关；A/B/C/RR 恒 false（语义不变）
+  // LLX/RR 归一：执行引擎一律 = C（mengine=2 控制流），分发与重平衡见下
+  const int mengine = (mode == 4 || mode == 5) ? 2 : mode;
+  const WlaDispatch dk = (mode == 5)   ? WlaDispatch::RoundRobin
+                         : (mode == 4) ? WlaDispatch::Affinity
+                                       : WlaDispatch::Affinity;
   MissTrace tr = replay_miss_stream(sp);
   WlaMultiGpuCtx ctx(devices, sp, skew, arrival, gap_ms, kvmode);
 
@@ -565,11 +673,29 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   std::atomic<bool> stop_disp{false};
   std::thread disp([&] {
     while (!stop_disp.load()) {
-      ctx.dispatch(ht.toc_ms() - t0);
+      // LLX 分发 = least-loaded（virtual usage 的在线代理：当前常驻数；
+      // 到达时刻请求剩余步全相等 → 常驻数即精确 usage，与 RR 的差异项）
+      if (mode == 4)
+        ctx.dispatch_least_loaded(ht.toc_ms() - t0);
+      else
+        ctx.dispatch(ht.toc_ms() - t0, dk);
       if (ctx.all_arrived()) break;
       std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
   });
+
+  // LLX 周期重平衡线程（对齐 LlumSched：全局视角周期决策，非 thief 驱动）
+  std::atomic<bool> stop_rebal{false};
+  std::thread rebal;
+  if (mode == 4) {
+    rebal = std::thread([&] {
+      while (!stop_rebal.load() && !ctx.all_done()) {
+        ctx.rebalance_llumnix(rebal_thr);
+        std::this_thread::sleep_for(
+            std::chrono::microseconds((long)(rebal_interval_ms * 1000)));
+      }
+    });
+  }
 
   std::atomic<uint64_t> refill_events{0};
   std::atomic<size_t> refill_bytes{0};
@@ -599,7 +725,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
       // 命中判定：full = trace 的全局 LRU（既有语义）；delta/drop = 本卡
       // LRU 镜像 kv_touch（状态化：迁移 drop 后未命中的块须回填 → 收益侧
       // 有账）。A 模式恒 trace 判定（A 无迁移，镜像与之等价但保持旧口径）。
-      const bool stateful = (kvmode != WlaKvMode::Full) && (mode != 0);
+      const bool stateful = (kvmode != WlaKvMode::Full) && (mengine != 0);
       auto is_miss = [&](int r, int s, int l, int k) -> bool {
         const MissEvent& e =
             tr.events[((size_t)r * sp.steps + s) * L * G + (size_t)l * G + k];
@@ -608,7 +734,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
       };
       auto exec_step = [&](int r, int s) {
         const size_t base_ev = ((size_t)r * sp.steps + s) * L * G;
-        if (mode == 0) {
+        if (mengine == 0) {
           // A：全 selected（含命中）逐块同步 H2D + 逐层 kernel（大同步通信）
           for (int l = 0; l < L; ++l) {
             CUDA_CHECK(cudaSetDevice(devices[g]));
@@ -623,7 +749,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
             }
             attn_layer(r, l);
           }
-        } else if (mode == 1) {
+        } else if (mengine == 1) {
           // B：逐 miss 回填（每 C4 一次通道传输 + 逐次 sync）+ 逐层 kernel
           HostStagedChannel* ch = ctx.refill_ch(g);
           for (int l = 0; l < L; ++l) {
@@ -713,7 +839,8 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
         std::vector<int> resident = ctx.tick_begin(g);
         if (resident.empty()) {
           ctx.tick_end(g, resident, ht.toc_ms() - t0);  // 清 in_tick（空快照）
-          // 本地空：B 偷 1 / C/E 偷批；A 只等到达
+          // 本地空：B 偷 1 / C/E 偷批；A/RR 只等到达；LLX 等重平衡线程迁入
+          // （LLX 的迁移是全局调度器驱动的"推"，不是执行卡的"拉"）
           if (mode == 1) {
             if (ctx.steal_migrate(g, 1, spol) > 0) continue;
           } else if (mode == 2 || mode == 3) {
@@ -754,6 +881,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                        t_tick1);
         ctx.yield_steal_window();  // 有 thief 在等 → 有界让渡窃取窗口
         // C/E：水位 < 公平份额 → tick 间隙批窃取（提前纠偏，非等空）
+        // LLX/RR：执行卡不窃取（重平衡仅由 mode 4 的 rebal 线程驱动）
         if ((mode == 2 || mode == 3) && !ctx.all_done() &&
             ctx.occ(g) < ctx.fair_share())
           ctx.steal_migrate(g, (size_t)steal_batch, spol);
@@ -765,6 +893,10 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   for (auto& t : execs) t.join();
   stop_disp.store(true);
   disp.join();
+  if (mode == 4) {
+    stop_rebal.store(true);
+    rebal.join();
+  }
 
   st.makespan_ms = ht.toc_ms() - t0;
   st.steals = ctx.steals();
@@ -772,6 +904,8 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   st.live_slots = ctx.live_slots();
   st.migrated_reqs = ctx.migrated_reqs();
   st.migrated_bytes = ctx.migrated_bytes();
+  st.rebal_calls = ctx.rebal_calls();
+  st.rebal_noop = ctx.rebal_noop();
   st.refill_events = refill_events.load();
   st.refill_bytes = refill_bytes.load();
   st.throughput_steps = (double)sp.num_requests / (st.makespan_ms / 1000.0);
