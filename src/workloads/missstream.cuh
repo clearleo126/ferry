@@ -30,6 +30,13 @@ struct MissSpec {
   int head_dim = 128;
   std::string arrival = "steady";   // steady|bursty|mixed（供执行器节流）
   uint64_t seed = 42;
+  // C2 前缀亲和（WlA 多卡专用；单卡/默认关闭）：
+  //   prefix_group > 1 时，每 prefix_group 个连续请求为一组，共享前缀——
+  //   组内前 prefix_steps 步的 selected block 与组首完全相同（= 前缀），
+  //   之后各请求分歧。组 = 前缀缓存的最小单位（hash 前缀缓存语义：
+  //   同组同 block_id 视为同内容，可跨请求命中）。
+  int prefix_group = 1;        // 组大小（1 = 关闭，退化为既有语义）
+  int prefix_steps = 8;        // 组内共享前缀的步数（其余步分歧）
 
   // 每 C4 block 字节数：4 token × 2(K/V) × kv_heads × head_dim × 2B(fp16)
   size_t c4_bytes() const { return (size_t)4 * 2 * kv_heads * head_dim * 2; }

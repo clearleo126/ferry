@@ -150,6 +150,83 @@ inline size_t wla_slot_off(const MissSpec& sp, int req, int layer,
           (size_t)(block % sp.hot_blocks)) * sp.c4_bytes();
 }
 
+// ---- C2：前缀亲和（组 = 前缀缓存单位；hash 语义） ----
+// 组 id（prefix_group=1 时组即请求，全部退化为既有语义）
+inline int wla_grp(const MissSpec& sp, int req) {
+  return sp.prefix_group > 1 ? req / sp.prefix_group : req;
+}
+// 组视角槽偏移（缓存/LRU 以组为索引；slab 源仍按请求——内容对计时无影响，
+// 论文须写明"同组同 block_id 视为同内容（hash 前缀缓存语义）"）
+inline size_t wla_gslot_off(const MissSpec& sp, int req, int layer,
+                            uint64_t block) {
+  return wla_slot_off(sp, wla_grp(sp, req), layer, block);
+}
+
+// 前缀共享变换：组内非首成员的前 prefix_steps 步事件 = 组首事件
+// （生成器按请求独立采样 → 无此变换则组内重叠仅剩偶发，前缀收益不存在）。
+// 变换后 is_miss 标志作废（按首成员 LRU 算的）——C2 下命中一律走
+// kv_touch 状态化判定，trace 标志不再被读；统计用下面的重算函数。
+inline void wla_apply_prefix_sharing(MissTrace& tr, const MissSpec& sp) {
+  if (sp.prefix_group <= 1 || sp.prefix_steps <= 0) return;
+  const int L = sp.num_layers, G = sp.sel_blocks;
+  const size_t per_rs = (size_t)L * G;               // 每 (req, step) 事件数
+  for (int r = 0; r < sp.num_requests; ++r) {
+    const int head = (r / sp.prefix_group) * sp.prefix_group;
+    if (r == head) continue;
+    for (int s = 0; s < std::min(sp.prefix_steps, sp.steps); ++s) {
+      const size_t dst = ((size_t)r * sp.steps + s) * per_rs;
+      const size_t src = ((size_t)head * sp.steps + s) * per_rs;
+      std::memcpy(&tr.events[dst], &tr.events[src], per_rs * sizeof(MissEvent));
+    }
+  }
+}
+
+// 变换后的统计重算：单一全局 LRU 回放（"理想局部性"基线 = 所有请求同卡
+// 时的 miss；A 模式在 home 的稳态命中率应接近此值）。
+inline void wla_recompute_stats(MissTrace& tr, const MissSpec& sp) {
+  if (sp.prefix_group <= 1) return;  // 未变换：生成器统计本就正确
+  const int L = sp.num_layers, G = sp.sel_blocks;
+  const int R = sp.num_requests;
+  // 组粒度 LRU（组内共享 = 前缀缓存；容量同 hot_blocks）
+  const int ngrp = (R + sp.prefix_group - 1) / sp.prefix_group;
+  std::vector<std::deque<uint64_t>> dq(ngrp * L);
+  std::vector<std::unordered_set<uint64_t>> st(ngrp * L);
+  tr.total_selects = 0;
+  tr.total_misses = 0;
+  tr.miss_bytes = 0;
+  for (int r = 0; r < R; ++r) {
+    const int grp = wla_grp(sp, r);
+    for (int s = 0; s < sp.steps; ++s) {
+      const size_t base = ((size_t)r * sp.steps + s) * L * G;
+      for (int l = 0; l < L; ++l) {
+        auto& d = dq[grp * L + l];
+        auto& sset = st[grp * L + l];
+        for (int k = 0; k < G; ++k) {
+          const MissEvent& e = tr.events[base + (size_t)l * G + k];
+          ++tr.total_selects;
+          if (sset.count(e.block_id) > 0) {
+            for (auto it = d.begin(); it != d.end(); ++it)
+              if (*it == e.block_id) { d.erase(it); break; }
+            d.push_back(e.block_id);
+          } else {
+            ++tr.total_misses;
+            tr.miss_bytes += sp.c4_bytes();
+            if ((int)d.size() >= sp.hot_blocks) {
+              sset.erase(d.front());
+              d.pop_front();
+            }
+            d.push_back(e.block_id);
+            sset.insert(e.block_id);
+          }
+        }
+      }
+    }
+  }
+  tr.hit_rate = tr.total_selects > 0
+                    ? 1.0 - (double)tr.total_misses / (double)tr.total_selects
+                    : 0.0;
+}
+
 class WlaMultiGpuCtx {
  public:
   WlaMultiGpuCtx(const std::vector<int>& devices, const MissSpec& sp,
@@ -161,22 +238,33 @@ class WlaMultiGpuCtx {
     max_blocks_ = 64 + (uint64_t)sp.steps * 8;
     seg_ = (size_t)sp.num_layers * sp.hot_blocks * c4_;  // 单请求热集
     // 请求归属（偏斜）与到达
+    // C2：组 = 前缀缓存单位 → 组内请求共享 home（前缀在哪家，请求就发哪家
+    //   = 前缀亲和分发）；偏斜 rng 以组为单位抽样 → 80/20 失衡保留。
+    //   prefix_group=1 时组即请求，与既有语义逐字一致。
+    const int ngrp = sp.prefix_group > 1
+                         ? (R_ + sp.prefix_group - 1) / sp.prefix_group
+                         : R_;
     reqs_.resize(R_);
     arrive_ms_.resize(R_);
     {
       std::mt19937_64 rng(7);
       double t = 0.0;
+      std::vector<int> grp_dest(ngrp, -1);
       for (int r = 0; r < R_; ++r) {
-        if (skew == "imbalanced") {
-          // 80% 请求落前一半卡（与 synthetic 的 80/20 口径一致）
-          const int half = std::max(1, n_ / 2);
-          std::uniform_real_distribution<double> u(0.0, 1.0);
-          int d = (u(rng) < 0.8) ? (int)(rng() % half)
-                                 : half + (int)(rng() % std::max(1, n_ - half));
-          reqs_[r].dest = std::min(d, n_ - 1);
-        } else {
-          reqs_[r].dest = r % n_;
+        const int grp = wla_grp(sp, r);
+        if (grp_dest[grp] < 0) {
+          if (skew == "imbalanced") {
+            // 80% 请求落前一半卡（与 synthetic 的 80/20 口径一致，按组抽样）
+            const int half = std::max(1, n_ / 2);
+            std::uniform_real_distribution<double> u(0.0, 1.0);
+            int d = (u(rng) < 0.8) ? (int)(rng() % half)
+                                   : half + (int)(rng() % std::max(1, n_ - half));
+            grp_dest[grp] = std::min(d, n_ - 1);
+          } else {
+            grp_dest[grp] = grp % n_;
+          }
         }
+        reqs_[r].dest = grp_dest[grp];
         if (arrival == "bursty") {
           t += (r % 16 == 0) ? 40.0 * gap_ms : 0.1 * gap_ms;  // 周期性突发
         } else {
@@ -222,16 +310,20 @@ class WlaMultiGpuCtx {
           mig_[v][c] = std::make_unique<HostStagedChannel>(devs_[v], devs_[c],
                                                            4, 4 << 20, 2);
     }
-    // LRU 镜像（delta/drop 才需要；full 保持零开销）
-    if (kvmode_ != WlaKvMode::Full) {
+    // LRU 镜像（delta/drop 或 C2 前缀亲和需要；索引 = 组 id，组内请求共享
+    // 前缀缓存状态。prefix_group=1 时组即请求 → 索引等价既有语义）
+    if (kvmode_ != WlaKvMode::Full || sp_.prefix_group > 1) {
+      const int ngrp = sp_.prefix_group > 1
+                           ? (R_ + sp_.prefix_group - 1) / sp_.prefix_group
+                           : R_;
       lru_dq_.resize(n_);
       lru_set_.resize(n_);
       for (int g = 0; g < n_; ++g) {
-        lru_dq_[g].resize(R_);
-        lru_set_[g].resize(R_);
-        for (int r = 0; r < R_; ++r) {
-          lru_dq_[g][r].resize(sp_.num_layers);
-          lru_set_[g][r].resize(sp_.num_layers);
+        lru_dq_[g].resize(ngrp);
+        lru_set_[g].resize(ngrp);
+        for (int q = 0; q < ngrp; ++q) {
+          lru_dq_[g][q].resize(sp_.num_layers);
+          lru_set_[g][q].resize(sp_.num_layers);
         }
       }
     }
@@ -415,13 +507,15 @@ class WlaMultiGpuCtx {
     size_t moved_bytes = 0;
     for (int r : moved) {
       if (kvmode_ == WlaKvMode::Full) {
-        ch->submit(d_cache_[v] + (size_t)r * seg_, seg_,
-                   d_cache_[g] + (size_t)r * seg_);
+        // full：整段复制（既有语义，数据冻结）。C2：段按组偏移 → 迁移随带
+        // 该组已驻留的热集（后到组员迁来即命中 —— 亲和收益随迁移携带）
+        const size_t goff = (size_t)wla_grp(sp_, r) * seg_;
+        ch->submit(d_cache_[v] + goff, seg_, d_cache_[g] + goff);
         moved_bytes += seg_;
       } else if (kvmode_ == WlaKvMode::Delta) {
         for (int l = 0; l < sp_.num_layers; ++l)
           for (uint64_t blk : kv_set(v, r, l)) {
-            const size_t off = wla_slot_off(sp_, r, l, blk);
+            const size_t off = wla_gslot_off(sp_, r, l, blk);
             ch->submit(d_cache_[v] + off, c4_, d_cache_[g] + off);
             moved_bytes += c4_;
             live_slots_.fetch_add(1);
@@ -481,11 +575,14 @@ class WlaMultiGpuCtx {
   uint64_t steal_refused() const { return steal_refused_.load(); }
   uint64_t live_slots() const { return live_slots_.load(); }
   WlaKvMode kv_mode() const { return kvmode_; }
-  // 状态化命中判定（delta/drop）：语义与 missstream 生成器逐字一致
-  // （命中则 LRU touch；未命中则按容量逐出最旧再插入）
+  // 状态化命中判定（delta/drop/C2）：语义与 missstream 生成器逐字一致
+  // （命中则 LRU touch；未命中则按容量逐出最旧再插入）。
+  // C2：索引 = 组 id（同组请求共享前缀缓存 → 跨请求命中 = 亲和收益）；
+  // prefix_group=1 时组即请求，与既有语义逐字一致。
   bool kv_touch(int g, int r, int l, uint64_t blk) {
-    auto& dq = lru_dq_[g][r][l];
-    auto& st = lru_set_[g][r][l];
+    const int q = wla_grp(sp_, r);
+    auto& dq = lru_dq_[g][q][l];
+    auto& st = lru_set_[g][q][l];
     const bool hit = st.count(blk) > 0;
     if (hit) {
       for (auto it = dq.begin(); it != dq.end(); ++it)
@@ -506,26 +603,30 @@ class WlaMultiGpuCtx {
   }
   // 迁移时热集状态交接（carry=true）或清空（drop → 消费卡冷启动）。
   // 安全性：调用点在 victim 出 tick 且请求已移出其队列之后 → victim 不会再
-  // 触碰该请求的镜像（其余请求的元素互不相交，容器不重分配）。
+  // 触碰该请求的镜像；C2 下组内其余请求可能仍在 v —— 它们读写 [v][q]，
+  // 本函数写 [c][q]，容器不相交（同组另有成员在 c 时：先迁者交接、后迁者
+  // 再交接，幂等覆盖，最终状态 = 组内最后一次交接，语义正确）。
   void kv_handoff(int v, int c, int r, bool carry) {
-    if (kvmode_ == WlaKvMode::Full) return;
+    if (kvmode_ == WlaKvMode::Full) return;  // full+C2：热集随整段 D2D 迁移
+    const int q = wla_grp(sp_, r);
     for (int l = 0; l < sp_.num_layers; ++l) {
       if (carry) {
-        lru_dq_[c][r][l] = lru_dq_[v][r][l];
-        lru_set_[c][r][l] = lru_set_[v][r][l];
+        lru_dq_[c][q][l] = lru_dq_[v][q][l];
+        lru_set_[c][q][l] = lru_set_[v][q][l];
       } else {
-        lru_dq_[c][r][l].clear();
-        lru_set_[c][r][l].clear();
+        lru_dq_[c][q][l].clear();
+        lru_set_[c][q][l].clear();
       }
     }
   }
   size_t kv_live(int g, int r) const {
+    const int q = wla_grp(sp_, r);
     size_t tot = 0;
-    for (int l = 0; l < sp_.num_layers; ++l) tot += lru_set_[g][r][l].size();
+    for (int l = 0; l < sp_.num_layers; ++l) tot += lru_set_[g][q][l].size();
     return tot;
   }
   const std::unordered_set<uint64_t>& kv_set(int g, int r, int l) const {
-    return lru_set_[g][r][l];
+    return lru_set_[g][wla_grp(sp_, r)][l];
   }
   // E 决策输入④：tick 实测的每请求步成本（含回填/迁移的通道争用）
   void update_step_ema(double tick_ms, size_t executed) {
@@ -657,6 +758,8 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                          : (mode == 4) ? WlaDispatch::Affinity
                                        : WlaDispatch::Affinity;
   MissTrace tr = replay_miss_stream(sp);
+  wla_apply_prefix_sharing(tr, sp);  // C2：组内前缀步共享（is_miss 作废）
+  wla_recompute_stats(tr, sp);       // C2：按组全局 LRU 重算 miss/命中率
   WlaMultiGpuCtx ctx(devices, sp, skew, arrival, gap_ms, kvmode);
 
   const int n = devices.size();
@@ -711,10 +814,12 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
       const size_t c4 = ctx.c4();
 
       auto attn_layer = [&](int r, int l) {
+        // C2：attn 源读组段（数据在组偏移）；out 为 scratch，同组偏移
+        const int q = wla_grp(sp, r);
         const __half* src = reinterpret_cast<const __half*>(
-            ctx.cache(g) + (size_t)(r * L + l) * sp.hot_blocks * c4);
+            ctx.cache(g) + (size_t)(q * L + l) * sp.hot_blocks * c4);
         __half* out = reinterpret_cast<__half*>(
-            ctx.out(g) + (size_t)(r * L + l) * sp.hot_blocks * c4);
+            ctx.out(g) + (size_t)(q * L + l) * sp.hot_blocks * c4);
         const uint64_t ne = (size_t)sp.hot_blocks * c4 / sizeof(__half);
         wla_attn_kernel<<<(int)((ne + 255) / 256), 256, 0, cs>>>(src, out, ne,
                                                                  attn_iters);
@@ -724,13 +829,19 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
       // 执行请求 r 的第 s 步（模式分支 = 单卡 kv_exec 的多卡版）
       // 命中判定：full = trace 的全局 LRU（既有语义）；delta/drop = 本卡
       // LRU 镜像 kv_touch（状态化：迁移 drop 后未命中的块须回填 → 收益侧
-      // 有账）。A 模式恒 trace 判定（A 无迁移，镜像与之等价但保持旧口径）。
-      const bool stateful = (kvmode != WlaKvMode::Full) && (mengine != 0);
+      // 有账）。C2 前缀亲和（prefix_group>1）：一律状态化（含 A 模式——
+      // 命中取决于"组的热集在哪张卡"，这正是分发/迁移要权衡的收益侧）。
+      const bool stateful =
+          sp.prefix_group > 1 || ((kvmode != WlaKvMode::Full) && (mengine != 0));
       auto is_miss = [&](int r, int s, int l, int k) -> bool {
         const MissEvent& e =
             tr.events[((size_t)r * sp.steps + s) * L * G + (size_t)l * G + k];
         if (!stateful) return e.is_miss;
         return !ctx.kv_touch(g, r, l, e.block_id);
+      };
+      // C2 下槽位一律组偏移（组段共享）；关闭时与请求偏移恒等
+      const auto slot_off = [&](int r, int l, uint64_t blk) -> size_t {
+        return wla_gslot_off(sp, r, l, blk);
       };
       auto exec_step = [&](int r, int s) {
         const size_t base_ev = ((size_t)r * sp.steps + s) * L * G;
@@ -741,7 +852,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
             for (int k = 0; k < G; ++k) {
               const MissEvent& e = tr.events[base_ev + (size_t)l * G + k];
               CUDA_CHECK(cudaMemcpy(
-                  ctx.cache(g) + wla_slot_off(sp, r, l, e.block_id),
+                  ctx.cache(g) + slot_off(r, l, e.block_id),
                   ctx.slab() + wla_slab_off(sp, r, l, e.block_id), c4,
                   cudaMemcpyHostToDevice));
               refill_events.fetch_add(1);
@@ -757,7 +868,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
               const MissEvent& e = tr.events[base_ev + (size_t)l * G + k];
               if (!is_miss(r, s, l, k)) continue;
               ch->submit(ctx.slab() + wla_slab_off(sp, r, l, e.block_id), c4,
-                         ctx.cache(g) + wla_slot_off(sp, r, l, e.block_id));
+                         ctx.cache(g) + slot_off(r, l, e.block_id));
               ch->sync();
               refill_events.fetch_add(1);
               refill_bytes.fetch_add(c4);
@@ -811,14 +922,14 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                 ch->submit(ctx.slab() + wla_slab_off(sp, r, m0.layer, m0.block),
                            run * c4,
                            ctx.cache(g) +
-                               wla_slot_off(sp, r, m0.layer, m0.block));
+                               slot_off(r, m0.layer, m0.block));
                 refill_bytes.fetch_add(run * c4);
               } else {
                 for (size_t q = 0; q < run; ++q) {
                   const Ref& m = miss_list[i0 + kk + q];
                   ch->submit(ctx.slab() + wla_slab_off(sp, r, m.layer, m.block),
                              c4,
-                             ctx.cache(g) + wla_slot_off(sp, r, m.layer, m.block));
+                             ctx.cache(g) + slot_off(r, m.layer, m.block));
                   refill_bytes.fetch_add(c4);
                 }
               }

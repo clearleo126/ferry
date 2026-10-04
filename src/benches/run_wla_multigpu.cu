@@ -54,6 +54,7 @@ int main(int argc, char** argv) {
   char gpu_buf[128] = "0";
   int reqs = 48, steps = 16, layers = 12, sel = 64, hot = 128, attn = 8;
   int steal_batch = 4;
+  int prefix_group = 1, prefix_steps = 8;
   double gap = 1.0, mig_bw = 11.0, mig_margin = 2.0;
   double rebal_interval = 50.0, rebal_thr = 0.25;
   char arrival[32] = "steady", skew[32] = "imbalanced";
@@ -93,6 +94,10 @@ int main(int argc, char** argv) {
       rebal_interval = std::atof(next());
     } else if (std::strcmp(argv[i], "--rebal-thr") == 0) {
       rebal_thr = std::atof(next());
+    } else if (std::strcmp(argv[i], "--prefix-group") == 0) {
+      prefix_group = std::atoi(next());
+    } else if (std::strcmp(argv[i], "--prefix-steps") == 0) {
+      prefix_steps = std::atoi(next());
     }
   }
 
@@ -129,6 +134,8 @@ int main(int argc, char** argv) {
   sp.sel_blocks = sel;
   sp.hot_blocks = hot;
   sp.arrival = arrival;
+  sp.prefix_group = prefix_group;
+  sp.prefix_steps = prefix_steps;
 
   AdaptiveBatchPolicy pol;  // min 1MB / max 4MB / target_batches 4（与 WlA 单卡同）
   WlaStealPolicy spol;     // mig_bw/mig_margin 仅 E 使用；A/B/C 语义不变
@@ -138,9 +145,10 @@ int main(int argc, char** argv) {
   std::printf(
       "[wla-mg] gpus=%s arrival=%s skew=%s reqs=%d steps=%d layers=%d sel=%d "
       "hot=%d attn=%d gap=%.1fms steal-batch=%d mig-bw=%.1fGB/s "
-      "mig-margin=%.1f kv-mode=%s rebal=%.0fms/thr%.2f\n",
+      "mig-margin=%.1f kv-mode=%s rebal=%.0fms/thr%.2f prefix=grp%d/stp%d\n",
       gpu_buf, arrival, skew, reqs, steps, layers, sel, hot, attn, gap,
-      steal_batch, mig_bw, mig_margin, kvmode_s, rebal_interval, rebal_thr);
+      steal_batch, mig_bw, mig_margin, kvmode_s, rebal_interval, rebal_thr,
+      prefix_group, prefix_steps);
   std::fflush(stdout);
 
   WlaMultiStats a = run_wla_multigpu(devices, sp, 0, pol, spol, skew, arrival,
@@ -211,17 +219,41 @@ int main(int argc, char** argv) {
       c.makespan_ms / rr.makespan_ms, a.makespan_ms / llx.makespan_ms,
       a.makespan_ms / rr.makespan_ms, llx.migrated_bytes / 1048576.0,
       rr.migrated_bytes / 1048576.0, llx.imbalance, rr.imbalance);
-  std::printf("  => hit_rate=%.3f  refill_bytes A=%.2f B=%.2f C=%.2f MB "
-              "(full 模式应全等：trace 固定；delta/drop 按设计可差)\n",
-              a.hit_rate, a.refill_bytes / 1048576.0,
-              b.refill_bytes / 1048576.0, c.refill_bytes / 1048576.0);
+  std::printf(
+      "  => hit_rate=%.3f  refill_bytes A=%.2f B=%.2f C=%.2f E=%.2f "
+      "LLX=%.2f RR=%.2f MB (%s)\n",
+      a.hit_rate, a.refill_bytes / 1048576.0, b.refill_bytes / 1048576.0,
+      c.refill_bytes / 1048576.0, e.refill_bytes / 1048576.0,
+      llx.refill_bytes / 1048576.0, rr.refill_bytes / 1048576.0,
+      prefix_group > 1
+          ? "C2：refill 随分发/迁移位置变化（局部性收益侧有账）"
+          : "full 模式应全等：trace 固定；delta/drop 按设计可差");
+  // C2 前缀亲和对照（只在开启时有意义）：局部性收益的直接账。
+  //   A = 亲和分发（暖）但 refill-all 引擎（无缓存基线）；
+  //   C = 亲和 + 迁移（迁移携带组热集 → 迁后命中）；
+  //   RR/LLX = 无视亲和分发 → 组员冷启动 → refill 显著高于 C
+  //   = "忽略局部性的冷启动代价"，正是重分配要权衡的收益侧。
+  if (prefix_group > 1) {
+    std::printf(
+        "  => [C2] prefix grp=%d stp=%d | refill: C=%.1f RR=%.1f LLX=%.1f "
+        "MB | 忽略局部性冷启动 = RR-C %+.1f MB (x%.2f) | migr C=%.1f "
+        "LLX=%.1f MB | C/RR %.3fx\n",
+        prefix_group, prefix_steps, c.refill_bytes / 1048576.0,
+        rr.refill_bytes / 1048576.0, llx.refill_bytes / 1048576.0,
+        (double)(rr.refill_bytes - c.refill_bytes) / 1048576.0,
+        c.refill_bytes > 0 ? (double)rr.refill_bytes / (double)c.refill_bytes
+                           : 0.0,
+        c.migrated_bytes / 1048576.0, llx.migrated_bytes / 1048576.0,
+        c.makespan_ms / rr.makespan_ms);
+  }
   // kv-mode 轴汇总：delta 字节节省（成本侧）与 drop 冷启动（收益侧）两账。
   // delta 自检：状态交接完整 ⇒ refill 应恰等于 trace 基线（差 = 0）。
   // drop 冷启动 = refill − trace 基线（>0 即"丢热集"的代价被显式计量）。
-  const double cold_mb = (double)(c.refill_bytes - c.trace_miss_bytes) /
-                         1048576.0;
-  const double cold_b_mb = (double)(b.refill_bytes - b.trace_miss_bytes) /
-                           1048576.0;
+  // ⚠️ 双精度直接作差（C2 下 refill 可低于全局基线，size_t 减法会下溢）。
+  const double cold_mb =
+      (double)c.refill_bytes / 1048576.0 - (double)c.trace_miss_bytes / 1048576.0;
+  const double cold_b_mb =
+      (double)b.refill_bytes / 1048576.0 - (double)b.trace_miss_bytes / 1048576.0;
   std::printf(
       "  => [kv-mode=%s] migr C=%.1f MB live=%llu | trace基线=%.2f MB | "
       "refill B=%.2f(+%.1f) C=%.2f(%+.1f) MB %s | cold_B=%.1f cold_C=%.1f\n",
