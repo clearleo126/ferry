@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=balanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=full rebal=50ms/thr0.25 prefix=grp4/stp8
+  static-A  makespan=  1881.44ms steps/s=   25.5 p50= 99.371 p99= 134.115 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.000 ref=0 live=0
+  dyn-B     makespan=   378.25ms steps/s=  126.9 p50= 12.674 p99=  56.357 steals=   9 migr=  216.0MB(  9 reqs) refill=  41091 seg   642.05MB imb=0.212 ref=0 live=0
+  ferry-C   makespan=   342.35ms steps/s=  140.2 p50= 12.650 p99=  25.348 steals=   8 migr=  384.0MB( 16 reqs) refill=  36621 seg   700.95MB imb=0.212 ref=0 live=0
+  costaware-E makespan=   261.53ms steps/s=  183.5 p50= 10.530 p99=  17.866 steals=   5 migr=  168.0MB(  7 reqs) refill=  33431 seg   640.03MB imb=0.000 ref=6 live=0
+  llumnix-LLX makespan=   323.83ms steps/s=  148.2 p50= 16.327 p99=  33.044 steals=   2 migr=   96.0MB(  4 reqs) refill=  59833 seg  1248.61MB imb=0.212 ref=0 live=0
+  roundrobin-RR makespan=   490.67ms steps/s=   97.8 p50= 16.870 p99=  55.876 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 5.50x  C/B 1.10x  E/A 7.19x
+  => [C1-结构] migr(MB): A=0.0 B=216.0 C=384.0 E=168.0 | steals: B=9 C=8 E=5 | refill_seg: A=589824 B=41091 C=36621  [PASS]
+  => [WlA-E] migr C=384.0 vs E=168.0 MB | steals C=8 E=5 | E refused=6 | E/C 1.309x
+  => [BASE] LLX 323.83ms(steals 2 rebal 4/2) RR 490.67ms(steals 0) | C/LLX 1.06x C/RR 0.70x A/LLX 5.81x A/RR 3.83x | migr LLX=96.0 RR=0.0 MB | imb LLX=0.212 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=642.05 C=700.95 E=640.03 LLX=1248.61 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=701.0 RR=1256.5 LLX=1248.6 MB | 忽略局部性冷启动 = RR-C +555.6 MB (x1.79) | migr C=384.0 LLX=96.0 MB | C/RR 0.698x
+  => [kv-mode=full] migr C=384.0 MB live=0 | trace基线=731.31 MB | refill B=642.05(+-89.3) C=700.95(-30.4) MB  | cold_B=-89.3 cold_C=-30.4

@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=imbalanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=full rebal=50ms/thr0.25 prefix=grp4/stp8
+  static-A  makespan=  3491.50ms steps/s=   13.7 p50= 82.903 p99= 235.331 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.577 ref=0 live=0
+  dyn-B     makespan=   383.42ms steps/s=  125.2 p50= 13.464 p99=  34.856 steals=  11 migr=  264.0MB( 11 reqs) refill=  42797 seg   668.70MB imb=0.083 ref=0 live=0
+  ferry-C   makespan=   333.39ms steps/s=  144.0 p50= 11.463 p99=  19.777 steals=  15 migr=  696.0MB( 29 reqs) refill=  39060 seg   756.98MB imb=0.212 ref=0 live=0
+  costaware-E makespan=   296.25ms steps/s=  162.0 p50= 12.251 p99=  20.023 steals=   8 migr=  456.0MB( 19 reqs) refill=  37014 seg   717.47MB imb=0.000 ref=14 live=0
+  llumnix-LLX makespan=   429.63ms steps/s=  111.7 p50= 20.805 p99=  61.937 steals=   3 migr=  120.0MB(  5 reqs) refill=  59442 seg  1241.09MB imb=0.243 ref=0 live=0
+  roundrobin-RR makespan=   379.21ms steps/s=  126.6 p50= 18.674 p99=  41.306 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 10.47x  C/B 1.15x  E/A 11.79x
+  => [C1-结构] migr(MB): A=0.0 B=264.0 C=696.0 E=456.0 | steals: B=11 C=15 E=8 | refill_seg: A=589824 B=42797 C=39060  [PASS]
+  => [WlA-E] migr C=696.0 vs E=456.0 MB | steals C=15 E=8 | E refused=14 | E/C 1.125x
+  => [BASE] LLX 429.63ms(steals 3 rebal 5/3) RR 379.21ms(steals 0) | C/LLX 0.78x C/RR 0.88x A/LLX 8.13x A/RR 9.21x | migr LLX=120.0 RR=0.0 MB | imb LLX=0.243 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=668.70 C=756.98 E=717.47 LLX=1241.09 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=757.0 RR=1256.5 LLX=1241.1 MB | 忽略局部性冷启动 = RR-C +499.6 MB (x1.66) | migr C=696.0 LLX=120.0 MB | C/RR 0.879x
+  => [kv-mode=full] migr C=696.0 MB live=0 | trace基线=731.31 MB | refill B=668.70(+-62.6) C=756.98(+25.7) MB  | cold_B=-62.6 cold_C=25.7

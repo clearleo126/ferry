@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=balanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=full rebal=50ms/thr0.25 prefix=grp4/stp8
+  static-A  makespan=  2009.06ms steps/s=   23.9 p50=114.966 p99= 149.711 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.000 ref=0 live=0
+  dyn-B     makespan=   301.74ms steps/s=  159.1 p50= 12.632 p99=  28.814 steals=   5 migr=  120.0MB(  5 reqs) refill=  37788 seg   590.44MB imb=0.132 ref=0 live=0
+  ferry-C   makespan=   274.78ms steps/s=  174.7 p50= 10.020 p99=  20.490 steals=   8 migr=  264.0MB( 11 reqs) refill=  32789 seg   619.92MB imb=0.212 ref=0 live=0
+  costaware-E makespan=   264.22ms steps/s=  181.7 p50= 10.403 p99=  17.549 steals=   6 migr=  288.0MB( 12 reqs) refill=  34233 seg   658.08MB imb=0.000 ref=5 live=0
+  llumnix-LLX makespan=   363.57ms steps/s=  132.0 p50= 16.856 p99=  28.179 steals=   2 migr=   96.0MB(  4 reqs) refill=  60483 seg  1260.38MB imb=0.156 ref=0 live=0
+  roundrobin-RR makespan=   309.49ms steps/s=  155.1 p50= 16.557 p99=  27.369 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 7.31x  C/B 1.10x  E/A 7.60x
+  => [C1-结构] migr(MB): A=0.0 B=120.0 C=264.0 E=288.0 | steals: B=5 C=8 E=6 | refill_seg: A=589824 B=37788 C=32789  [PASS]
+  => [WlA-E] migr C=264.0 vs E=288.0 MB | steals C=8 E=6 | E refused=5 | E/C 1.040x
+  => [BASE] LLX 363.57ms(steals 2 rebal 5/2) RR 309.49ms(steals 0) | C/LLX 0.76x C/RR 0.89x A/LLX 5.53x A/RR 6.49x | migr LLX=96.0 RR=0.0 MB | imb LLX=0.156 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=590.44 C=619.92 E=658.08 LLX=1260.38 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=619.9 RR=1256.5 LLX=1260.4 MB | 忽略局部性冷启动 = RR-C +636.6 MB (x2.03) | migr C=264.0 LLX=96.0 MB | C/RR 0.888x
+  => [kv-mode=full] migr C=264.0 MB live=0 | trace基线=731.31 MB | refill B=590.44(+-140.9) C=619.92(-111.4) MB  | cold_B=-140.9 cold_C=-111.4

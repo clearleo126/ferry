@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=bursty skew=balanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=full rebal=50ms/thr0.25 prefix=grp4/stp8
+  static-A  makespan=  1881.63ms steps/s=   25.5 p50= 97.608 p99= 129.959 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.000 ref=0 live=0
+  dyn-B     makespan=   330.23ms steps/s=  145.4 p50=  8.465 p99=  25.555 steals=   4 migr=   96.0MB(  4 reqs) refill=  37464 seg   585.38MB imb=0.156 ref=0 live=0
+  ferry-C   makespan=   319.20ms steps/s=  150.4 p50=  7.751 p99=  17.184 steals=  14 migr=  456.0MB( 19 reqs) refill=  37364 seg   711.64MB imb=0.212 ref=0 live=0
+  costaware-E makespan=   232.59ms steps/s=  206.4 p50=  4.987 p99=  10.435 steals=   0 migr=    0.0MB(  0 reqs) refill=  28849 seg   537.42MB imb=0.000 ref=3 live=0
+  llumnix-LLX makespan=   483.29ms steps/s=   99.3 p50= 17.561 p99=  40.248 steals=   3 migr=  192.0MB(  8 reqs) refill=  60252 seg  1255.58MB imb=0.204 ref=0 live=0
+  roundrobin-RR makespan=   470.61ms steps/s=  102.0 p50= 17.419 p99=  40.500 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 5.89x  C/B 1.03x  E/A 8.09x
+  => [C1-结构] migr(MB): A=0.0 B=96.0 C=456.0 E=0.0 | steals: B=4 C=14 E=0 | refill_seg: A=589824 B=37464 C=37364  [PASS]
+  => [WlA-E] migr C=456.0 vs E=0.0 MB | steals C=14 E=0 | E refused=3 | E/C 1.372x
+  => [BASE] LLX 483.29ms(steals 3 rebal 6/3) RR 470.61ms(steals 0) | C/LLX 0.66x C/RR 0.68x A/LLX 3.89x A/RR 4.00x | migr LLX=192.0 RR=0.0 MB | imb LLX=0.204 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=585.38 C=711.64 E=537.42 LLX=1255.58 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=711.6 RR=1256.5 LLX=1255.6 MB | 忽略局部性冷启动 = RR-C +544.9 MB (x1.77) | migr C=456.0 LLX=192.0 MB | C/RR 0.678x
+  => [kv-mode=full] migr C=456.0 MB live=0 | trace基线=731.31 MB | refill B=585.38(+-145.9) C=711.64(-19.7) MB  | cold_B=-145.9 cold_C=-19.7

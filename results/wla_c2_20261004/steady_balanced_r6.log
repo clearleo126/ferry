@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=balanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=full rebal=50ms/thr0.25 prefix=grp4/stp8
+  static-A  makespan=  1828.53ms steps/s=   26.3 p50= 95.359 p99= 116.472 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.000 ref=0 live=0
+  dyn-B     makespan=   310.98ms steps/s=  154.4 p50= 12.656 p99=  48.326 steals=   6 migr=  144.0MB(  6 reqs) refill=  39930 seg   623.91MB imb=0.059 ref=0 live=0
+  ferry-C   makespan=   267.78ms steps/s=  179.3 p50= 10.630 p99=  22.759 steals=  11 migr=  384.0MB( 16 reqs) refill=  36450 seg   707.05MB imb=0.059 ref=0 live=0
+  costaware-E makespan=   286.81ms steps/s=  167.4 p50= 11.433 p99=  23.985 steals=   5 migr=  288.0MB( 12 reqs) refill=  33581 seg   639.17MB imb=0.000 ref=4 live=0
+  llumnix-LLX makespan=   411.31ms steps/s=  116.7 p50= 16.497 p99=  41.234 steals=   4 migr=  216.0MB(  9 reqs) refill=  59471 seg  1241.55MB imb=0.339 ref=0 live=0
+  roundrobin-RR makespan=   414.32ms steps/s=  115.9 p50= 16.001 p99=  39.318 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 6.83x  C/B 1.16x  E/A 6.38x
+  => [C1-结构] migr(MB): A=0.0 B=144.0 C=384.0 E=288.0 | steals: B=6 C=11 E=5 | refill_seg: A=589824 B=39930 C=36450  [PASS]
+  => [WlA-E] migr C=384.0 vs E=288.0 MB | steals C=11 E=5 | E refused=4 | E/C 0.934x
+  => [BASE] LLX 411.31ms(steals 4 rebal 3/4) RR 414.32ms(steals 0) | C/LLX 0.65x C/RR 0.65x A/LLX 4.45x A/RR 4.41x | migr LLX=216.0 RR=0.0 MB | imb LLX=0.339 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=623.91 C=707.05 E=639.17 LLX=1241.55 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=707.0 RR=1256.5 LLX=1241.5 MB | 忽略局部性冷启动 = RR-C +549.5 MB (x1.78) | migr C=384.0 LLX=216.0 MB | C/RR 0.646x
+  => [kv-mode=full] migr C=384.0 MB live=0 | trace基线=731.31 MB | refill B=623.91(+-107.4) C=707.05(-24.3) MB  | cold_B=-107.4 cold_C=-24.3

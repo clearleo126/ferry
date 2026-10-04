@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=balanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=full rebal=50ms/thr0.25 prefix=grp4/stp8
+  static-A  makespan=  1876.10ms steps/s=   25.6 p50= 98.179 p99= 119.796 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.000 ref=0 live=0
+  dyn-B     makespan=   284.71ms steps/s=  168.6 p50= 12.388 p99=  23.216 steals=   6 migr=  144.0MB(  6 reqs) refill=  39074 seg   610.53MB imb=0.132 ref=0 live=0
+  ferry-C   makespan=   316.48ms steps/s=  151.7 p50= 10.961 p99=  28.330 steals=  13 migr=  528.0MB( 22 reqs) refill=  37329 seg   716.77MB imb=0.295 ref=0 live=0
+  costaware-E makespan=   235.92ms steps/s=  203.5 p50=  9.625 p99=  15.486 steals=   6 migr=  288.0MB( 12 reqs) refill=  34222 seg   659.84MB imb=0.000 ref=7 live=0
+  llumnix-LLX makespan=   300.76ms steps/s=  159.6 p50= 16.138 p99=  27.264 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  roundrobin-RR makespan=   300.77ms steps/s=  159.6 p50= 16.061 p99=  26.872 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 5.93x  C/B 0.90x  E/A 7.95x
+  => [C1-结构] migr(MB): A=0.0 B=144.0 C=528.0 E=288.0 | steals: B=6 C=13 E=6 | refill_seg: A=589824 B=39074 C=37329  [PASS]
+  => [WlA-E] migr C=528.0 vs E=288.0 MB | steals C=13 E=6 | E refused=7 | E/C 1.341x
+  => [BASE] LLX 300.76ms(steals 0 rebal 6/0) RR 300.77ms(steals 0) | C/LLX 1.05x C/RR 1.05x A/LLX 6.24x A/RR 6.24x | migr LLX=0.0 RR=0.0 MB | imb LLX=0.000 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=610.53 C=716.77 E=659.84 LLX=1256.55 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=716.8 RR=1256.5 LLX=1256.5 MB | 忽略局部性冷启动 = RR-C +539.8 MB (x1.75) | migr C=528.0 LLX=0.0 MB | C/RR 1.052x
+  => [kv-mode=full] migr C=528.0 MB live=0 | trace基线=731.31 MB | refill B=610.53(+-120.8) C=716.77(-14.5) MB  | cold_B=-120.8 cold_C=-14.5

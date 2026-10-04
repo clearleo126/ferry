@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=balanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=full rebal=50ms/thr0.25 prefix=grp4/stp8
+  static-A  makespan=  1980.31ms steps/s=   24.2 p50=100.094 p99= 191.845 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.000 ref=0 live=0
+  dyn-B     makespan=   270.99ms steps/s=  177.1 p50= 12.488 p99=  31.885 steals=   3 migr=   72.0MB(  3 reqs) refill=  36602 seg   571.91MB imb=0.102 ref=0 live=0
+  ferry-C   makespan=   265.32ms steps/s=  180.9 p50= 10.025 p99=  18.620 steals=  11 migr=  600.0MB( 25 reqs) refill=  35442 seg   678.31MB imb=0.195 ref=0 live=0
+  costaware-E makespan=   283.71ms steps/s=  169.2 p50= 11.714 p99=  23.734 steals=   6 migr=  384.0MB( 16 reqs) refill=  32421 seg   615.62MB imb=0.000 ref=6 live=0
+  llumnix-LLX makespan=   397.74ms steps/s=  120.7 p50= 16.667 p99=  42.780 steals=   3 migr=  144.0MB(  6 reqs) refill=  60109 seg  1253.16MB imb=0.250 ref=0 live=0
+  roundrobin-RR makespan=   340.71ms steps/s=  140.9 p50= 15.641 p99=  37.880 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 7.46x  C/B 1.02x  E/A 6.98x
+  => [C1-结构] migr(MB): A=0.0 B=72.0 C=600.0 E=384.0 | steals: B=3 C=11 E=6 | refill_seg: A=589824 B=36602 C=35442  [PASS]
+  => [WlA-E] migr C=600.0 vs E=384.0 MB | steals C=11 E=6 | E refused=6 | E/C 0.935x
+  => [BASE] LLX 397.74ms(steals 3 rebal 4/3) RR 340.71ms(steals 0) | C/LLX 0.67x C/RR 0.78x A/LLX 4.98x A/RR 5.81x | migr LLX=144.0 RR=0.0 MB | imb LLX=0.250 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=571.91 C=678.31 E=615.62 LLX=1253.16 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=678.3 RR=1256.5 LLX=1253.2 MB | 忽略局部性冷启动 = RR-C +578.2 MB (x1.85) | migr C=600.0 LLX=144.0 MB | C/RR 0.779x
+  => [kv-mode=full] migr C=600.0 MB live=0 | trace基线=731.31 MB | refill B=571.91(+-159.4) C=678.31(-53.0) MB  | cold_B=-159.4 cold_C=-53.0

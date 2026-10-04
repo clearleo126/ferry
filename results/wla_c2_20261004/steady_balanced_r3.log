@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=balanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=full rebal=50ms/thr0.25 prefix=grp4/stp8
+  static-A  makespan=  1876.69ms steps/s=   25.6 p50=114.411 p99= 123.910 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.000 ref=0 live=0
+  dyn-B     makespan=   276.76ms steps/s=  173.4 p50= 12.621 p99=  36.000 steals=   2 migr=   48.0MB(  2 reqs) refill=  36069 seg   563.58MB imb=0.083 ref=0 live=0
+  ferry-C   makespan=   268.22ms steps/s=  179.0 p50= 10.942 p99=  18.720 steals=   9 migr=  408.0MB( 17 reqs) refill=  35731 seg   685.50MB imb=0.212 ref=0 live=0
+  costaware-E makespan=   280.35ms steps/s=  171.2 p50= 11.585 p99=  21.130 steals=   6 migr=  240.0MB( 10 reqs) refill=  34366 seg   656.73MB imb=0.000 ref=7 live=0
+  llumnix-LLX makespan=   307.78ms steps/s=  156.0 p50= 15.945 p99=  28.783 steals=   2 migr=   48.0MB(  2 reqs) refill=  60155 seg  1254.38MB imb=0.083 ref=0 live=0
+  roundrobin-RR makespan=   358.84ms steps/s=  133.8 p50= 15.639 p99=  40.831 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 7.00x  C/B 1.03x  E/A 6.69x
+  => [C1-结构] migr(MB): A=0.0 B=48.0 C=408.0 E=240.0 | steals: B=2 C=9 E=6 | refill_seg: A=589824 B=36069 C=35731  [PASS]
+  => [WlA-E] migr C=408.0 vs E=240.0 MB | steals C=9 E=6 | E refused=7 | E/C 0.957x
+  => [BASE] LLX 307.78ms(steals 2 rebal 4/2) RR 358.84ms(steals 0) | C/LLX 0.87x C/RR 0.75x A/LLX 6.10x A/RR 5.23x | migr LLX=48.0 RR=0.0 MB | imb LLX=0.083 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=563.58 C=685.50 E=656.73 LLX=1254.38 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=685.5 RR=1256.5 LLX=1254.4 MB | 忽略局部性冷启动 = RR-C +571.0 MB (x1.83) | migr C=408.0 LLX=48.0 MB | C/RR 0.747x
+  => [kv-mode=full] migr C=408.0 MB live=0 | trace基线=731.31 MB | refill B=563.58(+-167.7) C=685.50(-45.8) MB  | cold_B=-167.7 cold_C=-45.8

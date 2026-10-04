@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=bursty skew=balanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=full rebal=50ms/thr0.25 prefix=grp4/stp8
+  static-A  makespan=  1899.92ms steps/s=   25.3 p50= 92.315 p99= 127.245 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.000 ref=0 live=0
+  dyn-B     makespan=   311.48ms steps/s=  154.1 p50=  7.832 p99=  22.798 steals=   4 migr=   96.0MB(  4 reqs) refill=  37422 seg   584.72MB imb=0.167 ref=0 live=0
+  ferry-C   makespan=   344.91ms steps/s=  139.2 p50=  9.504 p99=  16.888 steals=  17 migr=  552.0MB( 23 reqs) refill=  40652 seg   780.36MB imb=0.083 ref=0 live=0
+  costaware-E makespan=   289.78ms steps/s=  165.6 p50=  6.151 p99=  12.065 steals=   4 migr=  120.0MB(  5 reqs) refill=  32644 seg   617.89MB imb=0.000 ref=14 live=0
+  llumnix-LLX makespan=   376.92ms steps/s=  127.3 p50= 14.554 p99=  31.676 steals=   3 migr=   96.0MB(  4 reqs) refill=  59449 seg  1241.92MB imb=0.167 ref=0 live=0
+  roundrobin-RR makespan=   438.78ms steps/s=  109.4 p50= 15.441 p99=  37.090 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 5.51x  C/B 0.90x  E/A 6.56x
+  => [C1-结构] migr(MB): A=0.0 B=96.0 C=552.0 E=120.0 | steals: B=4 C=17 E=4 | refill_seg: A=589824 B=37422 C=40652  [PASS]
+  => [WlA-E] migr C=552.0 vs E=120.0 MB | steals C=17 E=4 | E refused=14 | E/C 1.190x
+  => [BASE] LLX 376.92ms(steals 3 rebal 4/3) RR 438.78ms(steals 0) | C/LLX 0.92x C/RR 0.79x A/LLX 5.04x A/RR 4.33x | migr LLX=96.0 RR=0.0 MB | imb LLX=0.167 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=584.72 C=780.36 E=617.89 LLX=1241.92 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=780.4 RR=1256.5 LLX=1241.9 MB | 忽略局部性冷启动 = RR-C +476.2 MB (x1.61) | migr C=552.0 LLX=96.0 MB | C/RR 0.786x
+  => [kv-mode=full] migr C=552.0 MB live=0 | trace基线=731.31 MB | refill B=584.72(+-146.6) C=780.36(+49.0) MB  | cold_B=-146.6 cold_C=49.0
