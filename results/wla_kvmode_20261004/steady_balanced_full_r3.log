@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=balanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=full rebal=50ms/thr0.25 prefix=grp4/stp8
+  static-A  makespan=  1910.91ms steps/s=   25.1 p50= 98.316 p99= 123.160 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.000 ref=0 live=0
+  dyn-B     makespan=   301.93ms steps/s=  159.0 p50= 11.789 p99=  41.828 steals=   8 migr=  192.0MB(  8 reqs) refill=  40275 seg   629.30MB imb=0.167 ref=0 live=0
+  ferry-C   makespan=   252.44ms steps/s=  190.1 p50= 10.408 p99=  23.728 steals=   9 migr=  384.0MB( 16 reqs) refill=  34553 seg   659.66MB imb=0.102 ref=0 live=0
+  costaware-E makespan=   261.47ms steps/s=  183.6 p50= 11.048 p99=  21.805 steals=   5 migr=  288.0MB( 12 reqs) refill=  33456 seg   639.94MB imb=0.000 ref=11 live=0
+  llumnix-LLX makespan=   394.49ms steps/s=  121.7 p50= 15.317 p99=  40.975 steals=   4 migr=  288.0MB( 12 reqs) refill=  58833 seg  1229.70MB imb=0.500 ref=0 live=0
+  roundrobin-RR makespan=   360.66ms steps/s=  133.1 p50= 16.727 p99=  40.405 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 7.57x  C/B 1.20x  E/A 7.31x
+  => [C1-结构] migr(MB): A=0.0 B=192.0 C=384.0 E=288.0 | steals: B=8 C=9 E=5 | refill_seg: A=589824 B=40275 C=34553  [PASS]
+  => [WlA-E] migr C=384.0 vs E=288.0 MB | steals C=9 E=5 | E refused=11 | E/C 0.965x
+  => [BASE] LLX 394.49ms(steals 4 rebal 3/4) RR 360.66ms(steals 0) | C/LLX 0.64x C/RR 0.70x A/LLX 4.84x A/RR 5.30x | migr LLX=288.0 RR=0.0 MB | imb LLX=0.500 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=629.30 C=659.66 E=639.94 LLX=1229.70 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=659.7 RR=1256.5 LLX=1229.7 MB | 忽略局部性冷启动 = RR-C +596.9 MB (x1.90) | migr C=384.0 LLX=288.0 MB | C/RR 0.700x
+  => [kv-mode=full] migr C=384.0 MB live=0 | trace基线=731.31 MB | refill B=629.30(+-102.0) C=659.66(-71.7) MB  | cold_B=-102.0 cold_C=-71.7

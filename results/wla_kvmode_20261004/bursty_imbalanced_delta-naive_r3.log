@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=bursty skew=imbalanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=delta-naive rebal=50ms/thr0.25 prefix=grp4/stp8
+  static-A  makespan=  3988.92ms steps/s=   12.0 p50= 82.751 p99= 265.257 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.577 ref=0 live=0
+  dyn-B     makespan=   416.77ms steps/s=  115.2 p50=  9.962 p99=  34.327 steals=  10 migr=  138.4MB( 10 reqs) refill=  38700 seg   604.69MB imb=0.102 ref=0 live=8857
+  ferry-C   makespan=   432.50ms steps/s=  111.0 p50=  7.010 p99=  13.898 steals=  13 migr=  368.2MB( 30 reqs) refill=  30561 seg   569.25MB imb=0.059 ref=0 live=23565
+  costaware-E makespan=   427.79ms steps/s=  112.2 p50=  6.498 p99=  18.901 steals=  12 migr=  283.7MB( 32 reqs) refill=  30564 seg   573.25MB imb=0.102 ref=9 live=18158
+  llumnix-LLX makespan=   433.07ms steps/s=  110.8 p50= 14.978 p99=  35.676 steals=   2 migr=   53.3MB(  4 reqs) refill=  59851 seg  1249.52MB imb=0.186 ref=0 live=3413
+  roundrobin-RR makespan=   449.61ms steps/s=  106.8 p50= 15.731 p99=  38.151 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 9.22x  C/B 0.96x  E/A 9.32x
+  => [C1-结构] migr(MB): A=0.0 B=138.4 C=368.2 E=283.7 | steals: B=10 C=13 E=12 | refill_seg: A=589824 B=38700 C=30561  [PASS]
+  => [WlA-E] migr C=368.2 vs E=283.7 MB | steals C=13 E=12 | E refused=9 | E/C 1.011x
+  => [BASE] LLX 433.07ms(steals 2 rebal 4/3) RR 449.61ms(steals 0) | C/LLX 1.00x C/RR 0.96x A/LLX 9.21x A/RR 8.87x | migr LLX=53.3 RR=0.0 MB | imb LLX=0.186 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=604.69 C=569.25 E=573.25 LLX=1249.52 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=569.2 RR=1256.5 LLX=1249.5 MB | 忽略局部性冷启动 = RR-C +687.3 MB (x2.21) | migr C=368.2 LLX=53.3 MB | C/RR 0.962x
+  => [kv-mode=delta-naive] migr C=368.2 MB live=23565 | trace基线=731.31 MB | refill B=604.69(+-126.6) C=569.25(-162.1) MB  | cold_B=-126.6 cold_C=-162.1

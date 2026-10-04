@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=balanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8
+  static-A  makespan=  1894.81ms steps/s=   25.3 p50=114.724 p99= 130.903 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.000 ref=0 live=0
+  dyn-B     makespan=   293.06ms steps/s=  163.8 p50= 13.441 p99=  28.111 steals=   6 migr=  127.5MB(  6 reqs) refill=  35236 seg   550.56MB imb=0.212 ref=0 live=8159
+  ferry-C   makespan=   298.56ms steps/s=  160.8 p50= 12.084 p99=  21.984 steals=  12 migr=  281.6MB( 19 reqs) refill=  32911 seg   610.73MB imb=0.132 ref=0 live=18024
+  costaware-E makespan=   250.21ms steps/s=  191.8 p50=  9.909 p99=  19.288 steals=   5 migr=   30.5MB(  6 reqs) refill=  32777 seg   616.27MB imb=0.000 ref=2 live=1953
+  llumnix-LLX makespan=   370.92ms steps/s=  129.4 p50= 17.136 p99=  42.177 steals=   3 migr=   47.4MB(  3 reqs) refill=  59804 seg  1248.31MB imb=0.156 ref=0 live=3036
+  roundrobin-RR makespan=   349.79ms steps/s=  137.2 p50= 17.303 p99=  39.972 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 6.35x  C/B 0.98x  E/A 7.57x
+  => [C1-结构] migr(MB): A=0.0 B=127.5 C=281.6 E=30.5 | steals: B=6 C=12 E=5 | refill_seg: A=589824 B=35236 C=32911  [PASS]
+  => [WlA-E] migr C=281.6 vs E=30.5 MB | steals C=12 E=5 | E refused=2 | E/C 1.193x
+  => [BASE] LLX 370.92ms(steals 3 rebal 4/3) RR 349.79ms(steals 0) | C/LLX 0.80x C/RR 0.85x A/LLX 5.11x A/RR 5.42x | migr LLX=47.4 RR=0.0 MB | imb LLX=0.156 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=550.56 C=610.73 E=616.27 LLX=1248.31 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=610.7 RR=1256.5 LLX=1248.3 MB | 忽略局部性冷启动 = RR-C +645.8 MB (x2.06) | migr C=281.6 LLX=47.4 MB | C/RR 0.854x
+  => [kv-mode=delta] migr C=281.6 MB live=18024 | trace基线=731.31 MB | refill B=550.56(+-180.8) C=610.73(-120.6) MB  | cold_B=-180.8 cold_C=-120.6

@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=bursty skew=imbalanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=full rebal=50ms/thr0.25 prefix=grp4/stp8
+  static-A  makespan=  2976.38ms steps/s=   16.1 p50= 79.318 p99= 215.997 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.577 ref=0 live=0
+  dyn-B     makespan=   426.46ms steps/s=  112.6 p50= 13.718 p99=  33.283 steals=   9 migr=  216.0MB(  9 reqs) refill=  41639 seg   650.61MB imb=0.144 ref=0 live=0
+  ferry-C   makespan=   315.49ms steps/s=  152.1 p50=  7.858 p99=  16.277 steals=  17 migr=  768.0MB( 32 reqs) refill=  37928 seg   729.70MB imb=0.236 ref=0 live=0
+  costaware-E makespan=   274.13ms steps/s=  175.1 p50=  6.910 p99=  12.605 steals=  10 migr=  600.0MB( 25 reqs) refill=  34981 seg   670.11MB imb=0.000 ref=6 live=0
+  llumnix-LLX makespan=   365.95ms steps/s=  131.2 p50= 13.785 p99=  31.953 steals=   3 migr=  120.0MB(  5 reqs) refill=  58999 seg  1234.22MB imb=0.132 ref=0 live=0
+  roundrobin-RR makespan=   447.87ms steps/s=  107.2 p50= 18.307 p99=  37.336 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 9.43x  C/B 1.35x  E/A 10.86x
+  => [C1-结构] migr(MB): A=0.0 B=216.0 C=768.0 E=600.0 | steals: B=9 C=17 E=10 | refill_seg: A=589824 B=41639 C=37928  [PASS]
+  => [WlA-E] migr C=768.0 vs E=600.0 MB | steals C=17 E=10 | E refused=6 | E/C 1.151x
+  => [BASE] LLX 365.95ms(steals 3 rebal 4/3) RR 447.87ms(steals 0) | C/LLX 0.86x C/RR 0.70x A/LLX 8.13x A/RR 6.65x | migr LLX=120.0 RR=0.0 MB | imb LLX=0.132 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=650.61 C=729.70 E=670.11 LLX=1234.22 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=729.7 RR=1256.5 LLX=1234.2 MB | 忽略局部性冷启动 = RR-C +526.8 MB (x1.72) | migr C=768.0 LLX=120.0 MB | C/RR 0.704x
+  => [kv-mode=full] migr C=768.0 MB live=0 | trace基线=731.31 MB | refill B=650.61(+-80.7) C=729.70(-1.6) MB  | cold_B=-80.7 cold_C=-1.6

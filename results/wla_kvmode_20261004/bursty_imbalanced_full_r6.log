@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=bursty skew=imbalanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=full rebal=50ms/thr0.25 prefix=grp4/stp8
+  static-A  makespan=  2970.80ms steps/s=   16.2 p50= 88.209 p99= 195.538 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.577 ref=0 live=0
+  dyn-B     makespan=   428.95ms steps/s=  111.9 p50= 10.521 p99=  37.549 steals=  12 migr=  288.0MB( 12 reqs) refill=  43514 seg   679.91MB imb=0.059 ref=0 live=0
+  ferry-C   makespan=   430.58ms steps/s=  111.5 p50=  8.103 p99=  99.666 steals=  16 migr=  768.0MB( 32 reqs) refill=  38604 seg   745.97MB imb=0.102 ref=0 live=0
+  costaware-E makespan=   310.29ms steps/s=  154.7 p50=  7.938 p99=  18.133 steals=   9 migr=  600.0MB( 25 reqs) refill=  32465 seg   618.70MB imb=0.132 ref=15 live=0
+  llumnix-LLX makespan=   391.37ms steps/s=  122.6 p50= 14.178 p99=  50.096 steals=   3 migr=  288.0MB( 12 reqs) refill=  58021 seg  1215.38MB imb=0.408 ref=0 live=0
+  roundrobin-RR makespan=   357.71ms steps/s=  134.2 p50= 14.394 p99=  30.545 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 6.90x  C/B 1.00x  E/A 9.57x
+  => [C1-结构] migr(MB): A=0.0 B=288.0 C=768.0 E=600.0 | steals: B=12 C=16 E=9 | refill_seg: A=589824 B=43514 C=38604  [PASS]
+  => [WlA-E] migr C=768.0 vs E=600.0 MB | steals C=16 E=9 | E refused=15 | E/C 1.388x
+  => [BASE] LLX 391.37ms(steals 3 rebal 4/3) RR 357.71ms(steals 0) | C/LLX 1.10x C/RR 1.20x A/LLX 7.59x A/RR 8.30x | migr LLX=288.0 RR=0.0 MB | imb LLX=0.408 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=679.91 C=745.97 E=618.70 LLX=1215.38 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=746.0 RR=1256.5 LLX=1215.4 MB | 忽略局部性冷启动 = RR-C +510.6 MB (x1.68) | migr C=768.0 LLX=288.0 MB | C/RR 1.204x
+  => [kv-mode=full] migr C=768.0 MB live=0 | trace基线=731.31 MB | refill B=679.91(+-51.4) C=745.97(+14.7) MB  | cold_B=-51.4 cold_C=14.7

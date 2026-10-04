@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=balanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=full rebal=50ms/thr0.25 prefix=grp4/stp8
+  static-A  makespan=  2270.45ms steps/s=   21.1 p50=113.371 p99= 145.380 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.000 ref=0 live=0
+  dyn-B     makespan=   357.11ms steps/s=  134.4 p50= 14.502 p99=  58.569 steals=   7 migr=  168.0MB(  7 reqs) refill=  40433 seg   631.77MB imb=0.132 ref=0 live=0
+  ferry-C   makespan=   302.66ms steps/s=  158.6 p50= 10.691 p99=  23.734 steals=  13 migr=  456.0MB( 19 reqs) refill=  36540 seg   706.08MB imb=0.306 ref=0 live=0
+  costaware-E makespan=   283.15ms steps/s=  169.5 p50= 12.176 p99=  20.879 steals=   5 migr=  168.0MB(  7 reqs) refill=  33420 seg   639.88MB imb=0.000 ref=11 live=0
+  llumnix-LLX makespan=   367.56ms steps/s=  130.6 p50= 17.070 p99=  38.688 steals=   3 migr=   96.0MB(  4 reqs) refill=  59795 seg  1248.36MB imb=0.118 ref=0 live=0
+  roundrobin-RR makespan=   395.96ms steps/s=  121.2 p50= 18.140 p99=  41.064 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 7.50x  C/B 1.18x  E/A 8.02x
+  => [C1-结构] migr(MB): A=0.0 B=168.0 C=456.0 E=168.0 | steals: B=7 C=13 E=5 | refill_seg: A=589824 B=40433 C=36540  [PASS]
+  => [WlA-E] migr C=456.0 vs E=168.0 MB | steals C=13 E=5 | E refused=11 | E/C 1.069x
+  => [BASE] LLX 367.56ms(steals 3 rebal 4/3) RR 395.96ms(steals 0) | C/LLX 0.82x C/RR 0.76x A/LLX 6.18x A/RR 5.73x | migr LLX=96.0 RR=0.0 MB | imb LLX=0.118 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=631.77 C=706.08 E=639.88 LLX=1248.36 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=706.1 RR=1256.5 LLX=1248.4 MB | 忽略局部性冷启动 = RR-C +550.5 MB (x1.78) | migr C=456.0 LLX=96.0 MB | C/RR 0.764x
+  => [kv-mode=full] migr C=456.0 MB live=0 | trace基线=731.31 MB | refill B=631.77(+-99.5) C=706.08(-25.2) MB  | cold_B=-99.5 cold_C=-25.2
