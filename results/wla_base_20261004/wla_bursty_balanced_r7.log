@@ -1,0 +1,13 @@
+[wla-mg] gpus=0,1,2,3 arrival=bursty skew=balanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=full rebal=50ms/thr0.25
+  static-A  makespan=  1946.43ms steps/s=   24.7 p50= 97.463 p99= 132.889 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.000 ref=0 live=0
+  dyn-B     makespan=   539.53ms steps/s=   89.0 p50= 21.772 p99=  78.651 steals=   4 migr=   96.0MB(  4 reqs) refill=  79550 seg  1242.97MB imb=0.195 ref=0 live=0
+  ferry-C   makespan=   385.67ms steps/s=  124.5 p50= 12.610 p99=  31.800 steals=   9 migr=  216.0MB(  9 reqs) refill=  59863 seg  1242.97MB imb=0.156 ref=0 live=0
+  costaware-E makespan=   399.66ms steps/s=  120.1 p50= 14.188 p99=  36.154 steals=   3 migr=   96.0MB(  4 reqs) refill=  59863 seg  1242.97MB imb=0.167 ref=4 live=0
+  llumnix-LLX makespan=   422.00ms steps/s=  113.7 p50= 13.820 p99=  36.114 steals=   3 migr=  168.0MB(  7 reqs) refill=  59863 seg  1242.97MB imb=0.212 ref=0 live=0
+  roundrobin-RR makespan=   374.46ms steps/s=  128.2 p50= 12.243 p99=  36.994 steals=   0 migr=    0.0MB(  0 reqs) refill=  59863 seg  1242.97MB imb=0.000 ref=0 live=0
+  => C/A 5.05x  C/B 1.40x  E/A 4.87x
+  => [C1-结构] migr(MB): A=0.0 B=96.0 C=216.0 E=96.0 | steals: B=4 C=9 E=3 | refill_seg: A=589824 B=79550 C=59863  [PASS]
+  => [WlA-E] migr C=216.0 vs E=96.0 MB | steals C=9 E=3 | E refused=4 | E/C 0.965x
+  => [BASE] LLX 422.00ms(steals 3 rebal 5/3) RR 374.46ms(steals 0) | C/LLX 0.91x C/RR 1.03x A/LLX 4.61x A/RR 5.20x | migr LLX=168.0 RR=0.0 MB | imb LLX=0.212 RR=0.000
+  => hit_rate=0.865  refill_bytes A=9216.00 B=1242.97 C=1242.97 MB (full 模式应全等：trace 固定；delta/drop 按设计可差)
+  => [kv-mode=full] migr C=216.0 MB live=0 | trace基线=1242.97 MB | refill B=1242.97(+0.0) C=1242.97(+0.0) MB  | cold_B=0.0 cold_C=0.0
