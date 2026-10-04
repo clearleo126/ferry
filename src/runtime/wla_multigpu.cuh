@@ -100,7 +100,43 @@ __global__ inline void wla_attn_kernel(const __half* in, __half* out,
 }
 
 // 迁移内容模式（见头注释"KV 迁移内容"）
-enum class WlaKvMode { Full = 0, Delta = 1, Drop = 2 };
+// delta     = 批量化压实（gather → 单次 submit → scatter，2026-10-04）
+// delta-naive = v8 逐槽 submit 路径（仅作 ablation 保留：证明"增量必须
+//               批量化，逐条发输给全量"的实现缺陷量级）
+enum class WlaKvMode { Full = 0, Delta = 1, Drop = 2, DeltaNaive = 3 };
+
+// ---- delta 批量化参数（离线微基准标定 2026-10-04，4MB×4 槽 ring 同构通道）----
+// 实测（/tmp/calib_delta.cu，48 槽偏移随机散布的保守情形）：
+//   full 24MB=1.41ms(17.9GB/s)  batch 24MB=1.52ms(+7%,16.6GB/s)
+//   naive 24MB=9.53ms(6.3× 慢于 batch，每槽 6.2µs) → 逐槽路径即缺陷本体
+// kMigDeltaFixedMs = 每 chunk 固定开销（索引 H2D×2 + gather/scatter
+// kernel + submit 建链），实测 52–109µs，取保守中值；替换 v8 硬编码的
+// 2.0 每字节惩罚（该惩罚实为逐槽 submit 的实现缺陷）。
+inline constexpr double kMigDeltaFixedMs = 0.06;
+inline constexpr int kMigChunkReqs = 4;  // 每 chunk 请求数（= steal_batch 默认）
+
+// delta 批量化 kernel（Raft AppendEntries 教训：一批 entry 一次 RPC）：
+//   gather  = victim 侧把散布在各槽的驻留 KV 压实成连续段（blockIdx = slot）
+//   scatter = consumer 侧按偏移表散射回真实槽位（gather 的镜像）
+// 均走默认流（与 blocking 计算流双向有序：gather 不会与计算并发读写同槽）
+__global__ inline void wla_slot_gather_kernel(
+    const char* __restrict__ cache, char* __restrict__ stage,
+    const uint64_t* __restrict__ offs, int n_slots, int words_per_slot) {
+  const int s = blockIdx.x;  // 每 block 搬一个 slot（c4=16KB → 4 uint4/线程）
+  if (s >= n_slots) return;
+  const uint4* src = reinterpret_cast<const uint4*>(cache + offs[s]);
+  uint4* dst = reinterpret_cast<uint4*>(stage) + (size_t)s * words_per_slot;
+  for (int i = threadIdx.x; i < words_per_slot; i += blockDim.x) dst[i] = src[i];
+}
+__global__ inline void wla_slot_scatter_kernel(
+    const char* __restrict__ stage, char* __restrict__ cache,
+    const uint64_t* __restrict__ offs, int n_slots, int words_per_slot) {
+  const int s = blockIdx.x;
+  if (s >= n_slots) return;
+  const uint4* src = reinterpret_cast<const uint4*>(stage) + (size_t)s * words_per_slot;
+  uint4* dst = reinterpret_cast<uint4*>(cache + offs[s]);
+  for (int i = threadIdx.x; i < words_per_slot; i += blockDim.x) dst[i] = src[i];
+}
 
 // 到达分发路径：Affinity = 按 dest 亲和（A/B/C/E 既有语义）；
 // RoundRobin = 轮转（RR 基线的唯一差异项）
@@ -310,6 +346,22 @@ class WlaMultiGpuCtx {
           mig_[v][c] = std::make_unique<HostStagedChannel>(devs_[v], devs_[c],
                                                            4, 4 << 20, 2);
     }
+    // delta 批量化 staging：每卡两块（victim gather 侧 / consumer scatter
+    // 侧，容量 = kMigChunkReqs×seg + 索引表）+ pinned 索引表暂存。
+    // steal_from 全程持 steal_lock_ 串行 → 每卡一块即可互斥复用。
+    if (kvmode_ == WlaKvMode::Delta) {
+      mig_idx_cap_ = (size_t)kMigChunkReqs * sp.num_layers *
+                     sp.hot_blocks * sizeof(uint64_t);
+      const size_t stage_bytes = mig_idx_cap_ + (size_t)kMigChunkReqs * seg_;
+      mig_stage_v_.assign(n_, nullptr);
+      mig_stage_c_.assign(n_, nullptr);
+      for (int g = 0; g < n_; ++g) {
+        CUDA_CHECK(cudaSetDevice(devs_[g]));
+        CUDA_CHECK(cudaMalloc(&mig_stage_v_[g], stage_bytes));
+        CUDA_CHECK(cudaMalloc(&mig_stage_c_[g], stage_bytes));
+      }
+      CUDA_CHECK(cudaMallocHost(&h_mig_idx_, mig_idx_cap_));
+    }
     // LRU 镜像（delta/drop 或 C2 前缀亲和需要；索引 = 组 id，组内请求共享
     // 前缀缓存状态。prefix_group=1 时组即请求 → 索引等价既有语义）
     if (kvmode_ != WlaKvMode::Full || sp_.prefix_group > 1) {
@@ -347,6 +399,14 @@ class WlaMultiGpuCtx {
       }
     }
     cudaFreeHost(h_slab_);
+    if (kvmode_ == WlaKvMode::Delta) {
+      for (int g = 0; g < n_; ++g) {
+        CUDA_CHECK(cudaSetDevice(devs_[g]));
+        cudaFree(mig_stage_v_[g]);
+        cudaFree(mig_stage_c_[g]);
+      }
+      cudaFreeHost(h_mig_idx_);
+    }
   }
 
   // ---- 到达分发（主线程） ----
@@ -470,8 +530,16 @@ class WlaMultiGpuCtx {
             cost_ms = 2.0 * (double)seg_ * bw_ms_per_byte;
           } else {
             const double live_b = (double)kv_live(v, r) * (double)c4_;
-            cost_ms = (kvmode_ == WlaKvMode::Delta ? 2.0 : 1.0) * live_b *
-                      bw_ms_per_byte;
+            // delta（批量化）：同通道同每字节价 + 每 chunk 固定开销
+            //（kMigDeltaFixedMs，微基准标定）；delta-naive 保留 v8 的
+            // 2.0 每字节惩罚（其逐槽 submit 真实如此，仅 ablation）；
+            // drop = 单跳冷启动回填
+            cost_ms =
+                (kvmode_ == WlaKvMode::Delta)
+                    ? 2.0 * live_b * bw_ms_per_byte + kMigDeltaFixedMs
+                    : (kvmode_ == WlaKvMode::DeltaNaive
+                           ? 2.0 * live_b * bw_ms_per_byte
+                           : live_b * bw_ms_per_byte);
           }
           const double value =
               (double)(sp_.steps - next_step_[r]) * step_ms;
@@ -505,25 +573,81 @@ class WlaMultiGpuCtx {
     //   drop  = 不发数据，镜像清空 → 消费卡冷启动
     HostStagedChannel* ch = mig_[v][g].get();
     size_t moved_bytes = 0;
-    for (int r : moved) {
-      if (kvmode_ == WlaKvMode::Full) {
-        // full：整段复制（既有语义，数据冻结）。C2：段按组偏移 → 迁移随带
-        // 该组已驻留的热集（后到组员迁来即命中 —— 亲和收益随迁移携带）
-        const size_t goff = (size_t)wla_grp(sp_, r) * seg_;
-        ch->submit(d_cache_[v] + goff, seg_, d_cache_[g] + goff);
-        moved_bytes += seg_;
-      } else if (kvmode_ == WlaKvMode::Delta) {
-        for (int l = 0; l < sp_.num_layers; ++l)
-          for (uint64_t blk : kv_set(v, r, l)) {
-            const size_t off = wla_gslot_off(sp_, r, l, blk);
-            ch->submit(d_cache_[v] + off, c4_, d_cache_[g] + off);
-            moved_bytes += c4_;
-            live_slots_.fetch_add(1);
-          }
-        kv_handoff(v, g, r, /*carry=*/true);
-      } else {  // Drop
-        kv_handoff(v, g, r, /*carry=*/false);
-        moved_bytes += 0;  // 不搬数据；代价显式转嫁到消费卡的回填侧
+    if (kvmode_ == WlaKvMode::Delta) {
+      // 批量化 delta（Raft 教训：一批 entry 一次 RPC）：chunk 内全部请求
+      // 的驻留槽平铺成一张偏移表（pinned 暂存）→ victim 侧 gather 压实
+      // → 单次 submit（通道内部按 4MB 切分，次数与 full 同量级）→
+      // sync（chunk 间串行防 staging 覆盖）→ consumer 侧索引 H2D 直发
+      // + scatter 散射回真实槽位。submit 次数 O(L×live)→每 chunk 1 次。
+      char* stg_v = mig_stage_v_[v];
+      char* stg_g = mig_stage_c_[g];
+      for (size_t c0 = 0; c0 < moved.size(); c0 += (size_t)kMigChunkReqs) {
+        const size_t c1 =
+            std::min(c0 + (size_t)kMigChunkReqs, moved.size());
+        uint64_t* idx = reinterpret_cast<uint64_t*>(h_mig_idx_);
+        int ns = 0;
+        for (size_t j = c0; j < c1; ++j) {
+          const int r = moved[j];
+          for (int l = 0; l < sp_.num_layers; ++l)
+            for (uint64_t blk : kv_set(v, r, l))
+              idx[ns++] = (uint64_t)wla_gslot_off(sp_, r, l, blk);
+        }
+        for (size_t j = c0; j < c1; ++j)
+          kv_handoff(v, g, moved[j], /*carry=*/true);
+        if (ns == 0) continue;  // 空热集：仅状态交接，无数据可迁
+        const size_t data_bytes = (size_t)ns * c4_;
+        const int words = (int)(c4_ / sizeof(uint4));
+        // ① victim：索引 H2D → staging 头部；gather 压实到数据区
+        CUDA_CHECK(cudaSetDevice(devs_[v]));
+        CUDA_CHECK(cudaMemcpyAsync(stg_v, idx,
+                                   (size_t)ns * sizeof(uint64_t),
+                                   cudaMemcpyHostToDevice, 0));
+        wla_slot_gather_kernel<<<ns, 256>>>(
+            d_cache_[v], stg_v + mig_idx_cap_,
+            reinterpret_cast<const uint64_t*>(stg_v), ns, words);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(0));  // gather 落地后才允许 submit 读
+        // ② 单次 submit（数据区；通道内部自动 4MB 切分）
+        ch->submit(stg_v + mig_idx_cap_, data_bytes, stg_g + mig_idx_cap_);
+        moved_bytes += data_bytes;
+        live_slots_.fetch_add(ns);
+        // ③ 批末同步（chunk 间串行，防 staging 被下一 chunk 覆盖）
+        ch->sync();
+        // ④ consumer：索引 H2D 直发 + scatter 散射回真实槽位
+        CUDA_CHECK(cudaSetDevice(devs_[g]));
+        CUDA_CHECK(cudaMemcpyAsync(stg_g, idx,
+                                   (size_t)ns * sizeof(uint64_t),
+                                   cudaMemcpyHostToDevice, 0));
+        wla_slot_scatter_kernel<<<ns, 256>>>(
+            stg_g + mig_idx_cap_, d_cache_[g],
+            reinterpret_cast<const uint64_t*>(stg_g), ns, words);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(0));
+      }
+    } else {
+      for (int r : moved) {
+        if (kvmode_ == WlaKvMode::Full) {
+          // full：整段复制（既有语义，数据冻结）。C2：段按组偏移 → 迁移随带
+          // 该组已驻留的热集（后到组员迁来即命中 —— 亲和收益随迁移携带）
+          const size_t goff = (size_t)wla_grp(sp_, r) * seg_;
+          ch->submit(d_cache_[v] + goff, seg_, d_cache_[g] + goff);
+          moved_bytes += seg_;
+        } else if (kvmode_ == WlaKvMode::DeltaNaive) {
+          // v8 逐槽路径（仅 ablation 保留）：每 c4 一次 D2H+H2D+event，
+          // ring 反压每 4 槽一次主机同步（≈数百次/请求）——批量化前的
+          // "实现缺陷本体"，量化对照见 results/wla_kvmode_20261004.md。
+          for (int l = 0; l < sp_.num_layers; ++l)
+            for (uint64_t blk : kv_set(v, r, l)) {
+              const size_t off = wla_gslot_off(sp_, r, l, blk);
+              ch->submit(d_cache_[v] + off, c4_, d_cache_[g] + off);
+              moved_bytes += c4_;
+              live_slots_.fetch_add(1);
+            }
+          kv_handoff(v, g, r, /*carry=*/true);
+        } else {  // Drop
+          kv_handoff(v, g, r, /*carry=*/false);
+          moved_bytes += 0;  // 不搬数据；代价显式转嫁到消费卡的回填侧
+        }
       }
     }
     ch->sync();
@@ -716,6 +840,12 @@ class WlaMultiGpuCtx {
   std::atomic<double> step_ms_ema_{2.0};   // E 决策输入④：每请求步成本 EMA
   std::atomic<uint64_t> steal_refused_{0}; // E 遥测：价值不足拒绝的窃取数
   std::atomic<uint64_t> live_slots_{0};    // delta 遥测：实际迁移的驻留槽数
+  // delta 批量化（kvmode_==Delta 专用）：每卡两块 staging（victim
+  // gather 侧 / consumer scatter 侧；steal_lock_ 串行保证互斥复用）
+  // + pinned 索引表暂存（chunk 内全部驻留槽的偏移，容量 = 4 请求全满）
+  std::vector<char*> mig_stage_v_, mig_stage_c_;
+  char* h_mig_idx_ = nullptr;
+  size_t mig_idx_cap_ = 0;
   size_t rr_counter_ = 0;                  // RR 分发轮转游标（dispatch 线程独占）
   std::atomic<uint64_t> rebal_calls_{0};   // LLX 遥测：重平衡触发次数
   std::atomic<uint64_t> rebal_noop_{0};    // LLX 遥测：未达失衡阈值直接返回的次数

@@ -15,10 +15,12 @@
 //                      [--layers 12] [--sel 64] [--hot 128] [--attn 8]
 //                      [--arrival steady|bursty] [--skew balanced|imbalanced]
 //                      [--gap 1.0] [--steal-batch 4] [--mig-bw 11.0]
-//                      [--mig-margin 2.0] [--kv-mode full|delta|drop]
+//                      [--mig-margin 2.0] [--kv-mode full|delta|delta-naive|drop]
 //                      [--rebal-interval 50] [--rebal-thr 0.25]
-// kv-mode（迁移内容轴）：full=整段 24MB（默认，既有数据语义）；delta=只发
-// 驻留槽+状态交接（Raft nextIndex）；drop=不搬数据冷启动（冷启动代价建模）。
+// kv-mode（迁移内容轴）：full=整段 24MB（默认，既有数据语义）；
+// delta=只发驻留槽+状态交接（Raft nextIndex，批量化压实 gather→单次
+// submit→scatter）；delta-naive=v8 逐槽 submit 路径（ablation：量化
+// "增量必须批量化"的实现缺陷）；drop=不搬数据冷启动（冷启动代价建模）。
 // 输出固定含 6 行（A/B/C/E/LLX/RR）+ 汇总 + [C1-结构] 判据行
 // + [WlA-E] 成本感知对照行 + [BASE] 外部基线对照行（LLX/RR vs C 与 vs A）。
 // ⚠️ --gpus 只认逗号（空格静默降级为单卡，见 说明文档 §6 第 2 条）
@@ -120,10 +122,13 @@ int main(int argc, char** argv) {
     kvmode = ferry::WlaKvMode::Full;
   else if (std::strcmp(kvmode_s, "delta") == 0)
     kvmode = ferry::WlaKvMode::Delta;
+  else if (std::strcmp(kvmode_s, "delta-naive") == 0)
+    kvmode = ferry::WlaKvMode::DeltaNaive;
   else if (std::strcmp(kvmode_s, "drop") == 0)
     kvmode = ferry::WlaKvMode::Drop;
   else {
-    std::fprintf(stderr, "未知 kv-mode '%s'（full|delta|drop）\n", kvmode_s);
+    std::fprintf(stderr, "未知 kv-mode '%s'（full|delta|delta-naive|drop）\n",
+                 kvmode_s);
     return 2;
   }
 
@@ -261,7 +266,9 @@ int main(int argc, char** argv) {
       (unsigned long long)c.live_slots, c.trace_miss_bytes / 1048576.0,
       b.refill_bytes / 1048576.0, cold_b_mb, c.refill_bytes / 1048576.0,
       cold_mb,
-      (kvmode == ferry::WlaKvMode::Delta && cold_mb == 0.0)
+      ((kvmode == ferry::WlaKvMode::Delta ||
+        kvmode == ferry::WlaKvMode::DeltaNaive) &&
+       cold_mb == 0.0)
           ? "[delta 自检 PASS：状态交接完整]"
           : "",
       cold_b_mb, cold_mb);
