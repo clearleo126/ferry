@@ -12,6 +12,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +38,19 @@ struct ArrivalSpec {
   std::string load_skew = "balanced";// balanced|imbalanced
   uint64_t total = 1 << 16;          // 任务总数
   int num_gpus = 1;                  // 目标卡数（dest 分布用）
+
+  // ---- 连续偏斜（偏斜度扫描用；默认值 = 旧硬编码口径，既有数据可复现）----
+  // dest_hot_frac：落在"热卡集合"上的任务占比。
+  //   0.0 → 完全均匀（走轮转分支，每卡恰好 1/N）；1.0 → 全压热卡（极端偏斜）。
+  //   热卡实得份额 = frac + (1-frac)/N（其余流量均匀撒到所有卡）。
+  //   旧口径 imbalanced ≡ 0.8；4 卡 hot=1 时 GPU0 实得 0.8+0.2/4 = 0.85
+  //   （即 85/5/5/5，变异系数 ≈1.386，与实测 imb=1.384 吻合）。
+  //   ⚠️ 偏斜度是本文的输入变量而非假设值：论文报 C/A 随 frac 的扫描曲线。
+  double dest_hot_frac = 0.8;
+  // dest_hot_cards：热卡数；<=0 时沿用旧口径 max(1, num_gpus/5)。
+  //   ⚠️ num_gpus/5 是整数除法：4 卡 → 1 张（不是 20%×4=0.8→1），
+  //      实际偏斜比"80/20"的标称更狠，扫描时应显式指定以免误读。
+  int dest_hot_cards = 0;
 
   size_t payload_bytes() const {
     // KB 级 payload（v2 实验设计第 6 节）：旧 4B 档使总迁移量仅 64KB 级，
@@ -97,9 +111,14 @@ inline std::vector<Task> generate_tasks(const ArrivalSpec& spec,
   std::exponential_distribution<double> exp_gap(1.0);
   std::exponential_distribution<double> pareto_gap(1.16);  // 80/20 长尾
 
-  // 到达偏斜（dest 分布）：balanced = 均匀轮转；imbalanced = Zipf 偏向
-  // 少数卡（80% 任务落去前 20% 的卡）——这是多卡控制面要解决的负载失衡来源
+  // 到达偏斜（dest 分布）：连续可调（见 ArrivalSpec::dest_hot_frac）；
+  // balanced 或 frac<=0 时退化为均匀轮转
   const bool dest_skew = (spec.load_skew == "imbalanced");
+  const double hot_frac = spec.dest_hot_frac;
+  const int hot_cards =
+      spec.dest_hot_cards > 0
+          ? std::min(spec.dest_hot_cards, std::max(1, spec.num_gpus))
+          : std::max(1, spec.num_gpus / 5);  // 旧口径（整数除法）
 
   double t = 0.0;
   // bursty: 每 burst_period 个任务构成一个"突发行"——该行任务同一 tick
@@ -136,14 +155,12 @@ inline std::vector<Task> generate_tasks(const ArrivalSpec& spec,
     }
   }
 
-  // 目标卡：偏斜到达 → 80% 落在 rng 前 20% 的卡上（与到达内容解耦，单独循环）
+  // 目标卡：热卡集合承接 hot_frac 流量，其余均匀撒到所有卡（与到达内容解耦）
   for (uint64_t i = 0; i < spec.total; ++i) {
-    if (dest_skew && spec.num_gpus > 1) {
+    if (dest_skew && spec.num_gpus > 1 && hot_frac > 0.0) {
       const double u = (double)(rng() % 1000) / 1000.0;
-      if (u < 0.8) {
-        // 落去前 1/5 的卡（至少 1 张）
-        const int hot = std::max(1, spec.num_gpus / 5);
-        tasks[i].dest = (int)(rng() % (uint64_t)hot);
+      if (u < hot_frac) {
+        tasks[i].dest = (int)(rng() % (uint64_t)hot_cards);
       } else {
         tasks[i].dest = (int)(rng() % (uint64_t)spec.num_gpus);
       }
@@ -153,6 +170,40 @@ inline std::vector<Task> generate_tasks(const ArrivalSpec& spec,
     }
   }
   return tasks;
+}
+
+// dest 分布统计（偏斜扫描自证用）：返回每卡任务数 + 变异系数 + 最热卡份额。
+// 打印这个直方图有两个作用：① 扫描时确认设定真的生效（防 --gpus 那类静默降级）；
+// ② 论文里"偏斜度"有了可核对的客观定义，而非一个标称的 80/20。
+struct DestDist {
+  std::vector<uint64_t> per_gpu;  // 每卡任务数
+  double imb = 0.0;               // 变异系数 = std/mean（与 MultiStats::imb 同口径）
+  double hot_share = 0.0;         // 最热卡份额（max/total）
+};
+
+inline DestDist dest_distribution(const std::vector<Task>& tasks, int num_gpus) {
+  DestDist d;
+  if (num_gpus <= 0) return d;
+  d.per_gpu.assign((size_t)num_gpus, 0);
+  for (const auto& t : tasks) {
+    if (t.dest >= 0 && t.dest < num_gpus) d.per_gpu[(size_t)t.dest]++;
+  }
+  const double total = (double)tasks.size();
+  double mean = 0.0, mx = 0.0;
+  for (auto v : d.per_gpu) {
+    mean += (double)v;
+    mx = std::max(mx, (double)v);
+  }
+  mean /= (double)num_gpus;
+  double var = 0.0;
+  for (auto v : d.per_gpu) {
+    const double dv = (double)v - mean;
+    var += dv * dv;
+  }
+  var /= (double)num_gpus;
+  d.imb = mean > 0.0 ? std::sqrt(var) / mean : 0.0;
+  d.hot_share = total > 0.0 ? mx / total : 0.0;
+  return d;
 }
 
 }  // namespace ferry
