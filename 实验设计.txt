@@ -1,5 +1,23 @@
-实验设计（收束版 v11 · 2026-10-05 · 取代 v1–v10；旧版作废）
+实验设计（收束版 v12 · 2026-10-05 · 取代 v1–v11；旧版作废）
 场景钉死：LLM 稀疏注意力持续 decode 的 host-staged 热 KV 工作集（QSA-style miss 流）。
+v12 = v11 + **C2 起源叙事的工业侧可引用证据**（前缀缓存的收益账 / 亲和性制造热点的
+工业自述 / "sticky until saturated" 的准入边界）——把 C2 的动机从自证升级为可引用；
+附术语警示（同一事四个名字）与粒度对齐（llm-d 为 TP=2，须与 C3 假设一并声明）；
+**+ 单实例侧最接近的两篇必引与对位（HotPrefix PACMMOD'25 / KVFlow NeurIPS'25）**：
+  - 两篇均单实例（单卡 + CPU/host 外存）、**无跨卡迁移**，但都做 host↔GPU KV 传输
+    **+ I/O 与计算重叠** ⇒ 再证 v11 对 M1/M3 的降级判定（又多两处先例），
+    并把切割线收敛为"单实例内选谁驻留快层" vs "卡间选谁做、搬的代价划不划算"。
+    详见【3】的 HotPrefix/KVFlow 对位段。
+  - C2 动机也因此更硬：热度感知前缀在任何一层都已是公认问题（HotPrefix 做热度追踪、
+    KVFlow 做 steps-to-execution 逐出）⇒ 本文的 dest 偏斜不是自造设定。
+  - 自查结论（2026-10-05）：PRISM（arXiv:2605.08581）亦为**单卡**（附录 D.3 明写
+    on a Single A800）、无迁移 ⇒ 与本文不撞车，可用作 motivation 引用。
+  - 收益账（AWS SageMaker 实测，Llama 3.1 70B / 8k 共享前缀）：P50 TTFT −71~77%、
+    命中率 25%→80%+、吞吐 +15~16%；短对话档仅 −13~16% / +1.7~2.0%
+    → 前缀越长收益越大。记账解释：TTFT ≈ 需重算 token 数×单价 + 固定开销，
+      前缀越长第一项占比越高，命中砍掉的相对份额越大（写 motivation 用这条）。
+  - 亲和性制造热点 **有工业自述**（llm-d 2026-08-17）→ 本项目 imb 由自证升级为对照。
+  - 工业现解 "sticky until saturated" 只作用于**准入时刻**，搬不动存量 → 本文缝隙。
 v11 = v10 + **新颖性边界重划：M1×M3（算通重叠）退出创新点清单**
 （触发 = 发现 MAST，ICDCS'25，DOI 10.1109/ICDCS63083.2025.00061，Lin/Pan/Shi/Wang/Li/Chu）：
   - MAST 做的事：MoE **训练**中 attention 层与 MoE 层的通信/计算任务重叠 + **用优化
@@ -328,7 +346,34 @@ D2H/H2D 共路、且所迁数据为对端当前步即需的约束下，**何时�
 Related work 必引（差异化定位）：StealHalf（Hendler-Shavit SPAA'02，粒度理论）+ Llumnix
 （OSDI'24，请求级活迁移）+ Mooncake（FAST'25，放置决策）+ Preble（SOSP'24，复用 vs 均衡）
 + HiSparse（arXiv:2608.07009，单卡分层 KV，与本文多卡控制面互补）
-+ **MAST（ICDCS'25，任务流水与重排，v11 新增必引——同会议，审稿人极可能知晓甚至同批）**。
++ **MAST（ICDCS'25，任务流水与重排，v11 新增必引——同会议，审稿人极可能知晓甚至同批）**
++ **HotPrefix（SIGMOD/PACMMOD 2025）+ KVFlow（NeurIPS 2025）——单实例 host-GPU 分层
+  与缓存调度，v12 新增必引（见下对位段；二者是"单实例侧"最接近本项目的两篇）**。
+**HotPrefix / KVFlow 对位段（v12 新增；2026-10-05 核实）**：
+  两篇均为**单实例（单卡 + CPU/host 外存）**工作，**均无跨卡迁移、无多卡控制面** —— 这是
+  本项目与它们的切割线。但它们与本项目的**机制侧高度重叠**，必须在 related work 显式对位，
+  否则审稿人会认为本文把"标准手段"当贡献（与 v11 对 MAST 的处理同理）：
+  - **HotPrefix**（Proc. ACM Manag. Data 3(4), Article 250, 2025-09-23, DOI 10.1145/3749168；
+    南京大学）三项：① 前缀树节点**热度动态追踪**；② **选择性准入**（GPU 逐出时只把高热度
+    KV 留在 CPU 内存）；③ **热度提升**（周期性把高热度前缀从 CPU 升回 GPU），并配
+    **I/O 与计算流水以掩盖传输开销**。SGLang 实现，vs vLLM(开启 prefix sharing) 最高 2.25×，
+    vs SGLang 最高 2×。
+  - **KVFlow**（NeurIPS 2025 poster；OpenReview 5Iw1nDtYmT；DOI 10.52202/085713-4208；
+    UCSD+AWS）用 **Agent Step Graph + steps-to-execution** 做 KV 节点级细粒度逐出，并配
+    **完全重叠的 KV 预取**（后台线程 CPU→GPU）。vs SGLang 分层 radix cache：单工作流
+    最高 1.83×、多并发工作流最高 2.19×。
+  - ⚠️ **对本文的两点直接影响**：
+    ① **再证 v11 的新颖性边界判定**：这两篇说明"host↔GPU KV 传输 + I/O 与计算重叠"
+       在**单实例**服务里已是标准手段 ⇒ 本文 M1/M3 不作贡献主张的口径正确，且有了
+       更多先例（与 MAST/CoCoNet/PipeMoE 并列引用）。**贡献句禁止出现"重叠/流水"作主语。**
+    ② **切割线收敛为一条**：两篇都在**单实例内**做"热度感知的 KV 驻留/逐出"（谁该留在
+       快层），本文做**卡间**的"负载重分配 + 无 P2P host-staged 迁移成本决策"（谁该做、
+       数据怎么搬）。热度/前缀组在本项目只是**dest 偏斜的来源**（C2），不是调度目标。
+  - 建议写法：「热度感知的 KV 缓存调度已在单实例内被充分研究（HotPrefix、KVFlow、KVFlow
+    类工作），其目标是在 GPU/CPU 分层间选择**哪些前缀值得驻留**；本文的问题在上一层——
+    请求已在某卡排队/执行后，**该由哪张卡来做、搬过去的代价是否划算**，且卡间无 P2P、
+    迁移与 miss 回填争用同一条 host-staged 通道。」
+  配套纪律：不与两篇比数字（单卡 SGLang vs 本文 4 卡无 P2P，不可比）。
 **MAST 对位段（related work 建议写法，务必显式对位，不可只罗列）**：
   「任务流水与重排已被广泛用于隐藏通信开销（MAST[ICDCS'25]、PipeMoE、CoCoNet、Tutel），
    但这些工作面向**有直连的训练**场景：通信为 all-to-all、迭代结构静态可知，故可离线
@@ -635,6 +680,47 @@ N 卡控制面 ✓（multigpu.cuh + run_multigpu；结构：每卡执行线程�
          7 次矩阵（results/wla_c2_20261004.md）：C/RR 反转
          0.73–0.82±、E 四格最优（E/C 0.90–0.98）——迁移成本侧（C1）与收益侧
          （C2）闭环。
+         ▸ **起源叙事的工业侧证据（v12 新增；2026-10-05 检索，均为厂商/工程文档，
+           非同行评审，引用时按此标注）**：
+           ① 前缀缓存收益的账：AWS SageMaker 实测（Llama 3.1 70B，7 实例，8k 共享
+              前缀）：P50 TTFT −71~77%、KV 命中率 25%→80%+、吞吐 +15~16%；短对话档
+              仅 P50 −13~16%、吞吐 +1.7~2.0%。记账模型 TTFT ≈ 需重算 token 数×单价
+              + 固定开销 ⇒ 前缀越长，第一项占比越高，命中砍掉的相对份额越大 ——
+              **解释"为什么长前缀场景才值得做亲和性"，直接用作 motivation 第一段。**
+           ② 多副本 + 随机/轮询路由会把同一前缀撒到不同副本 → 各副本都不够频繁见到
+              它、缓存暖不起来 → 工业界故引入 prefix-aware routing（同前缀送同一
+              副本）。现已是**产品默认**（AWS SageMaker 2026-09-10 公告、llm-d、
+              NVIDIA Dynamo、阿里云 ACK）⇒ "亲和性会造成失衡"不是假想设定。
+           ③ **热点有工业自述，非自证**：llm-d（2026-08-17）写明"亲和性把流量集中到
+              缓存暖的节点；若无显式饱和释放，暖节点会持续吸流量，直到超过『冷节点
+              其实更快』的临界点"。⇒ 本项目 imb 可与之对照引用。
+           ④ 工业现解 = "sticky until saturated"（标定阈值：饱和前守亲和，饱和后按
+              负载选）。⚠️ **但其作用域是准入时刻** —— 只能改新请求去向，**搬不动热卡
+              上已排队/在跑的存量**。存量迁移（Llumnix 活迁移 / 本项目重分配）= 本文
+              定位缝隙；写 Related Work 时以此句切割，不得含糊。
+           ⑤ 术语警示（防被审稿人绕）：prefix-aware routing（AWS）/ prefix cache-aware
+              routing（阿里云）/ KV cache aware routing / token-aware routing（llm-d
+              改口）= **同一事，勿当四个概念**；"sticky until saturated" 为 llm-d 专名，
+              非通用术语，引用须加引号。
+           ⑥ ⚠️ **粒度对齐（与 C3 联读）**：llm-d 实测环境为 **TP=2**（一副本=2 卡），
+              其"卡间失衡"发生在**副本内部**；本文调度单位是"DP/replica 部署下副本≈单卡"。
+              两者不同域 —— 引用 llm-d 作动机时必须一并声明该差异，否则审稿人会拿其
+              部署形态质疑本项目 imb 的可比性。
+           ⑦ **学术侧引用（强于厂商博客，优先用）**：
+              - **PRISM**（arXiv:2605.08581，2026-05；武汉大学）——开篇即把本文 C2 设定
+                写成领域共识：*prompt segmentation* + *hotspot skew*（"a small set of
+                hot segments may recur across many requests within short windows"），
+                并做 **Zipf 指数 / hot request rate 敏感性**（其附录 C）。其
+                **TTFT 分解 Eq.(2)(4)** = 本文 motivation 的标准形式化，可直接引：
+                `TTFT = W_admit + T_prefill + T_1tok`，`T_prefill ≈ (ℓ(z)−L_hit)/R_pf(B)`。
+                其 **Theorem 1** 给出命中率增益 Δh → 服务率与稳定域扩大的解析式
+                （`Δλ* ∝ Δh/((1−h_LRU−Δh)(1−h_LRU))`），可用来论证"命中率为何值钱"。
+                ⚠️ **不撞车**（2026-10-05 核实）：**单卡**（§2.3 标题 "on a Single GPU"、
+                贡献① "on a single GPU"、附录 D.3 "on a Single A800"）、无 migration/
+               跨实例内容；QAS 在**准入层**、DART 在**淘汰层**，**两者都不动存量**。
+                ⇒ 与 ④ 一起构成"工业与学术都停在准入侧"的双重佐证。
+              - **HotPrefix（PACMMOD'25）/ KVFlow（NeurIPS'25）**：单实例 host-GPU 分层
+                的热度感知驻留/逐出，详见【3】对位段。
       ✓ C4 外部基线（LLX/RR，2026-10-04，commit 0684ea4）：LLX = Llumnix 策略
          复刻而非系统移植（vLLM+Ray 栈与 pre-copy 假设与 Ferry 相反；论文如实
          披露 "Llumnix-style policy, ported"）；RR = 最弱外部基线。无局部性
