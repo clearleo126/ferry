@@ -17,6 +17,7 @@
 //                      [--gap 1.0] [--steal-batch 4] [--mig-bw 11.0]
 //                      [--mig-margin 2.0] [--kv-mode full|delta|delta-naive|drop]
 //                      [--rebal-interval 50] [--rebal-thr 0.25]
+//                      [--steal-delay 0]（时机反事实轴：水位窃取去抖延迟，仅 C/E）
 // kv-mode（迁移内容轴）：full=整段 24MB（默认，既有数据语义）；
 // delta=只发驻留槽+状态交接（Raft nextIndex，批量化压实 gather→单次
 // submit→scatter）；delta-naive=v8 逐槽 submit 路径（ablation：量化
@@ -37,15 +38,29 @@ namespace {
 void print_row(const char* name, const ferry::WlaMultiStats& st) {
   std::printf(
       "  %-9s makespan=%9.2fms steps/s=%7.1f p50=%7.3f p99=%8.3f "
-      "steals=%4llu migr=%7.1fMB(%3llu reqs) refill=%7llu seg %8.2fMB "
-      "imb=%.3f ref=%llu live=%llu\n",
+      "steals=%4llu(att=%5llu) migr=%7.1fMB(%3llu reqs) refill=%7llu seg "
+      "%8.2fMB imb=%.3f ref=%llu live=%llu\n",
       name, st.makespan_ms, st.throughput_steps, st.p50_step_ms,
       st.p99_step_ms, (unsigned long long)st.steals,
+      (unsigned long long)st.steal_attempts,
       st.migrated_bytes / 1048576.0, (unsigned long long)st.migrated_reqs,
       (unsigned long long)st.refill_events, st.refill_bytes / 1048576.0,
       st.imbalance, (unsigned long long)st.steal_refused,
       (unsigned long long)st.live_slots);
   std::fflush(stdout);
+}
+
+// F0-a 审计（只读遥测）→ D2 去重后的节省口径：
+//   delta/naive：total = 去重前槽位条目数（naive 实际发送），distinct =
+//               去重后槽数（delta 实际传输）→ dup% = 去重节省份额；
+//   full      ：total = 迁移请求数，distinct = 去重组数（= 实际复制段数）。
+// 不变量：delta 的 live(kv-mode 行) == distinct、naive 的 live == total、
+// full 的 migr = distinct × 24MB（均逐位可验）。
+double mig_dup_pct(const ferry::WlaMultiStats& st) {
+  return st.mig_units_total
+             ? 100.0 * (double)(st.mig_units_total - st.mig_units_distinct) /
+                   (double)st.mig_units_total
+             : 0.0;
 }
 
 }  // namespace
@@ -58,7 +73,7 @@ int main(int argc, char** argv) {
   int steal_batch = 4;
   int prefix_group = 1, prefix_steps = 8;
   double gap = 1.0, mig_bw = 11.0, mig_margin = 2.0;
-  double rebal_interval = 50.0, rebal_thr = 0.25;
+  double rebal_interval = 50.0, rebal_thr = 0.25, steal_delay = 0.0;
   char arrival[32] = "steady", skew[32] = "imbalanced";
   char kvmode_s[32] = "full";
 
@@ -100,6 +115,8 @@ int main(int argc, char** argv) {
       prefix_group = std::atoi(next());
     } else if (std::strcmp(argv[i], "--prefix-steps") == 0) {
       prefix_steps = std::atoi(next());
+    } else if (std::strcmp(argv[i], "--steal-delay") == 0) {
+      steal_delay = std::atof(next());
     }
   }
 
@@ -146,14 +163,16 @@ int main(int argc, char** argv) {
   WlaStealPolicy spol;     // mig_bw/mig_margin 仅 E 使用；A/B/C 语义不变
   spol.mig_bw_gbs = mig_bw;
   spol.margin = mig_margin;
+  spol.steal_delay_ms = steal_delay;  // 时机反事实轴（仅 C/E 生效）
 
   std::printf(
       "[wla-mg] gpus=%s arrival=%s skew=%s reqs=%d steps=%d layers=%d sel=%d "
       "hot=%d attn=%d gap=%.1fms steal-batch=%d mig-bw=%.1fGB/s "
-      "mig-margin=%.1f kv-mode=%s rebal=%.0fms/thr%.2f prefix=grp%d/stp%d\n",
+      "mig-margin=%.1f kv-mode=%s rebal=%.0fms/thr%.2f prefix=grp%d/stp%d "
+      "steal-delay=%.1fms\n",
       gpu_buf, arrival, skew, reqs, steps, layers, sel, hot, attn, gap,
       steal_batch, mig_bw, mig_margin, kvmode_s, rebal_interval, rebal_thr,
-      prefix_group, prefix_steps);
+      prefix_group, prefix_steps, steal_delay);
   std::fflush(stdout);
 
   WlaMultiStats a = run_wla_multigpu(devices, sp, 0, pol, spol, skew, arrival,
@@ -272,6 +291,17 @@ int main(int argc, char** argv) {
           ? "[delta 自检 PASS：状态交接完整]"
           : "",
       cold_b_mb, cold_mb);
+  // F0-a 审计行：delta 重复 = 同组重复枚举 + block%hot 槽位别名；
+  // full 重复 = 同批同组请求整段重复复制。dup% = migr_bytes 冗余份额
+  // （字节确实被传输 = 时序忠实；但去重后同语义只需 distinct 份）。
+  std::printf(
+      "  => [F0-audit] mig-units dup%%: B=%.1f C=%.1f E=%.1f LLX=%.1f "
+      "RR=%.1f | C total=%llu distinct=%llu | E total=%llu distinct=%llu\n",
+      mig_dup_pct(b), mig_dup_pct(c), mig_dup_pct(e), mig_dup_pct(llx),
+      mig_dup_pct(rr), (unsigned long long)c.mig_units_total,
+      (unsigned long long)c.mig_units_distinct,
+      (unsigned long long)e.mig_units_total,
+      (unsigned long long)e.mig_units_distinct);
   std::fflush(stdout);
   return 0;
 }

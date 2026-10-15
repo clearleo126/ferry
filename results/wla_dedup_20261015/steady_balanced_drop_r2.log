@@ -1,0 +1,15 @@
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=balanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=drop rebal=50ms/thr0.25 prefix=grp4/stp8 steal-delay=0.0ms
+  static-A  makespan=  1882.97ms steps/s=   25.5 p50= 98.067 p99= 120.116 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.000 ref=0 live=0
+  dyn-B     makespan=   329.47ms steps/s=  145.7 p50= 14.956 p99=  26.646 steals=   4(att=   18) migr=    0.0MB(  4 reqs) refill=  37327 seg   583.23MB imb=0.118 ref=0 live=0
+  ferry-C   makespan=   302.16ms steps/s=  158.9 p50= 10.683 p99=  22.212 steals=  11(att=   43) migr=    0.0MB( 15 reqs) refill=  37470 seg   722.95MB imb=0.317 ref=0 live=0
+  costaware-E makespan=   296.08ms steps/s=  162.1 p50= 13.068 p99=  23.099 steals=  10(att=   30) migr=    0.0MB( 18 reqs) refill=  37543 seg   731.50MB imb=0.059 ref=2 live=0
+  llumnix-LLX makespan=   438.79ms steps/s=  109.4 p50= 19.395 p99=  41.481 steals=   3(att=    4) migr=    0.0MB(  4 reqs) refill=  62146 seg  1296.41MB imb=0.212 ref=0 live=0
+  roundrobin-RR makespan=   344.85ms steps/s=  139.2 p50= 16.720 p99=  32.445 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 6.23x  C/B 1.09x  E/A 6.36x
+  => [C1-结构] migr(MB): A=0.0 B=0.0 C=0.0 E=0.0 | steals: B=4 C=11 E=10 | refill_seg: A=589824 B=37327 C=37470  [FAIL]
+  => [WlA-E] migr C=0.0 vs E=0.0 MB | steals C=11 E=10 | E refused=2 | E/C 1.021x
+  => [BASE] LLX 438.79ms(steals 3 rebal 3/4) RR 344.85ms(steals 0) | C/LLX 0.69x C/RR 0.88x A/LLX 4.29x A/RR 5.46x | migr LLX=0.0 RR=0.0 MB | imb LLX=0.212 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=583.23 C=722.95 E=731.50 LLX=1296.41 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=723.0 RR=1256.5 LLX=1296.4 MB | 忽略局部性冷启动 = RR-C +533.6 MB (x1.74) | migr C=0.0 LLX=0.0 MB | C/RR 0.876x
+  => [kv-mode=drop] migr C=0.0 MB live=0 | trace基线=731.31 MB | refill B=583.23(+-148.1) C=722.95(-8.4) MB  | cold_B=-148.1 cold_C=-8.4
+  => [F0-audit] mig-units dup%: B=0.0 C=0.0 E=0.0 LLX=0.0 RR=0.0 | C total=0 distinct=0 | E total=0 distinct=0

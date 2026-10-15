@@ -154,7 +154,12 @@ struct WlaMultiStats {
   double imbalance = 0.0;          // 各卡完成请求数变异系数
   double hit_rate = 0.0;
   uint64_t steal_refused = 0;      // E 遥测：因"剩余工作 < 迁移成本"拒绝的窃取
+  uint64_t steal_attempts = 0;     // 遥测（小实验 C）：steal_from 总调用次数
+                                    //   （含无盈余/被拒的失败尝试——每次都付
+                                    //    victim 让渡 + thief 等待的控制面成本）
   uint64_t live_slots = 0;         // delta：实际迁移的驻留槽数（vs 整段 = L*hot）
+  uint64_t mig_units_total = 0;    // F0-a 审计：迁移单位总数（delta=槽位条目；full=请求）
+  uint64_t mig_units_distinct = 0; // F0-a 审计：去重单位数（差 = 冗余份额）
   size_t trace_miss_bytes = 0;     // trace 基线 miss 字节（冷启动代价的参照）
   int n_gpus = 0;
   uint64_t rebal_calls = 0;        // LLX 遥测：重平衡触发次数（含 noop）
@@ -171,6 +176,12 @@ struct WlaStealPolicy {
   bool cost_filter = false;   // E 开关：false = C 语义（不按成本过滤）
   double mig_bw_gbs = 11.0;   // D2D 有效带宽（probe --bw 实测口径）
   double margin = 2.0;        // value ≥ margin×cost 才迁（补偿争用低估）
+  // 时机反事实轴（小实验 C，2026-10-13）：水位窃取的去抖延迟——
+  // 失衡（occ < fair）须持续 ≥ delay 才触发首次干预；delay=0 = 既有 C 语义。
+  // 语义：只延迟"首次干预"，一旦触发后续连续纠偏不再等待（追补语义）；
+  // occ 回到 ≥ fair（失衡自愈/到达补齐）即清零计时。空卡抢活路径不受
+  // delay 影响（空卡等待 = 纯浪费）。仅 mode 2/3（C/E）生效。
+  double steal_delay_ms = 0.0;
 };
 
 // 偏移（与 kv_exec.cuh 同布局；独立命名避免头冲突）
@@ -480,9 +491,16 @@ class WlaMultiGpuCtx {
   // 而非 thief 自选最忙卡；公平性：同一让渡协议、同一条 D2D 通道）
   // v_sel=-1 = 自选最忙卡（C/E 语义）；v_sel>=0 = 指定源卡（LLX 语义）
   size_t steal_from(int g, int v_sel, size_t k, const WlaStealPolicy& pol) {
+    steal_attempts_.fetch_add(1);  // 小实验 C 遥测：总尝试（含失败）
     std::lock_guard<std::mutex> slk(steal_lock_);
     int v = v_sel;
     std::vector<int> moved;
+    // F0-a 竞态修复：状态快照产物（在下方临界区内构建，传输阶段只消费，
+    // 不再触碰 host LRU 容器）。delta = 整批偏移表 + 每 chunk 条目数；
+    // naive = 每请求偏移表（moved 顺序索引）。
+    std::vector<uint64_t> idx_all;
+    std::vector<int> chunk_ns;
+    std::vector<std::vector<uint64_t>> naive_offs;
     {
       std::unique_lock<std::mutex> lk(mtx_);
       if (v < 0) {  // 自选最忙卡（C/E 既有语义）
@@ -500,12 +518,19 @@ class WlaMultiGpuCtx {
       }
       // 告诉 victim：有 thief 在等窗口（victim 在 tick_end 后有界让渡）
       steal_pending_.store(true);
-      // 等 victim 出 tick（cv wait 释放 ctx 锁 → victim 可完成 tick）
-      while (in_tick_[v] && completed_.load() < (size_t)R_)
+      // 等双侧出 tick（cv wait 释放 ctx 锁 → 双方可完成 tick 并 notify）：
+      //   v = 状态源（下方快照/handoff 读 [v][q]，v 在 tick 内会 kv_touch
+      //       插入/逐出同组集合）；g = handoff 写入目标（LLX 由重平衡线程
+      //       调用时，g 的执行线程可能正在 tick 内 touch [g][q]）。
+      //   C/E：thief 即 g 的执行线程（自身出 tick），g 侧恒直通零成本。
+      // 双侧出 tick 后持锁直通快照段（tick_begin 需 mtx_ → 双侧无法再进
+      // tick）——F0-a 发现 2（组 LRU 并发修改竞态）的修复。
+      while ((in_tick_[v] || in_tick_[g]) && completed_.load() < (size_t)R_)
         cv_.wait_for(lk, std::chrono::microseconds(500));
       steal_pending_.store(false);
       cv_.notify_all();  // 唤醒让渡中的 victim
-      if (in_tick_[v] || completed_.load() >= (size_t)R_) return 0;
+      if (in_tick_[v] || in_tick_[g] || completed_.load() >= (size_t)R_)
+        return 0;
       const size_t cur = local_[v].size();
       // LLX 指定源时按全局份额判定盈余；C/E 自选时沿用公平份额（冻结语义）
       const size_t fair = (v_sel < 0) ? fair_share() : 0;
@@ -565,36 +590,89 @@ class WlaMultiGpuCtx {
       }
       for (auto it = moved.rbegin(); it != moved.rend(); ++it)
         local_[g].push_front(*it);
+      // ---- 状态快照 + 交接 + F0-a 审计（本临界区内一次完成；此后传输
+      // 阶段不触碰 host LRU 容器）。idx 枚举与 handoff 拷贝同临界区 ⇒
+      // 消费卡镜像 == 实际传输集合（修复"镜像含未传输块"的语义裂缝：
+      // 组拆散时 victim 侧剩余组员的 kv_touch 不再能插进两者之间）。----
+      if (kvmode_ == WlaKvMode::Delta || kvmode_ == WlaKvMode::DeltaNaive) {
+        for (int r : moved) {
+          if (kvmode_ == WlaKvMode::Delta) {
+            for (int l = 0; l < sp_.num_layers; ++l)
+              for (uint64_t blk : kv_set(v, r, l))
+                idx_all.push_back((uint64_t)wla_gslot_off(sp_, r, l, blk));
+          } else {  // naive：保留原始枚举（ablation 语义，不享受去重）
+            std::vector<uint64_t> offs;
+            for (int l = 0; l < sp_.num_layers; ++l)
+              for (uint64_t blk : kv_set(v, r, l))
+                offs.push_back((uint64_t)wla_gslot_off(sp_, r, l, blk));
+            naive_offs.push_back(std::move(offs));
+          }
+        }
+        for (int r : moved) kv_handoff(v, g, r, /*carry=*/true);
+        // F0-a 审计（原始枚举口径）：total = 去重前条目数（= naive 实际
+        // 发送的槽数），distinct = 去重后槽数（= delta 实际传输）→
+        // dup% = 去重节省份额。不变量：delta live==distinct、naive
+        // live==total（均逐位）。
+        {
+          std::unordered_set<uint64_t> uniq(idx_all.begin(), idx_all.end());
+          uint64_t tot = (uint64_t)idx_all.size();
+          for (const auto& ov : naive_offs) {
+            tot += (uint64_t)ov.size();
+            uniq.insert(ov.begin(), ov.end());
+          }
+          mig_units_total_.fetch_add(tot);
+          mig_units_distinct_.fetch_add((uint64_t)uniq.size());
+        }
+        // D2 第一步：批内槽位去重（仅 delta）。重复来源 = ① 同批同组
+        // 请求重复枚举同一组 LRU 集合；② 不同 block_id 经 block%hot 落
+        // 同一物理槽（槽位别名）。重复传输幂等（同源同目的同字节）→
+        // 去重为纯字节节省，镜像/hit/回填语义不变（F0-a 实测 grp4
+        // dup 40–50%）。sort 改变传输序：gather/scatter 按槽独立，无影响。
+        if (kvmode_ == WlaKvMode::Delta && idx_all.size() > 1) {
+          std::sort(idx_all.begin(), idx_all.end());
+          idx_all.erase(std::unique(idx_all.begin(), idx_all.end()),
+                        idx_all.end());
+        }
+        // chunk 切分按 staging 容量（去重后条目数与请求边界无关）
+        if (kvmode_ == WlaKvMode::Delta) {
+          const size_t cap = mig_idx_cap_ / sizeof(uint64_t);
+          for (size_t i = 0; i < idx_all.size(); i += cap)
+            chunk_ns.push_back((int)std::min(cap, idx_all.size() - i));
+        }
+      } else if (kvmode_ == WlaKvMode::Drop) {
+        for (int r : moved) kv_handoff(v, g, r, /*carry=*/false);
+      } else {  // Full：无 host LRU 访问（handoff 直通返回）；审计 = 请求/组数
+        std::unordered_set<int> uniq;
+        for (int r : moved) uniq.insert(wla_grp(sp_, r));
+        mig_units_total_.fetch_add((uint64_t)moved.size());
+        mig_units_distinct_.fetch_add((uint64_t)uniq.size());
+      }
     }
     // D2D 迁移（victim 段 -> host -> 本卡段）；一批一 sync。
     // kv-mode 分支（见头注释）：
     //   full  = 整段复制（既有语义，数据冻结）
     //   delta = 只发实际驻留槽（Raft nextIndex）+ 镜像交接（carry）
     //   drop  = 不发数据，镜像清空 → 消费卡冷启动
+    // 状态快照/交接已在上方临界区完成（F0-a 修复）→ 本段纯数据传输。
     HostStagedChannel* ch = mig_[v][g].get();
     size_t moved_bytes = 0;
     if (kvmode_ == WlaKvMode::Delta) {
       // 批量化 delta（Raft 教训：一批 entry 一次 RPC）：chunk 内全部请求
-      // 的驻留槽平铺成一张偏移表（pinned 暂存）→ victim 侧 gather 压实
+      // 的驻留槽已在临界区平铺成整批偏移表（idx_all/chunk_ns，与 handoff
+      // 同快照）→ 本循环纯传输：pinned 暂存切片 → victim 侧 gather 压实
       // → 单次 submit（通道内部按 4MB 切分，次数与 full 同量级）→
       // sync（chunk 间串行防 staging 覆盖）→ consumer 侧索引 H2D 直发
       // + scatter 散射回真实槽位。submit 次数 O(L×live)→每 chunk 1 次。
       char* stg_v = mig_stage_v_[v];
       char* stg_g = mig_stage_c_[g];
-      for (size_t c0 = 0; c0 < moved.size(); c0 += (size_t)kMigChunkReqs) {
-        const size_t c1 =
-            std::min(c0 + (size_t)kMigChunkReqs, moved.size());
-        uint64_t* idx = reinterpret_cast<uint64_t*>(h_mig_idx_);
-        int ns = 0;
-        for (size_t j = c0; j < c1; ++j) {
-          const int r = moved[j];
-          for (int l = 0; l < sp_.num_layers; ++l)
-            for (uint64_t blk : kv_set(v, r, l))
-              idx[ns++] = (uint64_t)wla_gslot_off(sp_, r, l, blk);
-        }
-        for (size_t j = c0; j < c1; ++j)
-          kv_handoff(v, g, moved[j], /*carry=*/true);
-        if (ns == 0) continue;  // 空热集：仅状态交接，无数据可迁
+      uint64_t* idx = reinterpret_cast<uint64_t*>(h_mig_idx_);
+      size_t base = 0;
+      for (size_t ci = 0; ci < chunk_ns.size(); ++ci) {
+        const int ns = chunk_ns[ci];
+        // 空热集：状态已交接（临界区），无数据可迁
+        if (ns == 0) continue;
+        std::memcpy(idx, idx_all.data() + base,
+                    (size_t)ns * sizeof(uint64_t));
         const size_t data_bytes = (size_t)ns * c4_;
         const int words = (int)(c4_ / sizeof(uint4));
         // ① victim：索引 H2D → staging 头部；gather 压实到数据区
@@ -623,31 +701,37 @@ class WlaMultiGpuCtx {
             reinterpret_cast<const uint64_t*>(stg_g), ns, words);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaStreamSynchronize(0));
+        base += (size_t)ns;
       }
     } else {
-      for (int r : moved) {
+      std::unordered_set<int> sent_grp;  // D2：full 同批同组段只复制一次
+      for (size_t j = 0; j < moved.size(); ++j) {
+        const int r = moved[j];
         if (kvmode_ == WlaKvMode::Full) {
           // full：整段复制（既有语义，数据冻结）。C2：段按组偏移 → 迁移随带
-          // 该组已驻留的热集（后到组员迁来即命中 —— 亲和收益随迁移携带）
-          const size_t goff = (size_t)wla_grp(sp_, r) * seg_;
-          ch->submit(d_cache_[v] + goff, seg_, d_cache_[g] + goff);
-          moved_bytes += seg_;
+          // 该组已驻留的热集（后到组员迁来即命中 —— 亲和收益随迁移携带）。
+          // 同批同组请求共享同一段 → 重复复制幂等（同源同目的）→ 只发
+          // 首见组 = 纯字节节省（F0-a 实测 grp4 dup 38–56%）；grp1 时
+          // 组=请求，恒 distinct，本路径数值不变。
+          const int q = wla_grp(sp_, r);
+          if (sent_grp.insert(q).second) {
+            const size_t goff = (size_t)q * seg_;
+            ch->submit(d_cache_[v] + goff, seg_, d_cache_[g] + goff);
+            moved_bytes += seg_;
+          }
         } else if (kvmode_ == WlaKvMode::DeltaNaive) {
           // v8 逐槽路径（仅 ablation 保留）：每 c4 一次 D2H+H2D+event，
           // ring 反压每 4 槽一次主机同步（≈数百次/请求）——批量化前的
           // "实现缺陷本体"，量化对照见 results/wla_kvmode_20261004.md。
-          for (int l = 0; l < sp_.num_layers; ++l)
-            for (uint64_t blk : kv_set(v, r, l)) {
-              const size_t off = wla_gslot_off(sp_, r, l, blk);
-              ch->submit(d_cache_[v] + off, c4_, d_cache_[g] + off);
-              moved_bytes += c4_;
-              live_slots_.fetch_add(1);
-            }
-          kv_handoff(v, g, r, /*carry=*/true);
-        } else {  // Drop
-          kv_handoff(v, g, r, /*carry=*/false);
-          moved_bytes += 0;  // 不搬数据；代价显式转嫁到消费卡的回填侧
+          // 偏移表已在临界区预枚举（与 handoff 同快照），此处只传输。
+          for (uint64_t off : naive_offs[j]) {
+            ch->submit(d_cache_[v] + off, c4_, d_cache_[g] + off);
+            moved_bytes += c4_;
+            live_slots_.fetch_add(1);
+          }
         }
+        // Drop：不搬数据不交接（均已在临界区完成）→ 代价显式转嫁到
+        // 消费卡的回填侧（冷启动首次有账）
       }
     }
     ch->sync();
@@ -697,7 +781,11 @@ class WlaMultiGpuCtx {
   uint64_t migrated_reqs() const { return migrated_reqs_.load(); }
   size_t migrated_bytes() const { return migrated_bytes_.load(); }
   uint64_t steal_refused() const { return steal_refused_.load(); }
+  uint64_t steal_attempts() const { return steal_attempts_.load(); }
   uint64_t live_slots() const { return live_slots_.load(); }
+  // F0-a 审计遥测（见成员注释；delta=槽位条目，full=请求）
+  uint64_t mig_units_total() const { return mig_units_total_.load(); }
+  uint64_t mig_units_distinct() const { return mig_units_distinct_.load(); }
   WlaKvMode kv_mode() const { return kvmode_; }
   // 状态化命中判定（delta/drop/C2）：语义与 missstream 生成器逐字一致
   // （命中则 LRU touch；未命中则按容量逐出最旧再插入）。
@@ -726,10 +814,12 @@ class WlaMultiGpuCtx {
     return hit;
   }
   // 迁移时热集状态交接（carry=true）或清空（drop → 消费卡冷启动）。
-  // 安全性：调用点在 victim 出 tick 且请求已移出其队列之后 → victim 不会再
-  // 触碰该请求的镜像；C2 下组内其余请求可能仍在 v —— 它们读写 [v][q]，
-  // 本函数写 [c][q]，容器不相交（同组另有成员在 c 时：先迁者交接、后迁者
-  // 再交接，幂等覆盖，最终状态 = 组内最后一次交接，语义正确）。
+  // 调用契约（F0-a 修复后）：必须在 steal_from 的临界区内、双侧出 tick 时
+  // 调用 —— 读 [v][q] 须与 v 的 kv_touch 互斥（组拆散后 v 上剩余组员在
+  // tick 内会插入/逐出同组集合），写 [c][q] 须与 c 的 kv_touch 互斥（LLX
+  // 由重平衡线程调用时 c 可能正在 tick）。C2 下组内其余请求可能仍在 v ——
+  // 它们读写 [v][q]，本函数写 [c][q]，容器不相交（同组另有成员在 c 时：
+  // 先迁者交接、后迁者再交接，幂等覆盖，最终状态 = 组内最后一次交接）。
   void kv_handoff(int v, int c, int r, bool carry) {
     if (kvmode_ == WlaKvMode::Full) return;  // full+C2：热集随整段 D2D 迁移
     const int q = wla_grp(sp_, r);
@@ -839,7 +929,17 @@ class WlaMultiGpuCtx {
   std::atomic<size_t> migrated_bytes_{0};
   std::atomic<double> step_ms_ema_{2.0};   // E 决策输入④：每请求步成本 EMA
   std::atomic<uint64_t> steal_refused_{0}; // E 遥测：价值不足拒绝的窃取数
+  std::atomic<uint64_t> steal_attempts_{0}; // 小实验 C：总尝试（含失败）
   std::atomic<uint64_t> live_slots_{0};    // delta 遥测：实际迁移的驻留槽数
+  // F0-a 审计遥测（只读统计，不改变任何迁移行为）：
+  //   delta/naive：单位 = 索引表槽位条目（= 实际 submit 的 c4 槽数）；
+  //     重复来源 ① 同批含同组多请求 → 重复枚举同一组 LRU 集合；
+  //             ② 不同 block_id 经 block%hot 落同一物理槽（槽位别名）。
+  //   full：单位 = 迁移请求（distinct = 去重组数；同批同组 → 整段重复复制）。
+  //   重复条目会被真实传输（时序/migr_bytes 记账忠实），但语义冗余 →
+  //   (total − distinct) = 迁移字节的冗余份额 = D2 去重空间的直接度量。
+  std::atomic<uint64_t> mig_units_total_{0};
+  std::atomic<uint64_t> mig_units_distinct_{0};
   // delta 批量化（kvmode_==Delta 专用）：每卡两块 staging（victim
   // gather 侧 / consumer scatter 侧；steal_lock_ 串行保证互斥复用）
   // + pinned 索引表暂存（chunk 内全部驻留槽的偏移，容量 = 4 请求全满）
@@ -1075,6 +1175,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
       };
 
       uint64_t idle_iters = 0;
+      double below_fair_since_ms = -1.0;  // steal_delay 计时（见 WlaStealPolicy）
       while (true) {
         if (ctx.all_done()) break;
         std::vector<int> resident = ctx.tick_begin(g);
@@ -1123,9 +1224,21 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
         ctx.yield_steal_window();  // 有 thief 在等 → 有界让渡窃取窗口
         // C/E：水位 < 公平份额 → tick 间隙批窃取（提前纠偏，非等空）
         // LLX/RR：执行卡不窃取（重平衡仅由 mode 4 的 rebal 线程驱动）
+        // steal_delay_ms：失衡须持续 ≥ delay 才触发首次干预（时机反事实轴）；
+        // 触发后连续纠偏不再等待；occ ≥ fair 即清零计时（自愈/到达补齐）。
         if ((mode == 2 || mode == 3) && !ctx.all_done() &&
-            ctx.occ(g) < ctx.fair_share())
-          ctx.steal_migrate(g, (size_t)steal_batch, spol);
+            ctx.occ(g) < ctx.fair_share()) {
+          bool fire = true;
+          if (spol.steal_delay_ms > 0.0) {
+            const double now_ms = ht.toc_ms() - t0;
+            if (below_fair_since_ms < 0)
+              below_fair_since_ms = now_ms;
+            fire = (now_ms - below_fair_since_ms) >= spol.steal_delay_ms;
+          }
+          if (fire) ctx.steal_migrate(g, (size_t)steal_batch, spol);
+        } else {
+          below_fair_since_ms = -1.0;
+        }
       }
       cudaStreamDestroy(cs);
     });
@@ -1142,7 +1255,10 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   st.makespan_ms = ht.toc_ms() - t0;
   st.steals = ctx.steals();
   st.steal_refused = ctx.steal_refused();
+  st.steal_attempts = ctx.steal_attempts();
   st.live_slots = ctx.live_slots();
+  st.mig_units_total = ctx.mig_units_total();
+  st.mig_units_distinct = ctx.mig_units_distinct();
   st.migrated_reqs = ctx.migrated_reqs();
   st.migrated_bytes = ctx.migrated_bytes();
   st.rebal_calls = ctx.rebal_calls();
