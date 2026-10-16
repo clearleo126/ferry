@@ -114,6 +114,15 @@ enum class WlaKvMode { Full = 0, Delta = 1, Drop = 2, DeltaNaive = 3 };
 // 2.0 每字节惩罚（该惩罚实为逐槽 submit 的实现缺陷）。
 inline constexpr double kMigDeltaFixedMs = 0.06;
 inline constexpr int kMigChunkReqs = 4;  // 每 chunk 请求数（= steal_batch 默认）
+// R-cal（v19）：物理参照带宽 B_ref（端到端双跳口径，本平台 batched-delta
+// 离线微基准 16.6 GB/s；旧的 11.0 是 full 段时代 probe 值）。成本模型 =
+// κ·V/B_ref + c_fix：B_ref 是**物理量**（单位换算），κ（cost_scale）是
+// **策略保守度旋钮**（预注册）。二者分离后：(a) 去掉旧公式里重复计算的
+// 2×（probe 的 11.0 本已是端到端双跳，见 topo.cpp run_host_staged）；
+// (b) 跨平台只需换 B_ref，κ 保持策略语义；X2 带宽轴即扫 B_ref。
+inline constexpr double kMigBWRefGbs = 16.6;
+inline constexpr double kMigCostScale = 3.0;  // 默认工作点 = 3.0/16.6 ≈ V/5.5
+                                              //（= 旧 2.0/11.0 的 V/5.5，保守等价）
 
 // delta 批量化 kernel（Raft AppendEntries 教训：一批 entry 一次 RPC）：
 //   gather  = victim 侧把散布在各槽的驻留 KV 压实成连续段（blockIdx = slot）
@@ -176,12 +185,16 @@ struct WlaMultiStats {
 //   四路输入（对齐 multigpu W7 的四路框架）：
 //   ① victim 盈余（cur - fair）                    —— 窃取量上界（防乒乓）
 //   ② 每请求剩余工作 (steps-next_step)×step_ema    —— 迁移收益
-//   ③ 迁移成本 2×seg/mig_bw（host-staged 双向 D2D）—— T2 的真实带宽项
+//   ③ 迁移成本 τ̂ = κ·V/B_ref + c_fix               —— T2 的真实带宽项
 //   ④ 窃取者步成本 step_ema（含回填争用的实测边际成本）
+// R-cal（v19）：B_ref = 物理参照带宽、κ = 策略保守度旋钮（预注册）。
+//   旧公式 = 2.0×V/11.0（2× 与端到端口径重复）；新公式 κ·V/B_ref 与之
+//   数值等价当 κ=3.0/B_ref=16.6（V/5.53，保守等价）⇒ 默认行为不变。
 struct WlaStealPolicy {
   bool cost_filter = false;   // E 开关：false = C 语义（不按成本过滤）
-  double mig_bw_gbs = 11.0;   // D2D 有效带宽（probe --bw 实测口径）
-  double margin = 2.0;        // value ≥ margin×cost 才迁（补偿争用低估）
+  double b_ref_gbs = kMigBWRefGbs;  // 物理参照带宽（端到端双跳；X2 扫此轴）
+  double cost_scale = kMigCostScale;  // κ：策略保守度（预注册；越大越保守）
+  double margin = 2.0;        // value ≥ margin×τ̂ 才迁（滞回/争用余量）
   // 时机反事实轴（小实验 C，2026-10-13）：水位窃取的去抖延迟——
   // 失衡（occ < fair）须持续 ≥ delay 才触发首次干预；delay=0 = 既有 C 语义。
   // 语义：只延迟"首次干预"，一旦触发后续连续纠偏不再等待（追补语义）；
@@ -553,18 +566,19 @@ class WlaMultiGpuCtx {
         // E：价值过滤 —— 只迁"剩余工作 ≥ margin × 真实迁移成本"的请求。
         // 成本必须按当前 kv-mode 的真实代价计（否则 E 基于未支付的成本决策，
         // 与本项目"双侧记账"的立场矛盾）：
-        //   full  = 2×seg（D2H+H2D 双跳整段）
-        //   delta = 2×live×c4（双跳只发驻留槽）
-        //   drop  = live×c4（消费卡冷启动回填，单跳 H2D）
+        //   full  = κ×seg/B_ref
+        //   delta = κ×live×c4/B_ref + c_fix（双跳只发驻留槽）
+        //   drop  = live×c4/B_ref（消费卡冷启动回填，单跳 H2D，不随 κ 缩放）
+        // R-cal（v19）：B_ref/κ 分离；旧公式数值 = --b-ref 11 --cost-scale 2
         // 候选自队尾起（最近到达 = 剩余步最多），取通过过滤的最长前缀
-        const double bw_ms_per_byte = 1e3 / (pol.mig_bw_gbs * 1e9);
+        const double bw_ms_per_byte = 1e3 / (pol.b_ref_gbs * 1e9);
         const double step_ms = step_ms_ema_.load();
         size_t ok = 0;
         for (size_t j = 0; j < take; ++j) {
           const int r = local_[v][local_[v].size() - 1 - j];
           double cost_ms;
           if (kvmode_ == WlaKvMode::Full) {
-            cost_ms = 2.0 * (double)seg_ * bw_ms_per_byte;
+            cost_ms = pol.cost_scale * (double)seg_ * bw_ms_per_byte;
           } else {
             const double live_b = (double)kv_live(v, r) * (double)c4_;
             // delta（批量化）：同通道同每字节价 + 每 chunk 固定开销
@@ -573,10 +587,11 @@ class WlaMultiGpuCtx {
             // drop = 单跳冷启动回填
             cost_ms =
                 (kvmode_ == WlaKvMode::Delta)
-                    ? 2.0 * live_b * bw_ms_per_byte + kMigDeltaFixedMs
+                    ? pol.cost_scale * live_b * bw_ms_per_byte +
+                          kMigDeltaFixedMs
                     : (kvmode_ == WlaKvMode::DeltaNaive
                            ? 2.0 * live_b * bw_ms_per_byte
-                           : live_b * bw_ms_per_byte);
+                           : 1.0 * live_b * bw_ms_per_byte);
           }
           const double value =
               (double)(sp_.steps - next_step_[r]) * step_ms;
@@ -836,8 +851,8 @@ class WlaMultiGpuCtx {
   uint64_t mig_units_total() const { return mig_units_total_.load(); }
   uint64_t mig_units_distinct() const { return mig_units_distinct_.load(); }
   // A1/L1 遥测（只观测不决策）：实测迁移达成带宽（饱和 chunk 的 EMA，
-  // GB/s；首测直填，之后 0.7/0.3）+ 更新次数。τ̂ = kMigDeltaFixedMs +
-  // V/B_eff 与离线微基准同模型；对照 E 门控的 mig_bw_gbs（写死 11.0）。
+  // GB/s；首测直填，之后 0.7/0.3）+ 更新次数。用于对照 E 成本模型的
+  // B_ref（物理参照）与判定跨平台换算。
   double b_eff_gbs() const { return b_eff_gbs_.load(); }
   uint64_t b_eff_updates() const { return b_eff_updates_.load(); }
   double p_t_sum_mb() const { return p_t_sum_mb_.load(); }

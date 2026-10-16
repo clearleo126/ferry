@@ -14,8 +14,9 @@
 //   ./run_wla_multigpu [--gpus 0,1,2,3] [--requests 48] [--steps 16]
 //                      [--layers 12] [--sel 64] [--hot 128] [--attn 8]
 //                      [--arrival steady|bursty] [--skew balanced|imbalanced]
-//                      [--gap 1.0] [--steal-batch 4] [--mig-bw 11.0]
-//                      [--mig-margin 2.0] [--kv-mode full|delta|delta-naive|drop]
+//                      [--gap 1.0] [--steal-batch 4] [--mig-bw 16.6]
+//                      [--cost-scale 3.0] [--mig-margin 2.0]
+//                      [--kv-mode full|delta|delta-naive|drop]
 //                      [--rebal-interval 50] [--rebal-thr 0.25]
 //                      [--steal-delay 0]（时机反事实轴：水位窃取去抖延迟，仅 C/E）
 //                      [--with-b1]（追加 D1(one-steal)/D2(steal-half) 两行 + [B1] 汇总）
@@ -74,7 +75,11 @@ int main(int argc, char** argv) {
   int steal_batch = 4;
   int prefix_group = 1, prefix_steps = 8;
   bool with_b1 = false;  // --with-b1：追加 D1(one-steal)/D2(steal-half) 两行
-  double gap = 1.0, mig_bw = 11.0, mig_margin = 2.0;
+  // R-cal（v19）：b_ref = 物理参照带宽（默认 16.6，本平台 batched-delta 值）；
+  // cost_scale = κ 策略保守度旋钮（默认 3.0 ⇒ 工作点 V/5.53 ≈ 旧 2.0/11.0）。
+  // 旧行为逐字复现：--mig-bw 11.0 --cost-scale 2.0
+  double gap = 1.0, b_ref = kMigBWRefGbs, cost_scale = kMigCostScale;
+  double mig_margin = 2.0;
   double rebal_interval = 50.0, rebal_thr = 0.25, steal_delay = 0.0;
   char arrival[32] = "steady", skew[32] = "imbalanced";
   char kvmode_s[32] = "full";
@@ -104,7 +109,9 @@ int main(int argc, char** argv) {
     } else if (std::strcmp(argv[i], "--steal-batch") == 0) {
       steal_batch = std::atoi(next());
     } else if (std::strcmp(argv[i], "--mig-bw") == 0) {
-      mig_bw = std::atof(next());
+      b_ref = std::atof(next());  // B_ref 覆盖（compat 名；X2 带宽轴用）
+    } else if (std::strcmp(argv[i], "--cost-scale") == 0) {
+      cost_scale = std::atof(next());  // κ：E 成本保守度旋钮
     } else if (std::strcmp(argv[i], "--mig-margin") == 0) {
       mig_margin = std::atof(next());
     } else if (std::strcmp(argv[i], "--kv-mode") == 0) {
@@ -164,19 +171,20 @@ int main(int argc, char** argv) {
   sp.prefix_steps = prefix_steps;
 
   AdaptiveBatchPolicy pol;  // min 1MB / max 4MB / target_batches 4（与 WlA 单卡同）
-  WlaStealPolicy spol;     // mig_bw/mig_margin 仅 E 使用；A/B/C 语义不变
-  spol.mig_bw_gbs = mig_bw;
+  WlaStealPolicy spol;     // b_ref/cost_scale/margin 仅 E 使用；A/B/C 语义不变
+  spol.b_ref_gbs = b_ref;
+  spol.cost_scale = cost_scale;
   spol.margin = mig_margin;
   spol.steal_delay_ms = steal_delay;  // 时机反事实轴（仅 C/E 生效）
 
   std::printf(
       "[wla-mg] gpus=%s arrival=%s skew=%s reqs=%d steps=%d layers=%d sel=%d "
-      "hot=%d attn=%d gap=%.1fms steal-batch=%d mig-bw=%.1fGB/s "
+      "hot=%d attn=%d gap=%.1fms steal-batch=%d B_ref=%.1fGB/s cost-scale=%.2f "
       "mig-margin=%.1f kv-mode=%s rebal=%.0fms/thr%.2f prefix=grp%d/stp%d "
       "steal-delay=%.1fms\n",
       gpu_buf, arrival, skew, reqs, steps, layers, sel, hot, attn, gap,
-      steal_batch, mig_bw, mig_margin, kvmode_s, rebal_interval, rebal_thr,
-      prefix_group, prefix_steps, steal_delay);
+      steal_batch, b_ref, cost_scale, mig_margin, kvmode_s, rebal_interval,
+      rebal_thr, prefix_group, prefix_steps, steal_delay);
   std::fflush(stdout);
 
   WlaMultiStats a = run_wla_multigpu(devices, sp, 0, pol, spol, skew, arrival,
@@ -329,16 +337,14 @@ int main(int argc, char** argv) {
       (unsigned long long)c.mig_units_distinct,
       (unsigned long long)e.mig_units_total,
       (unsigned long long)e.mig_units_distinct);
-  // A1/L1-L2 遥测（只观测不决策）：实测迁移带宽 vs E 门控常数 mig-bw
-  // （A1 判定数据：偏离大 → 争用真实存在，值得把 B_eff/P(t) 接进规则；
-  //   贴近 → 该 regime 争用弱，L2 降级为负结果）。P(t) = 决策时刻其余卡
-  // 在途回填（B2：共享通道争用的直接观测）。
+  // A1/L1 遥测（只观测不决策）：实测迁移带宽 vs 成本模型参照 B_ref/κ。
+  // P(t) = 决策时刻其余卡在途回填（共享通道争用的直接观测）。
   std::printf(
       "  => [A1-obs] B_eff(实测EMA): C=%.2f(%llu obs) E=%.2f(%llu obs) "
-      "vs mig_bw=%.1f | P(t) refill压力: C mean=%.2f max=%.2f E mean=%.2f "
-      "max=%.2f MB (n=%llu/%llu)\n",
+      "vs B_ref=%.1f x cost-scale=%.2f | P(t) refill压力: C mean=%.2f "
+      "max=%.2f E mean=%.2f max=%.2f MB (n=%llu/%llu)\n",
       c.b_eff_gbs, (unsigned long long)c.b_eff_updates, e.b_eff_gbs,
-      (unsigned long long)e.b_eff_updates, mig_bw, c.p_t_mean_mb,
+      (unsigned long long)e.b_eff_updates, b_ref, cost_scale, c.p_t_mean_mb,
       c.p_t_max_mb, e.p_t_mean_mb, e.p_t_max_mb,
       (unsigned long long)c.b_eff_updates, (unsigned long long)e.b_eff_updates);
   std::fflush(stdout);
