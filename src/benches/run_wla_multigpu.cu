@@ -302,6 +302,18 @@ int main(int argc, char** argv) {
       (unsigned long long)c.mig_units_distinct,
       (unsigned long long)e.mig_units_total,
       (unsigned long long)e.mig_units_distinct);
+  // A1/L1-L2 遥测（只观测不决策）：实测迁移带宽 vs E 门控常数 mig-bw
+  // （A1 判定数据：偏离大 → 争用真实存在，值得把 B_eff/P(t) 接进规则；
+  //   贴近 → 该 regime 争用弱，L2 降级为负结果）。P(t) = 决策时刻其余卡
+  // 在途回填（B2：共享通道争用的直接观测）。
+  std::printf(
+      "  => [A1-obs] B_eff(实测EMA): C=%.2f(%llu obs) E=%.2f(%llu obs) "
+      "vs mig_bw=%.1f | P(t) refill压力: C mean=%.2f max=%.2f E mean=%.2f "
+      "max=%.2f MB (n=%llu/%llu)\n",
+      c.b_eff_gbs, (unsigned long long)c.b_eff_updates, e.b_eff_gbs,
+      (unsigned long long)e.b_eff_updates, mig_bw, c.p_t_mean_mb,
+      c.p_t_max_mb, e.p_t_mean_mb, e.p_t_max_mb,
+      (unsigned long long)c.b_eff_updates, (unsigned long long)e.b_eff_updates);
   std::fflush(stdout);
   return 0;
 }

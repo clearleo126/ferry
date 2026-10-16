@@ -160,6 +160,12 @@ struct WlaMultiStats {
   uint64_t live_slots = 0;         // delta：实际迁移的驻留槽数（vs 整段 = L*hot）
   uint64_t mig_units_total = 0;    // F0-a 审计：迁移单位总数（delta=槽位条目；full=请求）
   uint64_t mig_units_distinct = 0; // F0-a 审计：去重单位数（差 = 冗余份额）
+  // A1/L1-L2 遥测（只观测不决策）：实测迁移带宽 vs E 门控常数 11.0 的
+  // 对照，及决策时刻并发回填压力 P(t)（B2 的"争用是否真实存在"判定数据）
+  double b_eff_gbs = 0.0;          // 饱和 chunk 实测带宽 EMA（GB/s）
+  uint64_t b_eff_updates = 0;      // EMA 更新次数（观测覆盖度）
+  double p_t_mean_mb = 0.0;        // 决策时刻其余卡在途回填均值（MB）
+  double p_t_max_mb = 0.0;         // 同上最大值
   size_t trace_miss_bytes = 0;     // trace 基线 miss 字节（冷启动代价的参照）
   int n_gpus = 0;
   uint64_t rebal_calls = 0;        // LLX 遥测：重平衡触发次数（含 noop）
@@ -390,6 +396,12 @@ class WlaMultiGpuCtx {
         }
       }
     }
+    // per-GPU 回填压力遥测（L2 前瞻项，只观测不决策）：执行线程在回填
+    // submit 前后 +/− 本卡在途回填字节。steal_from 决策读其余卡之和 =
+    // 决策时刻真实并发回填压力 P(t) 的直接观测（v/g 双侧出 tick，自身
+    // 不回填 → 抢带宽的恰是其余在 tick 卡的回填）。
+    refill_inflight_ = new std::atomic<double>[n_];
+    for (int i = 0; i < n_; ++i) refill_inflight_[i].store(0.0);
     // 状态
     local_.resize(n_);
     next_step_.assign(R_, 0);
@@ -656,6 +668,13 @@ class WlaMultiGpuCtx {
     // 状态快照/交接已在上方临界区完成（F0-a 修复）→ 本段纯数据传输。
     HostStagedChannel* ch = mig_[v][g].get();
     size_t moved_bytes = 0;
+    // A1/L1 遥测：传输段计时（含 gather/submit/sync/scatter 全程）→
+    // chunk 实测达成带宽；饱和 chunk（≥4MB）才更新 B_eff EMA。
+    // L2 遥测：决策点 P(t) 采样（此刻其余卡在途回填 MB）。
+    const auto t_xfer0 = std::chrono::steady_clock::now();
+    const double p_t0 = refill_pressure_mb(v, g);
+    double xfer_bytes_sat = 0.0;  // 饱和 chunk 累计字节
+    double xfer_secs_sat = 0.0;   // 饱和 chunk 累计耗时
     if (kvmode_ == WlaKvMode::Delta) {
       // 批量化 delta（Raft 教训：一批 entry 一次 RPC）：chunk 内全部请求
       // 的驻留槽已在临界区平铺成整批偏移表（idx_all/chunk_ns，与 handoff
@@ -671,6 +690,7 @@ class WlaMultiGpuCtx {
         const int ns = chunk_ns[ci];
         // 空热集：状态已交接（临界区），无数据可迁
         if (ns == 0) continue;
+        const auto t_ci0 = std::chrono::steady_clock::now();
         std::memcpy(idx, idx_all.data() + base,
                     (size_t)ns * sizeof(uint64_t));
         const size_t data_bytes = (size_t)ns * c4_;
@@ -701,6 +721,14 @@ class WlaMultiGpuCtx {
             reinterpret_cast<const uint64_t*>(stg_g), ns, words);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaStreamSynchronize(0));
+        // A1/L1：chunk 全程耗时 → 饱和 chunk（≥4MB = 通道切分粒度）计入
+        const double ci_secs = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - t_ci0)
+                                   .count();
+        if (data_bytes >= (4u << 20)) {
+          xfer_bytes_sat += (double)data_bytes;
+          xfer_secs_sat += ci_secs;
+        }
         base += (size_t)ns;
       }
     } else {
@@ -715,9 +743,16 @@ class WlaMultiGpuCtx {
           // 组=请求，恒 distinct，本路径数值不变。
           const int q = wla_grp(sp_, r);
           if (sent_grp.insert(q).second) {
+            const auto t_seg0 = std::chrono::steady_clock::now();
             const size_t goff = (size_t)q * seg_;
             ch->submit(d_cache_[v] + goff, seg_, d_cache_[g] + goff);
             moved_bytes += seg_;
+            ch->sync();  // 逐段计满全程（同 delta chunk 口径）
+            // A1/L1：full 段 24MB 恒饱和，全部计入
+            xfer_bytes_sat += (double)seg_;
+            xfer_secs_sat += std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - t_seg0)
+                                 .count();
           }
         } else if (kvmode_ == WlaKvMode::DeltaNaive) {
           // v8 逐槽路径（仅 ablation 保留）：每 c4 一次 D2H+H2D+event，
@@ -736,6 +771,26 @@ class WlaMultiGpuCtx {
     }
     ch->sync();
     CUDA_CHECK(cudaSetDevice(devs_[g]));
+    // A1/L1：饱和字节的实测带宽 → B_eff EMA（首测直填，之后 0.7/0.3；
+    // steal_lock_ 串行 → 无并发写）。观测缺失（小 chunk / drop）不更新。
+    if (xfer_secs_sat > 0.0) {
+      const double inst = xfer_bytes_sat / xfer_secs_sat / 1e9;
+      const double prev = b_eff_gbs_.load();
+      b_eff_gbs_.store(prev > 0.0 ? 0.7 * prev + 0.3 * inst : inst);
+      b_eff_updates_.fetch_add(1);
+    }
+    // L2：P(t) 观测记账（每 steal 一条）
+    {
+      double cur = p_t_sum_mb_.load();
+      while (!p_t_sum_mb_.compare_exchange_weak(cur, cur + p_t0)) {
+      }
+    }
+    {
+      double mx = p_t_max_mb_.load();
+      while (p_t0 > mx && !p_t_max_mb_.compare_exchange_weak(mx, p_t0)) {
+      }
+    }
+    p_t_samples_.fetch_add(1);
     migrated_reqs_.fetch_add(moved.size());
     migrated_bytes_.fetch_add(moved_bytes);
     steals_.fetch_add(1);
@@ -786,6 +841,28 @@ class WlaMultiGpuCtx {
   // F0-a 审计遥测（见成员注释；delta=槽位条目，full=请求）
   uint64_t mig_units_total() const { return mig_units_total_.load(); }
   uint64_t mig_units_distinct() const { return mig_units_distinct_.load(); }
+  // A1/L1 遥测（只观测不决策）：实测迁移达成带宽（饱和 chunk 的 EMA，
+  // GB/s；首测直填，之后 0.7/0.3）+ 更新次数。τ̂ = kMigDeltaFixedMs +
+  // V/B_eff 与离线微基准同模型；对照 E 门控的 mig_bw_gbs（写死 11.0）。
+  double b_eff_gbs() const { return b_eff_gbs_.load(); }
+  uint64_t b_eff_updates() const { return b_eff_updates_.load(); }
+  double p_t_sum_mb() const { return p_t_sum_mb_.load(); }
+  double p_t_max_mb() const { return p_t_max_mb_.load(); }
+  uint64_t p_t_samples() const { return p_t_samples_.load(); }
+  // L2 前瞻项遥测：除 v/g 外其余卡在途回填 MB 总和（决策时刻并发回填
+  // 压力 P(t) 的直接观测；v/g 双侧出 tick，自身不回填）
+  double refill_pressure_mb(int v, int g) const {
+    double s = 0.0;
+    for (int i = 0; i < n_; ++i)
+      if (i != v && i != g) s += refill_inflight_[i].load();
+    return s;
+  }
+  // 遥测接口（执行线程回填 submit 前后调用；MB 口径）
+  void refill_inflight_add(int g, double mb) {
+    double cur = refill_inflight_[g].load();
+    while (!refill_inflight_[g].compare_exchange_weak(cur, cur + mb)) {
+    }
+  }
   WlaKvMode kv_mode() const { return kvmode_; }
   // 状态化命中判定（delta/drop/C2）：语义与 missstream 生成器逐字一致
   // （命中则 LRU touch；未命中则按容量逐出最旧再插入）。
@@ -940,6 +1017,17 @@ class WlaMultiGpuCtx {
   //   (total − distinct) = 迁移字节的冗余份额 = D2 去重空间的直接度量。
   std::atomic<uint64_t> mig_units_total_{0};
   std::atomic<uint64_t> mig_units_distinct_{0};
+  // A1/L1 只观测不决策（未接进 E 门控）：迁移传输的实测达成带宽。
+  // 仅饱和尺寸（≥B_eff_min_bytes，≈通道 4MB 切分）的 chunk 才更新——
+  // 小传输的 per-submit 固定开销会系统性拉低估计。τ = c_fix + V/B_eff
+  // 与离线微基准（kMigDeltaFixedMs 标定）同一模型，斜率改在线量。
+  // b_eff_gbs = B / (1 + i)，B = double[GB]，i = uint64(次数)，读侧换算。
+  std::atomic<double> b_eff_gbs_{0.0};   // EMA（首测直填，之后 0.7/0.3）
+  std::atomic<uint64_t> b_eff_updates_{0};
+  // L2 决策点 P(t) 观测（只记录）：每次实际迁移的决策时刻并发回填 MB
+  std::atomic<double> p_t_sum_mb_{0.0}, p_t_max_mb_{0.0};
+  std::atomic<uint64_t> p_t_samples_{0};
+  std::atomic<double>* refill_inflight_ = nullptr;      // per-GPU 回填压力（L2 前瞻项：new[] 原子数组，vector<atomic> 不可 resize）
   // delta 批量化（kvmode_==Delta 专用）：每卡两块 staging（victim
   // gather 侧 / consumer scatter 侧；steal_lock_ 串行保证互斥复用）
   // + pinned 索引表暂存（chunk 内全部驻留槽的偏移，容量 = 4 请求全满）
@@ -1139,6 +1227,8 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
             size_t take = std::min<size_t>(
                 std::max<size_t>((size_t)(gmb * (1 << 20) / c4), 1),
                 miss_list.size() - i0);
+            // L2 遥测：本批在途回填字节（submit→wait_last_arrival 窗口）
+            ctx.refill_inflight_add(g, (double)take * c4 / (1 << 20));
             size_t kk = 0;
             while (kk < take) {
               const Ref& m0 = miss_list[i0 + kk];
@@ -1168,6 +1258,8 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
             }
             ch->wait_last_arrival(cs);
             CUDA_CHECK(cudaSetDevice(devices[g]));
+            // L2 遥测：批完成，撤回在途回填字节
+            ctx.refill_inflight_add(g, -(double)take * c4 / (1 << 20));
             i0 += take;
           }
           for (int l = 0; l < L; ++l) attn_layer(r, l);
@@ -1259,6 +1351,12 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   st.live_slots = ctx.live_slots();
   st.mig_units_total = ctx.mig_units_total();
   st.mig_units_distinct = ctx.mig_units_distinct();
+  st.b_eff_gbs = ctx.b_eff_gbs();
+  st.b_eff_updates = ctx.b_eff_updates();
+  if (ctx.p_t_samples() > 0) {
+    st.p_t_mean_mb = ctx.p_t_sum_mb() / (double)ctx.p_t_samples();
+    st.p_t_max_mb = ctx.p_t_max_mb();
+  }
   st.migrated_reqs = ctx.migrated_reqs();
   st.migrated_bytes = ctx.migrated_bytes();
   st.rebal_calls = ctx.rebal_calls();
