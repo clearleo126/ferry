@@ -18,6 +18,7 @@
 //                      [--mig-margin 2.0] [--kv-mode full|delta|delta-naive|drop]
 //                      [--rebal-interval 50] [--rebal-thr 0.25]
 //                      [--steal-delay 0]（时机反事实轴：水位窃取去抖延迟，仅 C/E）
+//                      [--with-b1]（追加 D1(one-steal)/D2(steal-half) 两行 + [B1] 汇总）
 // kv-mode（迁移内容轴）：full=整段 24MB（默认，既有数据语义）；
 // delta=只发驻留槽+状态交接（Raft nextIndex，批量化压实 gather→单次
 // submit→scatter）；delta-naive=v8 逐槽 submit 路径（ablation：量化
@@ -72,6 +73,7 @@ int main(int argc, char** argv) {
   int reqs = 48, steps = 16, layers = 12, sel = 64, hot = 128, attn = 8;
   int steal_batch = 4;
   int prefix_group = 1, prefix_steps = 8;
+  bool with_b1 = false;  // --with-b1：追加 D1(one-steal)/D2(steal-half) 两行
   double gap = 1.0, mig_bw = 11.0, mig_margin = 2.0;
   double rebal_interval = 50.0, rebal_thr = 0.25, steal_delay = 0.0;
   char arrival[32] = "steady", skew[32] = "imbalanced";
@@ -117,6 +119,8 @@ int main(int argc, char** argv) {
       prefix_steps = std::atoi(next());
     } else if (std::strcmp(argv[i], "--steal-delay") == 0) {
       steal_delay = std::atof(next());
+    } else if (std::strcmp(argv[i], "--with-b1") == 0) {
+      with_b1 = true;
     }
   }
 
@@ -195,6 +199,18 @@ int main(int argc, char** argv) {
   WlaMultiStats rr = run_wla_multigpu(devices, sp, 5, pol, spol, skew, arrival,
                                       gap, steal_batch, attn, kvmode);
   print_row("roundrobin-RR", rr);
+  // B1 公平对照（WlA 版，--with-b1 开启）：与 C 同引擎同通道同迁移成本，
+  // 唯一变量 = 窃取粒度（D1=1 请求/窃取；D2=victim 一半）。用于把 C/E 相对
+  // 基线的差异拆成"引擎/触发"与"粒度"两段——对齐 WlB B1 的归因口径。
+  WlaMultiStats d1, d2;
+  if (with_b1) {
+    d1 = run_wla_multigpu(devices, sp, 6, pol, spol, skew, arrival, gap,
+                          steal_batch, attn, kvmode);
+    print_row("d1-one", d1);
+    d2 = run_wla_multigpu(devices, sp, 7, pol, spol, skew, arrival, gap,
+                          steal_batch, attn, kvmode);
+    print_row("d2-half", d2);
+  }
 
   std::printf("  => C/A %.2fx  C/B %.2fx  E/A %.2fx\n",
               a.makespan_ms / c.makespan_ms, b.makespan_ms / c.makespan_ms,
@@ -226,6 +242,17 @@ int main(int argc, char** argv) {
       c.migrated_bytes / 1048576.0, e.migrated_bytes / 1048576.0,
       (unsigned long long)c.steals, (unsigned long long)e.steals,
       (unsigned long long)e.steal_refused, c.makespan_ms / e.makespan_ms);
+  // [B1] 窃取粒度隔离（--with-b1）：与 C 同引擎，唯一变量 = 粒度。
+  //   C/D1 > 1 ⇒ 批粒度净收益；steals 对比量化调度开销（WlB：↓≈175×）。
+  if (with_b1) {
+    std::printf(
+        "  => [B1] steals: C=%llu D1(one)=%llu D2(half)=%llu | C/D1 %.3fx "
+        "C/D2 %.3fx | migr C=%.1f D1=%.1f D2=%.1f MB\n",
+        (unsigned long long)c.steals, (unsigned long long)d1.steals,
+        (unsigned long long)d2.steals, d1.makespan_ms / c.makespan_ms,
+        d2.makespan_ms / c.makespan_ms, c.migrated_bytes / 1048576.0,
+        d1.migrated_bytes / 1048576.0, d2.migrated_bytes / 1048576.0);
+  }
   // 外部基线对照（v9）：公平性 = 与 C 同引擎同通道同迁移成本；
   //   LLX 差异 = 分发(least-loaded) + 周期全局重平衡（Llumnix 策略复刻）
   //   RR  差异 = 分发(round-robin)，无任何运行时重分配

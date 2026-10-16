@@ -668,10 +668,9 @@ class WlaMultiGpuCtx {
     // 状态快照/交接已在上方临界区完成（F0-a 修复）→ 本段纯数据传输。
     HostStagedChannel* ch = mig_[v][g].get();
     size_t moved_bytes = 0;
-    // A1/L1 遥测：传输段计时（含 gather/submit/sync/scatter 全程）→
-    // chunk 实测达成带宽；饱和 chunk（≥4MB）才更新 B_eff EMA。
+    // A1/L1 遥测：delta chunk 计时（含 gather/submit/sync/scatter 全程）→
+    // 饱和 chunk（≥4MB）更新 B_eff EMA。
     // L2 遥测：决策点 P(t) 采样（此刻其余卡在途回填 MB）。
-    const auto t_xfer0 = std::chrono::steady_clock::now();
     const double p_t0 = refill_pressure_mb(v, g);
     double xfer_bytes_sat = 0.0;  // 饱和 chunk 累计字节
     double xfer_secs_sat = 0.0;   // 饱和 chunk 累计耗时
@@ -743,16 +742,11 @@ class WlaMultiGpuCtx {
           // 组=请求，恒 distinct，本路径数值不变。
           const int q = wla_grp(sp_, r);
           if (sent_grp.insert(q).second) {
-            const auto t_seg0 = std::chrono::steady_clock::now();
             const size_t goff = (size_t)q * seg_;
             ch->submit(d_cache_[v] + goff, seg_, d_cache_[g] + goff);
             moved_bytes += seg_;
-            ch->sync();  // 逐段计满全程（同 delta chunk 口径）
-            // A1/L1：full 段 24MB 恒饱和，全部计入
-            xfer_bytes_sat += (double)seg_;
-            xfer_secs_sat += std::chrono::duration<double>(
-                                 std::chrono::steady_clock::now() - t_seg0)
-                                 .count();
+            // 注：full 路径不加逐段 sync（保持与去重矩阵同行为；D2 多段由
+            // 通道 ring 反压保护）。B_eff 观测只来自 delta 的 chunk 边界。
           }
         } else if (kvmode_ == WlaKvMode::DeltaNaive) {
           // v8 逐槽路径（仅 ablation 保留）：每 c4 一次 D2H+H2D+event，
@@ -1043,8 +1037,12 @@ class WlaMultiGpuCtx {
   std::vector<std::vector<std::vector<std::unordered_set<uint64_t>>>> lru_set_;
 };
 
-// ---- N 卡驱动（mode: 0=A 1=B 2=C 3=E 4=LLX 5=RR）----
+// ---- N 卡驱动（mode: 0=A 1=B 2=C 3=E 4=LLX 5=RR 6=D1 7=D2）----
 // E 与 C 同引擎（mengine=2 控制流），唯一差异 = 窃取决策（cost_filter）
+//
+// B1 公平对照（WlA 版）：D1(6)=one-steal、D2(7)=steal-half，均与 C **同引擎
+//   同通道同迁移成本**，唯一变量 = 窃取粒度（k=1 / SIZE_MAX vs 消费批）——
+//   对齐 WlB multigpu.cuh 的 B1 口径，用于在主 regime 拆"引擎/触发"与"粒度"。
 //
 // 外部基线（v9 新增，回应"无外部参照"评审风险）：
 //   RR (mode 5, round-robin)：与 C 同引擎同通道，唯一差异 = 初始分发
@@ -1069,12 +1067,24 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                                       double rebal_interval_ms = 50.0,
                                       double rebal_thr = 0.25) {
   WlaStealPolicy spol = spol_in;
-  spol.cost_filter = (mode == 3);  // E 开关；A/B/C/RR 恒 false（语义不变）
-  // LLX/RR 归一：执行引擎一律 = C（mengine=2 控制流），分发与重平衡见下
-  const int mengine = (mode == 4 || mode == 5) ? 2 : mode;
+  spol.cost_filter = (mode == 3);  // E 开关；A/B/C/D1/D2/RR 恒 false（语义不变）
+  // LLX/RR/D1/D2 归一：执行引擎一律 = C（mengine=2 控制流），差异仅在
+  // 分发（RR）或窃取粒度（D1/D2）——对齐 WlB B1 的公平对照口径。
+  const int mengine = (mode >= 4) ? 2 : mode;  // 4=LLX 5=RR 6=D1 7=D2
   const WlaDispatch dk = (mode == 5)   ? WlaDispatch::RoundRobin
                          : (mode == 4) ? WlaDispatch::Affinity
                                        : WlaDispatch::Affinity;
+  // B1 公平对照（WlA 版）：与 C **同引擎同通道同迁移成本**，唯一变量 = 窃取
+  // 粒度。take = min(粒度, victim 盈余, victim/2+1) 在 steal_from 内统一裁剪
+  // （与 WlB multigpu.cuh 的 steal_req 约定逐字一致）：
+  //   D1（mode 6）= one-steal（k=1，B 的粒度；每次窃取只搬 1 个请求的热集）
+  //   D2（mode 7）= steal-half（k=SIZE_MAX，不按消费批截断；StealHalf 语义）
+  //   拉式窃取模式 = B/C/E/D1/D2（A/LLX/RR 不做拉式窃取）
+  const bool pull_steal =
+      (mode == 1 || mode == 2 || mode == 3 || mode == 6 || mode == 7);
+  const size_t steal_k = (mode == 1 || mode == 6) ? 1
+                         : (mode == 7)             ? SIZE_MAX
+                                                   : (size_t)steal_batch;
   MissTrace tr = replay_miss_stream(sp);
   wla_apply_prefix_sharing(tr, sp);  // C2：组内前缀步共享（is_miss 作废）
   wla_recompute_stats(tr, sp);       // C2：按组全局 LRU 重算 miss/命中率
@@ -1273,12 +1283,10 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
         std::vector<int> resident = ctx.tick_begin(g);
         if (resident.empty()) {
           ctx.tick_end(g, resident, ht.toc_ms() - t0);  // 清 in_tick（空快照）
-          // 本地空：B 偷 1 / C/E 偷批；A/RR 只等到达；LLX 等重平衡线程迁入
-          // （LLX 的迁移是全局调度器驱动的"推"，不是执行卡的"拉"）
-          if (mode == 1) {
-            if (ctx.steal_migrate(g, 1, spol) > 0) continue;
-          } else if (mode == 2 || mode == 3) {
-            if (ctx.steal_migrate(g, (size_t)steal_batch, spol) > 0) continue;
+          // 本地空：B/C/E/D1/D2 拉式窃取（粒度见 steal_k）；A/RR 只等到达；
+          // LLX 等重平衡线程迁入（LLX 的迁移是全局调度器驱动的"推"，非执行卡"拉"）
+          if (pull_steal) {
+            if (ctx.steal_migrate(g, steal_k, spol) > 0) continue;
           }
           if (!ctx.all_arrived()) {
             ctx.wait_arrival(g);
@@ -1314,11 +1322,12 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                        ctx.all_done() ? (size_t)sp.num_requests : (size_t)0,
                        t_tick1);
         ctx.yield_steal_window();  // 有 thief 在等 → 有界让渡窃取窗口
-        // C/E：水位 < 公平份额 → tick 间隙批窃取（提前纠偏，非等空）
+        // C/E/D1/D2：水位 < 公平份额 → tick 间隙窃取（提前纠偏，非等空；粒度
+        // 见 steal_k）。三者的触发逻辑完全一致 ⇒ "唯一变量 = 窃取粒度"成立。
         // LLX/RR：执行卡不窃取（重平衡仅由 mode 4 的 rebal 线程驱动）
         // steal_delay_ms：失衡须持续 ≥ delay 才触发首次干预（时机反事实轴）；
         // 触发后连续纠偏不再等待；occ ≥ fair 即清零计时（自愈/到达补齐）。
-        if ((mode == 2 || mode == 3) && !ctx.all_done() &&
+        if (pull_steal && mode != 1 && !ctx.all_done() &&
             ctx.occ(g) < ctx.fair_share()) {
           bool fire = true;
           if (spol.steal_delay_ms > 0.0) {
@@ -1327,7 +1336,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
               below_fair_since_ms = now_ms;
             fire = (now_ms - below_fair_since_ms) >= spol.steal_delay_ms;
           }
-          if (fire) ctx.steal_migrate(g, (size_t)steal_batch, spol);
+          if (fire) ctx.steal_migrate(g, steal_k, spol);
         } else {
           below_fair_since_ms = -1.0;
         }

@@ -1,0 +1,19 @@
+[wla-mg] gpus=0,1,2,3 arrival=bursty skew=imbalanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 steal-delay=0.0ms
+  static-A  makespan=  4172.76ms steps/s=   11.5 p50=108.954 p99= 277.573 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.577 ref=0 live=0
+  dyn-B     makespan=   518.69ms steps/s=   92.5 p50= 17.259 p99=  37.186 steals=  10(att=  317) migr=  140.5MB( 10 reqs) refill=  38360 seg   599.38MB imb=0.102 ref=0 live=8993
+  ferry-C   makespan=   332.70ms steps/s=  144.3 p50= 10.714 p99=  18.699 steals=  10(att=  311) migr=  111.8MB( 21 reqs) refill=  31092 seg   582.17MB imb=0.059 ref=0 live=7153
+  costaware-E makespan=   324.04ms steps/s=  148.1 p50=  8.729 p99=  16.796 steals=   6(att=  320) migr=   35.7MB( 18 reqs) refill=  29931 seg   556.89MB imb=0.000 ref=2 live=2283
+  llumnix-LLX makespan=   518.77ms steps/s=   92.5 p50= 23.905 p99=  43.107 steals=   1(att=    1) migr=   20.7MB(  1 reqs) refill=  60320 seg  1257.44MB imb=0.059 ref=0 live=1323
+  roundrobin-RR makespan=   510.83ms steps/s=   94.0 p50= 24.658 p99=  44.193 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  d1-one    makespan=   436.65ms steps/s=  109.9 p50= 14.673 p99=  25.275 steals=  18(att=  335) migr=  178.8MB( 18 reqs) refill=  35372 seg   679.59MB imb=0.195 ref=0 live=11442
+  d2-half   makespan=   389.69ms steps/s=  123.2 p50= 11.972 p99=  19.689 steals=  16(att=  316) migr=  254.2MB( 43 reqs) refill=  31243 seg   586.11MB imb=0.102 ref=0 live=16267
+  => C/A 12.54x  C/B 1.56x  E/A 12.88x
+  => [C1-结构] migr(MB): A=0.0 B=140.5 C=111.8 E=35.7 | steals: B=10 C=10 E=6 | refill_seg: A=589824 B=38360 C=31092  [PASS]
+  => [WlA-E] migr C=111.8 vs E=35.7 MB | steals C=10 E=6 | E refused=2 | E/C 1.027x
+  => [B1] steals: C=10 D1(one)=18 D2(half)=16 | C/D1 1.312x C/D2 1.171x | migr C=111.8 D1=178.8 D2=254.2 MB
+  => [BASE] LLX 518.77ms(steals 1 rebal 9/1) RR 510.83ms(steals 0) | C/LLX 0.64x C/RR 0.65x A/LLX 8.04x A/RR 8.17x | migr LLX=20.7 RR=0.0 MB | imb LLX=0.059 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=599.38 C=582.17 E=556.89 LLX=1257.44 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=582.2 RR=1256.5 LLX=1257.4 MB | 忽略局部性冷启动 = RR-C +674.4 MB (x2.16) | migr C=111.8 LLX=20.7 MB | C/RR 0.651x
+  => [kv-mode=delta] migr C=111.8 MB live=7153 | trace基线=731.31 MB | refill B=599.38(+-131.9) C=582.17(-149.1) MB  | cold_B=-131.9 cold_C=-149.1
+  => [F0-audit] mig-units dup%: B=6.5 C=39.7 E=56.6 LLX=7.7 RR=0.0 | C total=11865 distinct=7153 | E total=5262 distinct=2283
+  => [A1-obs] B_eff(实测EMA): C=12.48(8 obs) E=11.80(4 obs) vs mig_bw=11.0 | P(t) refill压力: C mean=0.81 max=1.64 E mean=0.56 max=1.00 MB (n=8/4)
