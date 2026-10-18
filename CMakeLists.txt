@@ -133,6 +133,24 @@ add_executable(run_wla_multigpu
 )
 target_link_libraries(run_wla_multigpu PRIVATE ferry_workloads ferry_comm ferry_runtime ferry_config ferry_common)
 
+# wla_counterfact: 离线字节反事实分析（读取 FERRY_WLA_SNAPSHOT 产生的快照）
+add_executable(wla_counterfact
+  src/tools/wla_counterfact.cpp
+)
+target_link_libraries(wla_counterfact PRIVATE ferry_workloads ferry_config ferry_common)
+
+# run_mig_path: 迁移路径微基准（双跳携带 vs host 真值直发；小实验 A）
+add_executable(run_mig_path
+  src/benches/run_mig_path.cu
+)
+target_link_libraries(run_mig_path PRIVATE ferry_comm ferry_config ferry_common)
+
+# run_mig_interference: 迁移↔回填共道干扰（外部性 C_external；小实验 B）
+add_executable(run_mig_interference
+  src/benches/run_mig_interference.cu
+)
+target_link_libraries(run_mig_interference PRIVATE ferry_comm ferry_config ferry_common)
+
 # ------------------------------------------------------------------
 # 后续模块（P2 中逐步添加，先占位说明）
 #   workloads/: Workload A/B 生成器

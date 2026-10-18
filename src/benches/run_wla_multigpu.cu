@@ -74,6 +74,7 @@ int main(int argc, char** argv) {
   int reqs = 48, steps = 16, layers = 12, sel = 64, hot = 128, attn = 8;
   int steal_batch = 4;
   int prefix_group = 1, prefix_steps = 8;
+  unsigned long long seed = 42;  // --seed：miss 流种子（路径依赖曲线的样本轴）
   bool with_b1 = false;  // --with-b1：追加 D1(one-steal)/D2(steal-half) 两行
   // R-cal（v19）：b_ref = 物理参照带宽（默认 16.6，本平台 batched-delta 值）；
   // cost_scale = κ 策略保守度旋钮（默认 3.0 ⇒ 工作点 V/5.53 ≈ 旧 2.0/11.0）。
@@ -126,6 +127,8 @@ int main(int argc, char** argv) {
       prefix_steps = std::atoi(next());
     } else if (std::strcmp(argv[i], "--steal-delay") == 0) {
       steal_delay = std::atof(next());
+    } else if (std::strcmp(argv[i], "--seed") == 0) {
+      seed = std::strtoull(next(), nullptr, 10);
     } else if (std::strcmp(argv[i], "--with-b1") == 0) {
       with_b1 = true;
     }
@@ -167,6 +170,7 @@ int main(int argc, char** argv) {
   sp.sel_blocks = sel;
   sp.hot_blocks = hot;
   sp.arrival = arrival;
+  sp.seed = seed;
   sp.prefix_group = prefix_group;
   sp.prefix_steps = prefix_steps;
 
@@ -181,10 +185,10 @@ int main(int argc, char** argv) {
       "[wla-mg] gpus=%s arrival=%s skew=%s reqs=%d steps=%d layers=%d sel=%d "
       "hot=%d attn=%d gap=%.1fms steal-batch=%d B_ref=%.1fGB/s cost-scale=%.2f "
       "mig-margin=%.1f kv-mode=%s rebal=%.0fms/thr%.2f prefix=grp%d/stp%d "
-      "steal-delay=%.1fms\n",
+      "steal-delay=%.1fms seed=%llu\n",
       gpu_buf, arrival, skew, reqs, steps, layers, sel, hot, attn, gap,
       steal_batch, b_ref, cost_scale, mig_margin, kvmode_s, rebal_interval,
-      rebal_thr, prefix_group, prefix_steps, steal_delay);
+      rebal_thr, prefix_group, prefix_steps, steal_delay, seed);
   std::fflush(stdout);
 
   WlaMultiStats a = run_wla_multigpu(devices, sp, 0, pol, spol, skew, arrival,

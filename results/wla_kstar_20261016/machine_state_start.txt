@@ -1,0 +1,6 @@
+index, utilization.gpu [%], memory.used [MiB]
+0, 0 %, 15 MiB
+1, 0 %, 15 MiB
+2, 0 %, 15 MiB
+3, 0 %, 15 MiB
+Fri Oct 16 21:32:06 CST 2026

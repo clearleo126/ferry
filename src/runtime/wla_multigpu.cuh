@@ -76,6 +76,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -423,6 +424,8 @@ class WlaMultiGpuCtx {
     per_gpu_done_.assign(n_, 0);
     completed_.store(0);
     next_arrive_.store(0);
+    refill_g_bytes_.reset(new std::atomic<uint64_t>[n_]);
+    for (int i = 0; i < n_; ++i) refill_g_bytes_[i].store(0);
     CUDA_CHECK(cudaSetDevice(devs_[0]));
   }
 
@@ -442,6 +445,113 @@ class WlaMultiGpuCtx {
         cudaFree(mig_stage_c_[g]);
       }
       cudaFreeHost(h_mig_idx_);
+    }
+  }
+
+  // ---- 反事实快照（FERRY_WLA_SNAPSHOT=path 开启，默认关） ----
+  struct SnapLRU { int g, q, l; std::deque<uint64_t> dq; };
+  struct SnapDecision {
+    double t_ms;
+    int g, v;
+    size_t take, cur, fair;
+    std::vector<int> local_v, local_g;
+    std::vector<int> next_step;
+    std::vector<SnapLRU> lru_snap;
+    double step_ms_ema, b_eff_gbs;
+    // E-byte 的逐候选判定（仅 mode=3 / cost_filter 时填）
+    struct EbyteCand { int r; double value_ms, cost_ms; bool accept; };
+    std::vector<EbyteCand> ebyte_cands;
+    bool ebyte_refused;
+    size_t ebyte_take;
+  };
+  std::vector<SnapDecision> snap_buf_;
+  bool snap_on_ = false;
+  std::string snap_path_;
+
+  void snap_init(int mode) {
+    if (const char* p = std::getenv("FERRY_WLA_SNAPSHOT")) {
+      snap_on_ = true;
+      snap_path_ = std::string(p) + ".m" + std::to_string(mode);
+    }
+  }
+  // 快照 v 和 g 上所有涉及组的 LRU 状态
+  void snap_lru(SnapDecision& sd, int v, int g) {
+    if (lru_dq_.empty()) return;
+    auto dump = [&](int gpu) {
+      for (size_t q = 0; q < lru_dq_[gpu].size(); ++q)
+        for (int l = 0; l < sp_.num_layers; ++l)
+          if (!lru_dq_[gpu][q][l].empty())
+            sd.lru_snap.push_back({gpu, (int)q, l, lru_dq_[gpu][q][l]});
+    };
+    dump(v); dump(g);
+  }
+  void snap_flush() {
+    if (!snap_on_ || snap_path_.empty()) return;
+    std::ofstream ofs(snap_path_, std::ios::binary);
+    if (!ofs) return;
+    // header: MissSpec 标量字段（不含 std::string arrival）
+    ofs.write(reinterpret_cast<const char*>(&sp_.num_requests), sizeof(int));
+    ofs.write(reinterpret_cast<const char*>(&sp_.num_layers), sizeof(int));
+    ofs.write(reinterpret_cast<const char*>(&sp_.steps), sizeof(int));
+    ofs.write(reinterpret_cast<const char*>(&sp_.sel_blocks), sizeof(int));
+    ofs.write(reinterpret_cast<const char*>(&sp_.hot_blocks), sizeof(int));
+    ofs.write(reinterpret_cast<const char*>(&sp_.kv_heads), sizeof(int));
+    ofs.write(reinterpret_cast<const char*>(&sp_.head_dim), sizeof(int));
+    int32_t alen = (int32_t)sp_.arrival.size();
+    ofs.write(reinterpret_cast<const char*>(&alen), 4);
+    ofs.write(sp_.arrival.data(), alen);
+    ofs.write(reinterpret_cast<const char*>(&sp_.seed), sizeof(uint64_t));
+    ofs.write(reinterpret_cast<const char*>(&sp_.prefix_group), sizeof(int));
+    ofs.write(reinterpret_cast<const char*>(&sp_.prefix_steps), sizeof(int));
+    int64_t nsnap = (int64_t)snap_buf_.size();
+    ofs.write(reinterpret_cast<const char*>(&nsnap), sizeof(int64_t));
+    for (auto& s : snap_buf_) {
+      ofs.write(reinterpret_cast<const char*>(&s.t_ms), sizeof(double));
+      ofs.write(reinterpret_cast<const char*>(&s.g), sizeof(int));
+      ofs.write(reinterpret_cast<const char*>(&s.v), sizeof(int));
+      ofs.write(reinterpret_cast<const char*>(&s.take), sizeof(size_t));
+      ofs.write(reinterpret_cast<const char*>(&s.cur), sizeof(size_t));
+      ofs.write(reinterpret_cast<const char*>(&s.fair), sizeof(size_t));
+      ofs.write(reinterpret_cast<const char*>(&s.step_ms_ema), sizeof(double));
+      ofs.write(reinterpret_cast<const char*>(&s.b_eff_gbs), sizeof(double));
+      ofs.write(reinterpret_cast<const char*>(&s.ebyte_refused), sizeof(bool));
+      ofs.write(reinterpret_cast<const char*>(&s.ebyte_take), sizeof(size_t));
+      // local_v
+      int32_t nv = (int32_t)s.local_v.size(); ofs.write(reinterpret_cast<const char*>(&nv), 4);
+      ofs.write(reinterpret_cast<const char*>(s.local_v.data()), nv * sizeof(int));
+      // local_g
+      int32_t ng = (int32_t)s.local_g.size(); ofs.write(reinterpret_cast<const char*>(&ng), 4);
+      ofs.write(reinterpret_cast<const char*>(s.local_g.data()), ng * sizeof(int));
+      // next_step (full R_ entries)
+      int32_t nr = (int32_t)s.next_step.size(); ofs.write(reinterpret_cast<const char*>(&nr), 4);
+      ofs.write(reinterpret_cast<const char*>(s.next_step.data()), nr * sizeof(int));
+      // lru_snap
+      int32_t nl = (int32_t)s.lru_snap.size(); ofs.write(reinterpret_cast<const char*>(&nl), 4);
+      for (auto& lru : s.lru_snap) {
+        ofs.write(reinterpret_cast<const char*>(&lru.g), sizeof(int));
+        ofs.write(reinterpret_cast<const char*>(&lru.q), sizeof(int));
+        ofs.write(reinterpret_cast<const char*>(&lru.l), sizeof(int));
+        int32_t ndq = (int32_t)lru.dq.size(); ofs.write(reinterpret_cast<const char*>(&ndq), 4);
+        for (uint64_t blk : lru.dq) ofs.write(reinterpret_cast<const char*>(&blk), sizeof(uint64_t));
+      }
+      // ebyte_cands
+      int32_t nc = (int32_t)s.ebyte_cands.size(); ofs.write(reinterpret_cast<const char*>(&nc), 4);
+      for (auto& c : s.ebyte_cands) {
+        ofs.write(reinterpret_cast<const char*>(&c.r), sizeof(int));
+        ofs.write(reinterpret_cast<const char*>(&c.value_ms), sizeof(double));
+        ofs.write(reinterpret_cast<const char*>(&c.cost_ms), sizeof(double));
+        ofs.write(reinterpret_cast<const char*>(&c.accept), sizeof(bool));
+      }
+    }
+    // 阶段2：逐 tick 记录（时间模型拟合用）
+    int64_t ntick = (int64_t)tick_buf_.size();
+    ofs.write(reinterpret_cast<const char*>(&ntick), sizeof(int64_t));
+    for (auto& t : tick_buf_) {
+      ofs.write(reinterpret_cast<const char*>(&t.gpu), sizeof(int));
+      ofs.write(reinterpret_cast<const char*>(&t.tick), sizeof(int));
+      ofs.write(reinterpret_cast<const char*>(&t.resident), sizeof(int));
+      ofs.write(reinterpret_cast<const char*>(&t.refill_bytes), sizeof(uint64_t));
+      ofs.write(reinterpret_cast<const char*>(&t.ms), sizeof(double));
     }
   }
 
@@ -562,6 +672,8 @@ class WlaMultiGpuCtx {
       if (cur <= fair) return 0;  // victim 无盈余（防乒乓：不让其跌破公平份额）
       size_t take = std::min(std::min(k, cur - fair), cur / 2 + 1);
       if (take == 0) return 0;
+      // 反事实快照：在 cost_filter 之前收集 E-byte 逐候选判定
+      std::vector<SnapDecision::EbyteCand> snap_cands;
       if (pol.cost_filter) {
         // E：价值过滤 —— 只迁"剩余工作 ≥ margin × 真实迁移成本"的请求。
         // 成本必须按当前 kv-mode 的真实代价计（否则 E 基于未支付的成本决策，
@@ -595,12 +707,30 @@ class WlaMultiGpuCtx {
           }
           const double value =
               (double)(sp_.steps - next_step_[r]) * step_ms;
-          if (value >= pol.margin * cost_ms)
+          bool accept = (value >= pol.margin * cost_ms);
+          if (snap_on_) snap_cands.push_back({r, value, cost_ms, accept});
+          if (accept)
             ++ok;
           else
             break;
         }
         if (ok == 0) {
+          if (snap_on_) {
+            // 记录拒绝快照（状态未改）
+            SnapDecision sd;
+            sd.t_ms = 0; sd.g = g; sd.v = v;
+            sd.take = 0; sd.cur = cur; sd.fair = fair;
+            sd.local_v.assign(local_[v].begin(), local_[v].end());
+            sd.local_g.assign(local_[g].begin(), local_[g].end());
+            sd.next_step = next_step_;
+            sd.step_ms_ema = step_ms_ema_.load();
+            sd.b_eff_gbs = b_eff_gbs_.load();
+            sd.ebyte_cands = std::move(snap_cands);
+            sd.ebyte_refused = true; sd.ebyte_take = 0;
+            // LRU 快照：v 和 g 上涉及的组
+            snap_lru(sd, v, g);
+            snap_buf_.push_back(std::move(sd));
+          }
           steal_refused_.fetch_add(1);
           return 0;
         }
@@ -611,6 +741,21 @@ class WlaMultiGpuCtx {
                      "[steal] g=%d v=%d take=%zu cur(v)=%zu fair=%zu "
                      "occ(g)=%zu\n",
                      g, v, take, cur, fair, local_[g].size());
+      // 反事实快照：在移动前记录状态（cost_filter 已设 take）
+      if (snap_on_) {
+        SnapDecision sd;
+        sd.t_ms = 0; sd.g = g; sd.v = v;
+        sd.take = take; sd.cur = cur; sd.fair = fair;
+        sd.local_v.assign(local_[v].begin(), local_[v].end());
+        sd.local_g.assign(local_[g].begin(), local_[g].end());
+        sd.next_step = next_step_;
+        sd.step_ms_ema = step_ms_ema_.load();
+        sd.b_eff_gbs = b_eff_gbs_.load();
+        sd.ebyte_cands = std::move(snap_cands);
+        sd.ebyte_refused = false; sd.ebyte_take = take;
+        snap_lru(sd, v, g);
+        snap_buf_.push_back(std::move(sd));
+      }
       for (size_t j = 0; j < take; ++j) {
         moved.push_back(local_[v].back());
         local_[v].pop_back();
@@ -928,6 +1073,24 @@ class WlaMultiGpuCtx {
   const std::unordered_set<uint64_t>& kv_set(int g, int r, int l) const {
     return lru_set_[g][wla_grp(sp_, r)][l];
   }
+  // ---- 阶段2：逐 tick 时间模型遥测（snap_on_ 时记录）----
+  // 记录 (gpu, tick 序号, 常驻数, 本 tick 回填字节, tick 墙钟 ms)，离线拟合
+  //   tick_ms ≈ a·resident + b·refill_MB + c
+  struct TickRec { int gpu; int tick; int resident; uint64_t refill_bytes; double ms; };
+  std::vector<TickRec> tick_buf_;
+  std::mutex tick_mtx_;
+  std::unique_ptr<std::atomic<uint64_t>[]> refill_g_bytes_;
+  void record_tick(int gpu, int tick, int resident, uint64_t rb, double ms) {
+    if (!snap_on_) return;
+    std::lock_guard<std::mutex> lk(tick_mtx_);
+    tick_buf_.push_back({gpu, tick, resident, rb, ms});
+  }
+  void refill_g_add(int g, uint64_t b) {
+    if (refill_g_bytes_) refill_g_bytes_[g].fetch_add(b, std::memory_order_relaxed);
+  }
+  uint64_t refill_g_get(int g) const {
+    return refill_g_bytes_ ? refill_g_bytes_[g].load(std::memory_order_relaxed) : 0;
+  }
   // E 决策输入④：tick 实测的每请求步成本（含回填/迁移的通道争用）
   void update_step_ema(double tick_ms, size_t executed) {
     if (executed == 0) return;
@@ -1104,6 +1267,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   wla_apply_prefix_sharing(tr, sp);  // C2：组内前缀步共享（is_miss 作废）
   wla_recompute_stats(tr, sp);       // C2：按组全局 LRU 重算 miss/命中率
   WlaMultiGpuCtx ctx(devices, sp, skew, arrival, gap_ms, kvmode);
+  ctx.snap_init(mode);
 
   const int n = devices.size();
   WlaMultiStats st;
@@ -1200,6 +1364,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                   cudaMemcpyHostToDevice));
               refill_events.fetch_add(1);
               refill_bytes.fetch_add(c4);
+              ctx.refill_g_add(g, c4);
             }
             attn_layer(r, l);
           }
@@ -1215,6 +1380,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
               ch->sync();
               refill_events.fetch_add(1);
               refill_bytes.fetch_add(c4);
+              ctx.refill_g_add(g, c4);
             }
             attn_layer(r, l);
           }
@@ -1269,6 +1435,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                            ctx.cache(g) +
                                slot_off(r, m0.layer, m0.block));
                 refill_bytes.fetch_add(run * c4);
+                ctx.refill_g_add(g, run * c4);
               } else {
                 for (size_t q = 0; q < run; ++q) {
                   const Ref& m = miss_list[i0 + kk + q];
@@ -1276,6 +1443,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                              c4,
                              ctx.cache(g) + slot_off(r, m.layer, m.block));
                   refill_bytes.fetch_add(c4);
+                  ctx.refill_g_add(g, c4);
                 }
               }
               refill_events.fetch_add(1);
@@ -1293,6 +1461,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
 
       uint64_t idle_iters = 0;
       double below_fair_since_ms = -1.0;  // steal_delay 计时（见 WlaStealPolicy）
+      int tick_idx = 0;                   // 阶段2：本卡 tick 序号
       while (true) {
         if (ctx.all_done()) break;
         std::vector<int> resident = ctx.tick_begin(g);
@@ -1317,6 +1486,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
           continue;
         }
         const double t_tick0 = ht.toc_ms() - t0;
+        const uint64_t rb0 = ctx.refill_g_get(g);
         size_t executed = 0;
         for (int r : resident) {
           const int s = ctx.step_of(r);
@@ -1327,6 +1497,8 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
         CUDA_CHECK(cudaSetDevice(devices[g]));
         CUDA_CHECK(cudaStreamSynchronize(cs));
         const double t_tick1 = ht.toc_ms() - t0;
+        ctx.record_tick(g, tick_idx++, (int)resident.size(),
+                        ctx.refill_g_get(g) - rb0, t_tick1 - t_tick0);
         ctx.tick_end(g, resident, t_tick1);
         ctx.update_step_ema(t_tick1 - t_tick0, executed);  // E 决策输入④
         for (size_t i = 0; i < executed; ++i)
@@ -1405,6 +1577,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
     }
     st.imbalance = std::sqrt(var / n) / mean;
   }
+  ctx.snap_flush();
   return st;
 }
 

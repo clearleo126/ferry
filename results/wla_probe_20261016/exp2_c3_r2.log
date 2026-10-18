@@ -1,0 +1,16 @@
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=imbalanced reqs=48 steps=16 layers=12 sel=64 hot=256 attn=8 gap=1.0ms steal-batch=4 B_ref=16.6GB/s cost-scale=3.00 mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 steal-delay=0.0ms
+  static-A  makespan=  4728.02ms steps/s=   10.2 p50=108.008 p99= 310.266 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.577 ref=0 live=0
+  dyn-B     makespan=   377.31ms steps/s=  127.2 p50= 11.140 p99=  48.846 steals=  11(att=   23) migr=  201.7MB( 11 reqs) refill=  29771 seg   465.17MB imb=0.059 ref=0 live=12907
+  ferry-C   makespan=   290.50ms steps/s=  165.2 p50= 13.104 p99=  21.172 steals=  11(att=   28) migr=  132.1MB( 19 reqs) refill=  28692 seg   569.84MB imb=0.156 ref=0 live=8453
+  costaware-E makespan=   283.91ms steps/s=  169.1 p50= 12.352 p99=  19.061 steals=   5(att=   28) migr=   15.2MB( 12 reqs) refill=  26358 seg   523.70MB imb=0.000 ref=5 live=973
+  llumnix-LLX makespan=   497.55ms steps/s=   96.5 p50= 24.119 p99=  41.053 steals=   1(att=    1) migr=   49.7MB(  2 reqs) refill=  59529 seg  1244.84MB imb=0.118 ref=0 live=3182
+  roundrobin-RR makespan=   452.13ms steps/s=  106.2 p50= 23.821 p99=  41.717 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill=  59529 seg  1244.84MB imb=0.000 ref=0 live=0
+  => C/A 16.28x  C/B 1.30x  E/A 16.65x
+  => [C1-结构] migr(MB): A=0.0 B=201.7 C=132.1 E=15.2 | steals: B=11 C=11 E=5 | refill_seg: A=589824 B=29771 C=28692  [PASS]
+  => [WlA-E] migr C=132.1 vs E=15.2 MB | steals C=11 E=5 | E refused=5 | E/C 1.023x
+  => [BASE] LLX 497.55ms(steals 1 rebal 8/1) RR 452.13ms(steals 0) | C/LLX 0.58x C/RR 0.64x A/LLX 9.50x A/RR 10.46x | migr LLX=49.7 RR=0.0 MB | imb LLX=0.118 RR=0.000
+  => hit_rate=0.958  refill_bytes A=9216.00 B=465.17 C=569.84 E=523.70 LLX=1244.84 RR=1244.84 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=569.8 RR=1244.8 LLX=1244.8 MB | 忽略局部性冷启动 = RR-C +675.0 MB (x2.18) | migr C=132.1 LLX=49.7 MB | C/RR 0.643x
+  => [kv-mode=delta] migr C=132.1 MB live=8453 | trace基线=386.48 MB | refill B=465.17(+78.7) C=569.84(+183.4) MB  | cold_B=78.7 cold_C=183.4
+  => [F0-audit] mig-units dup%: B=0.0 C=17.2 E=0.0 LLX=0.0 RR=0.0 | C total=10211 distinct=8453 | E total=973 distinct=973
+  => [A1-obs] B_eff(实测EMA): C=14.49(7 obs) E=12.46(2 obs) vs B_ref=16.6 x cost-scale=3.00 | P(t) refill压力: C mean=0.93 max=2.83 E mean=1.18 max=2.41 MB (n=7/2)

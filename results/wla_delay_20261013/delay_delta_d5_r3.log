@@ -1,0 +1,5 @@
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=imbalanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 steal-delay=5.0ms
+  static-A  makespan=  2968.71ms steps/s=   16.2 p50= 78.979 p99= 200.809 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.577 ref=0 live=0
+  dyn-B     makespan=   327.61ms steps/s=  146.5 p50= 12.674 p99=  37.361 steals=   9 migr=  136.7MB(  9 reqs) refill=  38344 seg   599.12MB imb=0.156 ref=0 live=8750
+  ferry-C   makespan=   290.79ms steps/s=  165.1 p50= 10.631 p99=  19.674 steals=  16 migr=  298.1MB( 30 reqs) refill=  35178 seg   669.75MB imb=0.102 ref=0 live=19076
+  costaware-E makespan=   257.27ms steps/s=  186.6 p50= 10.117 p99=  18.104 steals=   5 migr=   38.1MB( 14 reqs) refill=  34436 seg   655.42MB imb=0.000 ref=10 live=2439

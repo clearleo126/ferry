@@ -1,0 +1,14 @@
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=imbalanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=full rebal=50ms/thr0.25 prefix=grp4/stp8 steal-delay=2.0ms
+  static-A  makespan=  3486.92ms steps/s=   13.8 p50= 79.075 p99= 233.909 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.577 ref=0 live=0
+  dyn-B     makespan=   386.12ms steps/s=  124.3 p50= 13.485 p99=  39.077 steals=   9 migr=  216.0MB(  9 reqs) refill=  41258 seg   644.66MB imb=0.144 ref=0 live=0
+  ferry-C   makespan=   244.28ms steps/s=  196.5 p50= 10.004 p99=  18.256 steals=  11 migr=  528.0MB( 22 reqs) refill=  36135 seg   693.81MB imb=0.156 ref=0 live=0
+  costaware-E makespan=   246.26ms steps/s=  194.9 p50= 10.279 p99=  18.126 steals=   5 migr=  312.0MB( 13 reqs) refill=  34240 seg   658.11MB imb=0.000 ref=9 live=0
+  llumnix-LLX makespan=   414.05ms steps/s=  115.9 p50= 15.645 p99=  40.986 steals=   4 migr=  216.0MB(  9 reqs) refill=  59139 seg  1235.08MB imb=0.377 ref=0 live=0
+  roundrobin-RR makespan=   379.27ms steps/s=  126.6 p50= 15.736 p99=  41.234 steals=   0 migr=    0.0MB(  0 reqs) refill=  60270 seg  1256.55MB imb=0.000 ref=0 live=0
+  => C/A 14.27x  C/B 1.58x  E/A 14.16x
+  => [C1-结构] migr(MB): A=0.0 B=216.0 C=528.0 E=312.0 | steals: B=9 C=11 E=5 | refill_seg: A=589824 B=41258 C=36135  [PASS]
+  => [WlA-E] migr C=528.0 vs E=312.0 MB | steals C=11 E=5 | E refused=9 | E/C 0.992x
+  => [BASE] LLX 414.05ms(steals 4 rebal 3/4) RR 379.27ms(steals 0) | C/LLX 0.59x C/RR 0.64x A/LLX 8.42x A/RR 9.19x | migr LLX=216.0 RR=0.0 MB | imb LLX=0.377 RR=0.000
+  => hit_rate=0.921  refill_bytes A=9216.00 B=644.66 C=693.81 E=658.11 LLX=1235.08 RR=1256.55 MB (C2：refill 随分发/迁移位置变化（局部性收益侧有账）)
+  => [C2] prefix grp=4 stp=8 | refill: C=693.8 RR=1256.5 LLX=1235.1 MB | 忽略局部性冷启动 = RR-C +562.7 MB (x1.81) | migr C=528.0 LLX=216.0 MB | C/RR 0.644x
+  => [kv-mode=full] migr C=528.0 MB live=0 | trace基线=731.31 MB | refill B=644.66(+-86.7) C=693.81(-37.5) MB  | cold_B=-86.7 cold_C=-37.5

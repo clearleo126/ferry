@@ -1,0 +1,5 @@
+[model] ticks=82  pooled: a(resident)=0.5668 ms  b(refill MB)=0.5430 ms  c=0.4467 ms  R2=0.572  RMSE=2.892 ms
+[model] gpu0: n=23 a=0.309 b=0.570 c=0.764 R2=0.827 RMSE=1.092 ms
+[model] gpu1: n=21 a=0.823 b=0.258 c=1.773 R2=0.630 RMSE=3.040 ms
+[model] gpu2: n=19 a=0.937 b=0.893 c=-3.765 R2=0.860 RMSE=1.909 ms
+[model] gpu3: n=19 a=0.368 b=0.556 c=0.690 R2=0.771 RMSE=1.311 ms

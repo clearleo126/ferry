@@ -1,0 +1,5 @@
+index, utilization.gpu [%], memory.used [MiB]
+0, 0 %, 15 MiB
+1, 0 %, 15 MiB
+2, 0 %, 15 MiB
+3, 0 %, 15 MiB

@@ -1,0 +1,6 @@
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=imbalanced reqs=48 steps=16 layers=12 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 mig-bw=11.0GB/s mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 steal-delay=5.0ms
+  static-A  makespan=  2944.21ms steps/s=   16.3 p50= 83.042 p99= 204.979 steals=   0 migr=    0.0MB(  0 reqs) refill= 589824 seg  9216.00MB imb=0.577 ref=0 live=0
+  dyn-B     makespan=   362.28ms steps/s=  132.5 p50= 13.580 p99=  33.731 steals=   9 migr=  136.7MB(  9 reqs) refill=  38331 seg   598.92MB imb=0.156 ref=0 live=8750
+  ferry-C   makespan=   305.65ms steps/s=  157.0 p50= 12.549 p99=  24.272 steals=  10 migr=  206.4MB( 20 reqs) refill=  35543 seg   670.95MB imb=0.118 ref=0 live=13208
+  costaware-E makespan=   265.13ms steps/s=  181.0 p50= 10.682 p99=  22.561 steals=   5 migr=   30.4MB( 14 reqs) refill=  32841 seg   623.91MB imb=0.000 ref=5 live=1946
+malloc(): largebin double linked list corrupted (bk)

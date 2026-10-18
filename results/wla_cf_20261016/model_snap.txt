@@ -1,0 +1,2 @@
+[model] ticks=0  pooled: a(resident)=0.0000 ms  b(refill MB)=0.0000 ms  c=0.0000 ms  R2=0.000  RMSE=0.000 ms
+[model] 无 tick 记录 → 只输出字节口径
