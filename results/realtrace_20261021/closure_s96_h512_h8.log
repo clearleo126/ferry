@@ -1,0 +1,4 @@
+[counterfact] 真实 trace: results/realtrace_20261021/qwen7b_g4_s96_quest.bin（33288232 bytes）
+[model] ticks=197  pooled: a(resident)=0.6499 ms  b(refill MB)=0.1795 ms  c=1.0368 ms  R2=0.888  RMSE=1.569 ms
+[model] gpu0: n=100 a=0.617 b=0.195 c=0.881 R2=0.903 RMSE=1.511 ms
+[model] gpu1: n=97 a=0.694 b=0.171 c=0.703 R2=0.896 RMSE=1.438 ms

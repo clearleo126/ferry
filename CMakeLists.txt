@@ -139,6 +139,12 @@ add_executable(wla_counterfact
 )
 target_link_libraries(wla_counterfact PRIVATE ferry_workloads ferry_config ferry_common)
 
+# miss_trace_info: 真实 trace 体检（头部校验 + LRU 命中率 + slab 容量）
+add_executable(miss_trace_info
+  src/tools/miss_trace_info.cpp
+)
+target_link_libraries(miss_trace_info PRIVATE ferry_workloads ferry_config ferry_common)
+
 # run_mig_path: 迁移路径微基准（双跳携带 vs host 真值直发；小实验 A）
 add_executable(run_mig_path
   src/benches/run_mig_path.cu

@@ -3,3 +3,11 @@ build/
 data/*.jsonl
 watch_gpu*.log
 *.tgz
+
+# 真实模型 trace / 快照 / 权重（体积大，不入库；需单独同步）
+results/realtrace_*/*.bin
+results/realtrace_*/*.m[0-9]
+results/realtrace_*/*.trace
+.models/
+.hf_home/
+__pycache__/

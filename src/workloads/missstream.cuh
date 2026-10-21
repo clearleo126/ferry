@@ -38,6 +38,12 @@ struct MissSpec {
   int prefix_group = 1;        // 组大小（1 = 关闭，退化为既有语义）
   int prefix_steps = 8;        // 组内共享前缀的步数（其余步分歧）
 
+  // 真实 trace（FERRY_MISS_TRACE）专用：单请求 slab 容量（4-token block 数）。
+  // 0 = 关闭 → 沿用合成口径 64 + steps*8（既有结果逐位不变）。
+  // 真实 trace 的 block id 是链式内容哈希（全局一致，用于跨请求共享），
+  // slab 只是载荷容器、内容不影响计时，故按 slab_blocks 取模寻址。
+  int slab_blocks = 0;
+
   // 每 C4 block 字节数：4 token × 2(K/V) × kv_heads × head_dim × 2B(fp16)
   size_t c4_bytes() const { return (size_t)4 * 2 * kv_heads * head_dim * 2; }
 };

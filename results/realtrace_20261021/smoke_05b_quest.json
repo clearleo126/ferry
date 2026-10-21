@@ -1,0 +1,55 @@
+{
+  "format": "ferry-miss-trace",
+  "version": 1,
+  "bin": "smoke_05b_quest.bin",
+  "model": "/workspace/.models/Qwen2.5-0.5B-Instruct",
+  "method": "quest",
+  "page_tokens": 16,
+  "block_tokens": 4,
+  "sel_pages": 16,
+  "num_requests": 4,
+  "steps": 32,
+  "layers": 24,
+  "num_heads": 14,
+  "kv_heads": 2,
+  "head_dim": 64,
+  "prefix_tokens": 256,
+  "prompt_tokens": 512,
+  "group_size": 4,
+  "groups": 1,
+  "seed": 42,
+  "prompt_lens": [
+    512,
+    512,
+    512,
+    512
+  ],
+  "output_lens": [
+    32,
+    32,
+    32,
+    32
+  ],
+  "group_ids": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "prefix_ids_match": true,
+  "step_ms": {
+    "mean": 22.218418986085453,
+    "p50": 21.178246941417456,
+    "p99": 25.603655599989015,
+    "max": 147.0848771277815
+  },
+  "pages_per_layer_step": 16.0,
+  "step_reuse_rate": 0.8527385752688172,
+  "wall_s": 3.2020373344421387,
+  "dtype": "fp16",
+  "device": "NVIDIA GeForce RTX 4090",
+  "torch": "2.11.0+cu128",
+  "transformers": "5.20.2",
+  "time": "2026-10-21 13:18:40",
+  "cmd": "tools/capture_miss_trace.py --model /workspace/.models/Qwen2.5-0.5B-Instruct --method quest --out results/realtrace_20261021/smoke_05b_quest --requests 4 --groups 1 --steps 32 --prompt-tokens 512 --prefix-tokens 256"
+}

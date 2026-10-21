@@ -87,6 +87,7 @@
 #include "common/timer.cuh"
 #include "runtime/adaptive_batch.cuh"
 #include "workloads/missstream.cuh"
+#include "workloads/miss_trace.cuh"
 
 namespace ferry {
 
@@ -205,11 +206,17 @@ struct WlaStealPolicy {
 };
 
 // 偏移（与 kv_exec.cuh 同布局；独立命名避免头冲突）
+// slab 容量：真实 trace 用 spec.slab_blocks（block id 为全局哈希 → 取模寻址，
+// 载荷内容不影响计时）；合成路径 0 → 沿用 64+steps*8，逐位不变。
+inline uint64_t wla_slab_cap(const MissSpec& sp) {
+  return sp.slab_blocks > 0 ? (uint64_t)sp.slab_blocks
+                            : 64 + (uint64_t)sp.steps * 8;
+}
 inline size_t wla_slab_off(const MissSpec& sp, int req, int layer,
                            uint64_t block) {
-  const uint64_t max_blocks = 64 + (uint64_t)sp.steps * 8;
-  return ((size_t)(req * sp.num_layers + layer) * max_blocks + block) *
-         sp.c4_bytes();
+  const uint64_t cap = wla_slab_cap(sp);
+  return ((size_t)(req * sp.num_layers + layer) * cap +
+          (size_t)(block % cap)) * sp.c4_bytes();
 }
 inline size_t wla_slot_off(const MissSpec& sp, int req, int layer,
                            uint64_t block) {
@@ -302,7 +309,7 @@ class WlaMultiGpuCtx {
       : devs_(devices), n_(devices.size()), sp_(sp), kvmode_(kvmode) {
     R_ = sp.num_requests;
     c4_ = sp.c4_bytes();
-    max_blocks_ = 64 + (uint64_t)sp.steps * 8;
+    max_blocks_ = wla_slab_cap(sp);
     seg_ = (size_t)sp.num_layers * sp.hot_blocks * c4_;  // 单请求热集
     // 请求归属（偏斜）与到达
     // C2：组 = 前缀缓存单位 → 组内请求共享 home（前缀在哪家，请求就发哪家
@@ -552,6 +559,23 @@ class WlaMultiGpuCtx {
       ofs.write(reinterpret_cast<const char*>(&t.resident), sizeof(int));
       ofs.write(reinterpret_cast<const char*>(&t.refill_bytes), sizeof(uint64_t));
       ofs.write(reinterpret_cast<const char*>(&t.ms), sizeof(double));
+    }
+    // 尾部扩展（旧快照无此段，读者按 EOF 兼容）：slab_blocks
+    const char tr_magic[4] = {'F', 'T', 'R', '2'};
+    ofs.write(tr_magic, 4);
+    ofs.write(reinterpret_cast<const char*>(&sp_.slab_blocks), sizeof(int));
+    ofs.close();
+
+    // 真实 trace 旁车文件：反事实必须读同一条 trace（否则会静默退回合成流）
+    if (const char* tp = std::getenv("FERRY_MISS_TRACE"); tp && *tp) {
+      uint64_t sz = 0;
+      const uint64_t h = fnv1a64_file(tp, &sz);
+      std::ofstream tf(snap_path_ + ".trace");
+      tf << "trace=" << tp << "\nsize=" << sz << "\nfnv=" << h
+         << "\nrequests=" << sp_.num_requests << "\nsteps=" << sp_.steps
+         << "\nlayers=" << sp_.num_layers << "\nsel_blocks=" << sp_.sel_blocks
+         << "\nkv_heads=" << sp_.kv_heads << "\nhead_dim=" << sp_.head_dim
+         << "\nslab_blocks=" << sp_.slab_blocks << "\n";
     }
   }
 
@@ -1235,7 +1259,7 @@ class WlaMultiGpuCtx {
 //     反证自检：宽裕场景（balanced 档）LLX 应显著优于 RR —— 否则实现存疑。
 //
 inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
-                                      const MissSpec& sp, int mode,
+                                      MissSpec sp, int mode,
                                       const AdaptiveBatchPolicy& pol,
                                       const WlaStealPolicy& spol_in,
                                       const std::string& skew,
@@ -1263,9 +1287,28 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   const size_t steal_k = (mode == 1 || mode == 6) ? 1
                          : (mode == 7)             ? SIZE_MAX
                                                    : (size_t)steal_batch;
-  MissTrace tr = replay_miss_stream(sp);
-  wla_apply_prefix_sharing(tr, sp);  // C2：组内前缀步共享（is_miss 作废）
-  wla_recompute_stats(tr, sp);       // C2：按组全局 LRU 重算 miss/命中率
+  // 真实 trace（FERRY_MISS_TRACE）：事件已含跨请求前缀共享（链式内容哈希），
+  // 不能再套 wla_apply_prefix_sharing/wla_recompute_stats（会二次改写）。
+  std::string trace_path;
+  const bool real_trace = ferry_miss_trace_path(&trace_path);
+  MissTrace tr;
+  MissTraceInfo tinfo;
+  if (real_trace) {
+    tr = load_miss_trace(trace_path, sp, &tinfo);
+    std::fprintf(stderr,
+                 "[trace] real model trace: %s | R=%d S=%d L=%d kv=%d d=%d "
+                 "page=%d sel_pages=%d unique_blocks=%llu slab_blocks=%d "
+                 "hit=%.3f\n",
+                 trace_path.c_str(), tinfo.requests, tinfo.steps, tinfo.layers,
+                 tinfo.kv_heads, tinfo.head_dim, tinfo.page_tokens,
+                 tinfo.sel_pages,
+                 (unsigned long long)tinfo.unique_blocks, sp.slab_blocks,
+                 tr.hit_rate);
+  } else {
+    tr = replay_miss_stream(sp);
+    wla_apply_prefix_sharing(tr, sp);  // C2：组内前缀步共享（is_miss 作废）
+    wla_recompute_stats(tr, sp);       // C2：按组全局 LRU 重算 miss/命中率
+  }
   WlaMultiGpuCtx ctx(devices, sp, skew, arrival, gap_ms, kvmode);
   ctx.snap_init(mode);
 

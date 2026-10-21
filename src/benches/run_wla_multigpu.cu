@@ -19,6 +19,9 @@
 //                      [--kv-mode full|delta|delta-naive|drop]
 //                      [--rebal-interval 50] [--rebal-thr 0.25]
 //                      [--steal-delay 0]（时机反事实轴：水位窃取去抖延迟，仅 C/E）
+// 真实 trace（tools/capture_miss_trace.py 产出）：
+//   [--miss-trace <x.bin>] [--layers 28] [--kv-heads 4] [--head-dim 128]
+//   [--sel 64] [--hot 128]，参数必须与 trace 头逐项一致（否则 abort，不退回合成流）
 //                      [--with-b1]（追加 D1(one-steal)/D2(steal-half) 两行 + [B1] 汇总）
 // kv-mode（迁移内容轴）：full=整段 24MB（默认，既有数据语义）；
 // delta=只发驻留槽+状态交接（Raft nextIndex，批量化压实 gather→单次
@@ -84,6 +87,8 @@ int main(int argc, char** argv) {
   double rebal_interval = 50.0, rebal_thr = 0.25, steal_delay = 0.0;
   char arrival[32] = "steady", skew[32] = "imbalanced";
   char kvmode_s[32] = "full";
+  char miss_trace[512] = "";
+  int kv_heads = 8, head_dim = 128;
 
   for (int i = 1; i < argc; ++i) {
     auto next = [&]() -> const char* { return argv[++i]; };
@@ -99,6 +104,12 @@ int main(int argc, char** argv) {
       sel = std::atoi(next());
     } else if (std::strcmp(argv[i], "--hot") == 0) {
       hot = std::atoi(next());
+    } else if (std::strcmp(argv[i], "--miss-trace") == 0) {
+      std::strncpy(miss_trace, next(), sizeof(miss_trace) - 1);
+    } else if (std::strcmp(argv[i], "--kv-heads") == 0) {
+      kv_heads = std::atoi(next());
+    } else if (std::strcmp(argv[i], "--head-dim") == 0) {
+      head_dim = std::atoi(next());
     } else if (std::strcmp(argv[i], "--attn") == 0) {
       attn = std::atoi(next());
     } else if (std::strcmp(argv[i], "--arrival") == 0) {
@@ -169,10 +180,13 @@ int main(int argc, char** argv) {
   sp.steps = steps;
   sp.sel_blocks = sel;
   sp.hot_blocks = hot;
+  sp.kv_heads = kv_heads;
+  sp.head_dim = head_dim;
   sp.arrival = arrival;
   sp.seed = seed;
   sp.prefix_group = prefix_group;
   sp.prefix_steps = prefix_steps;
+  if (miss_trace[0]) setenv("FERRY_MISS_TRACE", miss_trace, 1);
 
   AdaptiveBatchPolicy pol;  // min 1MB / max 4MB / target_batches 4（与 WlA 单卡同）
   WlaStealPolicy spol;     // b_ref/cost_scale/margin 仅 E 使用；A/B/C 语义不变
@@ -303,7 +317,8 @@ int main(int argc, char** argv) {
         "LLX=%.1f MB | C/RR %.3fx\n",
         prefix_group, prefix_steps, c.refill_bytes / 1048576.0,
         rr.refill_bytes / 1048576.0, llx.refill_bytes / 1048576.0,
-        (double)(rr.refill_bytes - c.refill_bytes) / 1048576.0,
+        (double)rr.refill_bytes / 1048576.0 -
+            (double)c.refill_bytes / 1048576.0,
         c.refill_bytes > 0 ? (double)rr.refill_bytes / (double)c.refill_bytes
                            : 0.0,
         c.migrated_bytes / 1048576.0, llx.migrated_bytes / 1048576.0,

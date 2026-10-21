@@ -1,0 +1,5 @@
+h=1 mean_d_total=1.872 MB n=215
+h=2 mean_d_total=2.177 MB n=215
+h=4 mean_d_total=2.232 MB n=215
+h=8 mean_d_total=2.025 MB n=215
+h=0 mean_d_total=-34.483 MB n=215

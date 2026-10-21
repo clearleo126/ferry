@@ -1,5 +1,32 @@
-实验设计（收束版 v27 · v26 主线不变；新增 EdgeFlow（ICDCS'26）对位：其成本模型是一次性迁移时间（direct KV vs activation 重算），不含迁移后回填/缓存共享被切断的外部性；保留 v26 及此前记录）
+实验设计（收束版 v28 · 真实 trace L1 落地：Qwen2.5-7B × Quest/mass，局部性与合成一致、零对照逐位 0；但外部性符号由缓存容量决定，v25 的 7–15× 正放大未复现；保留 v27 及此前记录）
 场景钉死：LLM 稀疏注意力持续 decode 的 host-staged 热 KV 工作集（QSA-style miss 流）。
+v28 = v27 + **真实 trace（L1）落地与首轮回放（results/realtrace_20261021.md；4×4090）**：
+  - 工具：`tools/capture_miss_trace.py`（Qwen2.5-7B 单卡逐步抓每层 top-k page；
+    Quest 上界 / attention-mass 两法；**链式内容哈希** block id，组内共享前缀逐位同 id，
+    前缀自检 PASS）；`src/workloads/miss_trace.cuh`（默认关、参数不符 **abort**，
+    不静默退回合成流）；`miss_trace_info`（不跑 GPU 的体检）；`offset_trace_ids.py`
+    （按请求加 id 偏移 = 合成 `--prefix-group 1` 语义）；`wla_counterfact` 读快照旁车
+    `.trace` + FNV 指纹；快照尾部 `FTR2+slab_blocks`（旧快照 EOF 兼容）。
+    合成回归：`refill=1242.97MB / hit=0.865` 逐位不变。
+  - **① 局部性校准**（48 请求 × 512 步，prompt 4096，48=12 组×4 共享 2048 前缀）：
+    Quest 复用 **0.679** / hit **0.8605**（合成 0.66 / 0.865）；
+    attention-mass 复用 **0.793** / hit **0.9264**。⇒ 合成流没有高估局部性。
+  - **② 零对照精确成立**：`--prefix-group 1`，真实 trace 上 218 候选 × 5 视野
+    Δrefill **逐位 0.000000** ⇒ v25 的结构恒等式在真实选择流上成立。
+  - **③ 判据 2 判负**：h1→全程无 7–15× 正放大。容量宽松（hot=512，128 slot/请求）
+    +1.87→+2.03MB（**1.1×**）；容量紧张（hot=128，32 slot/请求）
+    **−3.19→−381.4MB（119×，负号）** ⇒ 主导项是"移走成员释放组缓存容量"，
+    不是 v25 的共享泄漏。**外部性符号由容量压力决定**。
+  - **④ 闭包仍精确归零**：两档 `close_full` 均 **0.00MB**；宽松档 `partial`
+    复现 v26 正号（+6.69 / +4.09MB）。
+  - **⑤ n\* 与门控**：V=29.36MB、B=17.6GB/s、t_step=19.6ms ⇒ n\*≈**0.14 步<1**；
+    E/C makespan=**0.990–1.000** ⇒ v22"最好情况仅无害"在本平台保持。
+  - **⑥ 建模警告**：组缓存按**组**分配容量（`prefix_group=4`+hot=128 ⇒ 32 slot/请求）。
+    主口径改为 **hot=128×group**（组=4→512，每请求容量恒定）；group>1 时 C/RR 绝对
+    比值受"拆组→多份组缓存"污染（1.95 / 1.27 / 1.04），**不可当胜负**。
+  - 局限：单 trace/seed；反事实 2 卡；t_step 仅 batch=1；512 步未回放；
+    4090 为第 4 平台（GPU1 x8、250W）。下一步：4 replicate + mass 回放 +
+    batch=12 t_step + 512 步符号。
 v27 = v26 + **EdgeFlow（ICDCS 2026，arXiv 2610.22172，全文已读）对位——纯写作/对位，不新增实测**：
   - 做的事：地理分布式协同边缘（CEC）+ 按层 shard 的分布式推理；节点过载/退出时迁 KV；
     "直接传 KV"与"传 activation 再重算 KV"混合 + 多节点目标选择 + 2-approx，最小化迁移时间。
@@ -1820,7 +1847,9 @@ T_comm 1.84×）→ 绝对数字平台相关、比值平台无关。
     (i) 视野、(ii) 缓存共享结构、(iii) 规模；对既有"本次字节/带宽 + 固定开销"
     的成本形式构成结构性反例（非标定误差）。
   - 这是当前**最强、最可辩护**的一条，也是论文主线候选。
-  - 仍缺：真实 trace（换合成 QSA 流）、跨平台（vast PCIe3）、2 卡主平台。
+  - 仍缺：跨平台（vast PCIe3）、2 卡主平台。
+  - ✅ v28 已补 **L1 真实 trace**（Qwen2.5-7B × Quest/mass，见【21】）；仍缺：
+    batch>1 的真实 t_step、512 步回放、4 replicate。
 
 【20. EdgeFlow 对位（v27 新增；ICDCS 2026，arXiv 2610.22172）】
 20.1 出处与一句话
@@ -1906,3 +1935,70 @@ T_comm 1.84×）→ 绝对数字平台相关、比值平台无关。
   - [可选，不新增实验] 若审稿人要求"与 EdgeFlow 比"，以"边缘 Mbps / 多节点 shard /
     迁移时间" vs "PCIe / DP 请求 / makespan+字节"声明不可比；不做移植。
   - [可选，阅读] EdgeFlow 的 llama-box / PolyLink 细节与本项目无关，不再展开。
+
+【21. 真实 trace（L1）落地与首轮结果（v28 新增；4×4090）】
+21.1 目的与边界
+  - 补【19.6】的缺口：把合成 QSA miss 流换成**真实模型**的稀疏 KV 选择流。
+  - 边界内（不越过【3】/【12】）：不移植 SGLang/HiSparse、不接推理框架、不做服务级指标；
+    只在单卡抓 trace，在 Ferry 里回放。平台记录见 results/wla_4090_platform_20261021.md。
+  - 平台：4×4090（cc 8.9，250W，**GPU1 仅 x8**）。B_ref：x16 卡对 **17.6 GB/s**
+    （集群 3090 17.9）、含 GPU1 **11.8**；不与 3090 绝对 makespan 混表。
+21.2 采集（工具：tools/capture_miss_trace.py）
+  - 模型：Qwen2.5-7B-Instruct，fp16，单卡；L=28，H=28，KV=4，d=128
+    ⇒ KV=2KiB/token/layer，4-token block=8KiB，V(hot=128)=**29.36MB/请求**。
+  - 负载：prompt 4096 = 2048 共享前缀 + 2048 后缀；48 请求 = 12 组×4；
+    decode 96 / 512 步；语料 = Gutenberg 三本书，窗口不重叠，前后缀分别 token 化后拼接。
+  - 选择：page=16 token，每层每步 top-16 page（=64 个 4-token block），只选完整 page。
+    `quest` = Quest 上界（per-page K 逐维 min/max，Σ_d max(q·kmax, q·kmin)；
+    同 KV head 的 query head 取 max，再对 4 个 KV head 取 max）；
+    `mass` = 真实 attention 质量按 page 求和（oracle 上界）。
+  - id：**链式内容哈希** h_i=blake2b(h_{i-1}+tokens[4i:4i+4]) ⇒ 组内共享前缀同 id、
+    不同上下文的相同 4-gram 不误合并（= 真实 prefix-cache 哈希链）。
+    自检 `prefix_ids_match=PASS`；block id 在 Ferry 侧按首次出现重映射为稠密 id，
+    运行时与反事实逐位一致。
+21.3 Ferry 侧改动（默认关 + 失败即 abort）
+  - `src/workloads/miss_trace.cuh`：读 .bin、逐项校验 R/S/L/KV/D/sel、per-(req,layer)
+    LRU 重算 miss；写 `spec.slab_blocks`（slab 只装载荷 ⇒ id 取模寻址）。
+  - `run_wla_multigpu --miss-trace/--kv-heads/--head-dim`：真实 trace 跳过
+    `wla_apply_prefix_sharing`（trace 已含共享），只保留组去重语义。
+  - `wla_counterfact`：读快照旁车 `<snap>.trace`（路径+大小+FNV），指纹不符/缺失即退出；
+    快照尾部新增 `FTR2+slab_blocks`，旧 .m3 按 EOF 兼容。
+  - 回归：合成路径 `refill=1242.97MB / hit=0.865` 与历史逐位一致。
+21.4 校准与结构校验
+  - 局部性（512 步）：Quest 复用 **0.679** / hit **0.8605**（合成 0.66 / 0.865）；
+    mass 复用 **0.793** / hit **0.9264**；干净 forward（batch=1，ctx≈4.6k）**19.6ms**。
+    ⇒ 「合成流把局部性设高了」不成立；真实 Quest 的复用甚至更接近 0.66。
+  - 零对照（`--prefix-group 1`，218 候选×5 视野）：Δrefill **逐位 0.000000**。
+    ⇒ v25 的结构恒等式（carry 使目的卡状态与源卡相同 ⇒ miss 序列不变）在真实 trace 成立。
+21.5 首轮结果：外部性的符号由**缓存容量压力**决定
+  - 容量宽松（hot=512，即 128 slot/请求；hit=0.942）：h1 **+1.87** → h2 +2.18 →
+    h4 +2.23 → h8 +2.03 MB ⇒ 近似**局部可加**（1.1×），无 v25 的视野放大。
+  - 容量紧张（hot=128，即 32 slot/请求；hit=0.842）：h1 **−3.19** → h8 **−59.0** →
+    全程 **−381.4 MB**（**119×，负号**）⇒ 主导项是"移走一个成员**释放**组缓存容量"，
+    留下成员少 miss；不是 v25 的共享泄漏。
+  - 闭包：两档 `close_full` 均 **0.00MB**；宽松档 `partial` 复现 v26 正号
+    （dec0 +6.69MB / dec1 +4.09MB）。⇒ 闭包消除外部性与容量无关；**部分迁移的符号**随容量翻转。
+  - 机制解释：合成 trace 的 `prefix_steps=8` 假设"共享只在前 8 步"；真实 2048-token
+    前缀在整段 decode 中仍被选中 ⇒ 共享是**持续**的，容量紧张时救济项压倒泄漏项。
+  - n* 与门控：V=29.36MB、B=17.6GB/s、t_step=19.6ms ⇒ n*≈**0.14 步 < 1**；
+    E/C makespan = 0.990（hot=128）/ 1.000 量级（hot=512）/ 0.990（group=1）。
+    ⇒ v22「本 regime 门控最好情况仅无害」继续成立。
+21.6 建模警告（新增，写论文/解释数字前必读）
+  - 组缓存按**组**分配容量（`wla_gslot_off` 用 group id）：`prefix_group=4`+hot=128
+    ⇒ 每请求仅 32 slot/layer，人为放大"移走成员→剩下成员多容量"的救济。
+    主口径改为 **hot = 128×group**（组=4→512），保持每请求容量恒定；hot=128 作
+    "容量紧张"敏感性档。两档都报，且两档 close_full 均为 0.00。
+  - group>1 时 C/RR 的绝对比值受"拆组→同一组在多卡各一份缓存"污染：
+    hot=128 C/RR=1.95、hot=512=1.27、group=1=1.04。**不可当胜负**；C2 胜负只能在
+    group=1 或"per-request 容量 + 组级去重"的修正模型里判（未实现）。
+21.7 判定、局限与待办
+  - 判定（按预注册 results/realtrace_prereg_20261021.md）：判据 1/3/5/6 成立；
+    **判据 2（7–15× 正放大）不成立**；判据 4（512 步符号）未判。
+  - 局限：单 trace / 单 seed（42）；反事实只在 2 卡（GPU1/2）；t_step 仅 batch=1；
+    512 步 trace 已抓未回放；未做 mass 回放；组缓存容量-放置耦合未修正。
+  - 待办（按序）：
+    ① seed 43–46 各抓 s96 Quest（~2.5min/份）→ 两档容量 + 闭包，报 4 份范围；
+    ② 同一套判据跑 attention-mass（复用 0.809 / hit 0.916）；
+    ③ batch=12 的真实 t_step，替换 n* 的 0.14 步；
+    ④ 512 步回放判符号（44M 事件，15–30min/模式）；
+    ⑤ 若继续 C2：实现 per-request 容量 + 组级去重的修正模型。

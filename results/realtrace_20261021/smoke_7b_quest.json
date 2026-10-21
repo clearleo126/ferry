@@ -1,0 +1,61 @@
+{
+  "format": "ferry-miss-trace",
+  "version": 1,
+  "bin": "smoke_7b_quest.bin",
+  "model": "/workspace/.models/Qwen2.5-7B-Instruct",
+  "method": "quest",
+  "page_tokens": 16,
+  "block_tokens": 4,
+  "sel_pages": 16,
+  "num_requests": 4,
+  "steps": 64,
+  "layers": 28,
+  "num_heads": 28,
+  "kv_heads": 4,
+  "head_dim": 128,
+  "prefix_tokens": 2048,
+  "prompt_tokens": 4096,
+  "group_size": 4,
+  "groups": 1,
+  "seed": 42,
+  "prompt_lens": [
+    4096,
+    4096,
+    4096,
+    4096
+  ],
+  "output_lens": [
+    64,
+    64,
+    64,
+    64
+  ],
+  "group_ids": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "prefix_ids_match": true,
+  "step_ms": {
+    "mean": 25.278207624978677,
+    "p50": 24.772665463387966,
+    "p99": 27.583272033370967,
+    "max": 148.0211711023003
+  },
+  "pages_per_layer_step": 16.0,
+  "step_reuse_rate": 0.6701123157596371,
+  "clean_step_ms": {
+    "n": 30,
+    "ctx": 4190,
+    "mean": 19.5497771581014,
+    "p50": 19.548160552978516
+  },
+  "wall_s": 9.425418853759766,
+  "dtype": "fp16",
+  "device": "NVIDIA GeForce RTX 4090",
+  "torch": "2.11.0+cu128",
+  "transformers": "5.20.2",
+  "time": "2026-10-21 13:20:52",
+  "cmd": "tools/capture_miss_trace.py --model /workspace/.models/Qwen2.5-7B-Instruct --method quest --out results/realtrace_20261021/smoke_7b_quest --requests 4 --groups 1 --steps 64 --prompt-tokens 4096 --prefix-tokens 2048"
+}

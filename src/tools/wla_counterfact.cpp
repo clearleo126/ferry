@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -31,6 +32,7 @@
 
 // 复用 missstream.cuh 的 trace 生成器（纯 host 代码）
 #include "workloads/missstream.cuh"
+#include "workloads/miss_trace.cuh"
 
 using namespace ferry;
 
@@ -95,6 +97,31 @@ inline void wla_recompute_stats(MissTrace& tr, const MissSpec& sp) {
   tr.hit_rate = tr.total_selects > 0
                     ? 1.0 - (double)tr.total_misses / (double)tr.total_selects
                     : 0.0;
+}
+
+// 快照旁车（snap_flush 写）：真实 trace 的路径与指纹。
+// 存在即表示该快照来自真实 trace 运行——必须读同一条 trace，禁止退回合成流。
+struct TraceRef {
+  bool present = false;
+  std::string path;
+  uint64_t size = 0, fnv = 0;
+};
+
+inline TraceRef read_trace_ref(const std::string& snap_path) {
+  TraceRef r;
+  std::ifstream f(snap_path + ".trace");
+  if (!f) return r;
+  std::string line;
+  while (std::getline(f, line)) {
+    const size_t eq = line.find('=');
+    if (eq == std::string::npos) continue;
+    const std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+    if (k == "trace") r.path = v;
+    else if (k == "size") r.size = std::strtoull(v.c_str(), nullptr, 10);
+    else if (k == "fnv") r.fnv = std::strtoull(v.c_str(), nullptr, 10);
+  }
+  r.present = !r.path.empty();
+  return r;
 }
 
 // ---- 快照文件读取（与 wla_multigpu.cuh 的 snap_flush 对称） ----
@@ -199,6 +226,12 @@ SnapFile read_snap(const std::string& path) {
         t.refill_bytes = rd.rd_u64(); t.ms = rd.rd_f64();
       }
     }
+  }
+  // v26+ 尾部：FTR2 + slab_blocks（旧快照无此段，按 EOF 容忍）
+  if (!rd.eof()) {
+    char mg[4] = {0, 0, 0, 0};
+    rd.rd(mg, 4);
+    if (std::memcmp(mg, "FTR2", 4) == 0) sf.sp.slab_blocks = rd.rd_int();
   }
   return sf;
 }
@@ -445,7 +478,7 @@ int main(int argc, char** argv) {
   }
 
   SnapFile sf = read_snap(path);
-  const MissSpec& sp = sf.sp;
+  MissSpec& sp = sf.sp;
   if (dump_ticks) {
     std::printf("gpu,tick,resident,refill_MB,ms\n");
     for (const auto& t : sf.ticks)
@@ -453,9 +486,33 @@ int main(int argc, char** argv) {
                   (double)t.refill_bytes / 1048576.0, t.ms);
     return 0;
   }
-  MissTrace tr = replay_miss_stream(sp);
-  wla_apply_prefix_sharing(tr, sp);
-  wla_recompute_stats(tr, sp);
+  const TraceRef tref = read_trace_ref(path);
+  MissTrace tr;
+  if (tref.present) {
+    uint64_t sz = 0;
+    const uint64_t h = fnv1a64_file(tref.path, &sz);
+    if (tref.fnv != 0 && h != tref.fnv) {
+      std::fprintf(stderr,
+                   "[counterfact] trace 指纹不一致：%s（快照记录 fnv=%llu，实际 %llu）\n"
+                   "拒绝用错误的 trace 做反事实。\n",
+                   tref.path.c_str(), (unsigned long long)tref.fnv,
+                   (unsigned long long)h);
+      return 1;
+    }
+    std::fprintf(stderr, "[counterfact] 真实 trace: %s（%llu bytes）\n",
+                 tref.path.c_str(), (unsigned long long)sz);
+    tr = load_miss_trace(tref.path, sp);
+  } else {
+    if (const char* env = std::getenv("FERRY_MISS_TRACE"); env && *env) {
+      std::fprintf(stderr,
+                   "[counterfact] 快照无 .trace 旁车，但环境变量 FERRY_MISS_TRACE=%s："
+                   "无法确认运行时用的是哪条 trace，拒绝继续。\n", env);
+      return 1;
+    }
+    tr = replay_miss_stream(sp);
+    wla_apply_prefix_sharing(tr, sp);
+    wla_recompute_stats(tr, sp);
+  }
 
   TimeModels tm = fit_time_models(sf.ticks, 8);
   std::fprintf(stderr,
@@ -631,7 +688,7 @@ int main(int argc, char** argv) {
                   (double)r.cf.transfer_bytes / MB,
                   (double)r.cf.refill_v_bytes / MB,
                   (double)r.cf.refill_g_bytes / MB, tot / MB,
-                  (double)r.cf.refill_v_bytes - (double)a0.refill_v_bytes,
+                  ((double)r.cf.refill_v_bytes - (double)a0.refill_v_bytes) / MB,
                   ((double)r.cf.refill_g_bytes - (double)a0.refill_g_bytes) / MB,
                   (tot - a0_total) / MB);
       std::printf("%.2f,%.2f,%.2f,%.2f,", r.cf.tv_ms, r.cf.tg_ms, mk,
