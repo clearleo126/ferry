@@ -1,5 +1,13 @@
-实验设计（收束版 v26 · 迁移单位因果检验：共享泄漏→回填代价精确归零，但整组闭包在字节上不划算且大扇出下 65% 不可行；保留 v25 及此前记录）
+实验设计（收束版 v27 · v26 主线不变；新增 EdgeFlow（ICDCS'26）对位：其成本模型是一次性迁移时间（direct KV vs activation 重算），不含迁移后回填/缓存共享被切断的外部性；保留 v26 及此前记录）
 场景钉死：LLM 稀疏注意力持续 decode 的 host-staged 热 KV 工作集（QSA-style miss 流）。
+v27 = v26 + **EdgeFlow（ICDCS 2026，arXiv 2610.22172，全文已读）对位——纯写作/对位，不新增实测**：
+  - 做的事：地理分布式协同边缘（CEC）+ 按层 shard 的分布式推理；节点过载/退出时迁 KV；
+    "直接传 KV"与"传 activation 再重算 KV"混合 + 多节点目标选择 + 2-approx，最小化迁移时间。
+  - 成本模型（论文 II-B）：T_kv = 2·L_seq·H_j·B/B_{k,n}；T_ACT^comm = T_kv/2；
+    T_ACT^comp = 2·L_seq·H_j²·B/FLOPS_n；T_{k,n}=max(T_ACT^comp+T_KV, T_ACT^comm)。
+    ⇒ 它算的是**一次性迁移动作**的通信+重算时间，不含迁移后消费侧 refill/缓存共享外部性。
+  - 切割：网络 100–900 Mbps / 多节点 shard / failover 触发 vs 本文 PCIe host-staged
+    / DP 请求分区 / 前缀偏斜 + 持续 decode；六条切割与写作落点见【20】。
 v26 = v25 + **阶段4 闭包 vs 部分组（results/wla_cf_20261018.md 阶段4；6 配置×4 seed）**：
   - 工具新增 `--closure`：同一决策点对齐体量（nbase）输出 a0 / partial / partial_same /
     close_expand（补 v 上组员）/ close_full（两阶段选整组，保证不漏成员）。
@@ -596,7 +604,10 @@ Related work 必引（差异化定位）：StealHalf（Hendler-Shavit SPAA'02，
   与缓存调度，v12 新增必引（见下对位段；二者是"单实例侧"最接近本项目的两篇）**
 + **MCaM（IEEE 会议论文 2025-07，Chu/Shen/…/Zhang，IEEE Xplore 文档号 11183741）——
   单实例多级 KV 缓存 + 跨请求前缀复用 + KV manager 与 scheduler 协同，v15 新增必引
-  （见下 MCaM 对位段；与 C2 的前缀复用动机重叠度最高的一篇）**。
+  （见下 MCaM 对位段；与 C2 的前缀复用动机重叠度最高的一篇）**
++ **EdgeFlow（ICDCS 2026，arXiv 2610.22172）——CEC 地理分布式边缘的 KV cache 迁移，
+  与本文标题最接近；v27 新增必引，六条切割见【20】（网络 Mbps / 多节点 shard /
+  failover vs 本文 PCIe host-staged / DP 请求 / 前缀偏斜 + 持续 decode）**。
 **HotPrefix / KVFlow 对位段（v12 新增；2026-10-05 核实）**：
   两篇均为**单实例（单卡 + CPU/host 外存）**工作，**均无跨卡迁移、无多卡控制面** —— 这是
   本项目与它们的切割线。但它们与本项目的**机制侧高度重叠**，必须在 related work 显式对位，
@@ -1499,6 +1510,10 @@ T_comm 1.84×）→ 绝对数字平台相关、比值平台无关。
   （arXiv 2610.21500：T_load = T0 + ns/B，B* = sR，生产 trace 验证）⇒ 先例增至三个
   （Mooncake / llm-d / 2610.21500）；τ̂ = κ·V/B_ref + c_fix 只能作"采用的标准形式"，
   不得作模型贡献。且 v21 实测已表明该门控在本 regime **最好情况仅无害**（见 18.9）。
+  **v27 追加**：**一次性迁移时间的加性成本模型**亦已有 ICDCS'26 先例
+  （EdgeFlow：T_kv = 2·L_seq·H_j·B/B_{k,n}，activation 重算 = T_kv/2 + 算力项，
+  2-approx 选目标；见【20】）⇒ 该形状只能作"采用的标准形式"；本文 v23–v26 的
+  路径依赖/非局部 refill 反例才是可辩护的差异（成本不是决策点可局部测得的加性量）。
 18.1' ⚠️ **v16 原四条贡献措辞作废**（2026-10-15，A1 实测触发，仅存档）：
   原 ①"…并挤占关键路径上的回填带宽" → P(t) 实测否证（争用非相位冲突）；
   原 ②"给出一个简单的窃取阈值/批大小规则" → 平坦高原使"提出阈值"失去分量，
@@ -1612,7 +1627,7 @@ T_comm 1.84×）→ 绝对数字平台相关、比值平台无关。
   ⚠️ 局限必须写明：仿真通道不产生真实链路争用，"P2P 仍与回填争带宽"在仿真中体现不出，
      仿真结果只作乐观上界；真实争用仅由两个真实锚点支撑。
 
-18.6 Related Work 补三条（与 18.1 的切割一致）
+18.6 Related Work 对位补条（v18 三条 + v22 2610.21500 + v27 EdgeFlow；与 18.1 的切割一致）
   - **BanaServe**（He/Xu/…/Ye，Softw. Pract. Exp. 56(4):424–444, 2026；arXiv 2510.13223）：
     PD 分离下层级权重迁移 + attention 级 KV 迁移 + Global KV Cache Store + 逐层重叠传输；
     明确指出 prefix-cache 路由造成负载偏斜，目标是让路由"不受缓存放置约束"。
@@ -1650,9 +1665,22 @@ T_comm 1.84×）→ 绝对数字平台相关、比值平台无关。
     **可借用的核心洞见**：判断数据移动是否值得，须对照**替代方案的速率**（其原句
     "judge a cache tier against the prefill rate"），而非对照链路延迟 —— 正是 18.9
     盈亏分析的骨架。引用时标注 preprint 与单次运行。
-  对位总表（同一"亲和 vs 均衡"张力的**五**种解法）：
+  - **EdgeFlow**（Zhang/Cao/Wu/Chen/Wang，**ICDCS 2026**，arXiv 2610.22172；全文已读）：
+    CEC 地理分布式边缘、按层 shard 的分布式推理；节点过载/退出时迁 KV。
+    "直接传 KV"与"传 activation 再重算 KV"混合 + 多节点目标选择 + 2-approx，
+    最小化迁移时间；真实 PolyLink（100+ 消费级 GPU）+ 大规模仿真，
+    900 Mbps 下 vs DKV/ACT/EdgeFlow-G 降 35–39% / 20–29% / 25–26%。
+    切割：① 场景 CEC/多节点 shard vs 本文单节点 4×3090 + DP
+    请求分区；② 触发 failover/过载 vs 前缀偏斜 + 持续 decode；③ 网络 100–900 Mbps
+    vs host-staged PCIe 双跳（12–14 GB/s）且与回填共用；④ 搬 KV shard（+activation）
+    vs 搬请求 + 真实 KV 热集（24MB/请求，per-group 去重）；⑤ 成本对象 = 一次性
+    迁移时间 vs 本文"迁移 + 迁移后 refill 外部性"（v23–v26：非局部、路径依赖）；
+    ⑥ 决策 = 目标节点 + 层分割点 vs 逐决策"迁 vs 留在原卡排队"（n* 盈亏刻画）。
+    ⇒ 标题级撞车风险最高，必须显式引用；详见【20】。
+  对位总表（同一"KV 该放哪 / 是否搬"问题簇的**六**种解法）：
     避免迁移（准入侧路由：llm-d / Dynamo / AWS）｜擦除约束（BanaServe）｜
     **准入时拉 KV（llm-d P2P）**｜预算内搬存量（Llumnix / MELL）｜
+    **地理分布式边缘的 KV 分片迁移（EdgeFlow, ICDCS'26；见【20】）**｜
     **保留亲和 + 代价感知窃取存量（本文）**。
 
 18.7 本节作废 / 改写的前文表述
@@ -1793,3 +1821,88 @@ T_comm 1.84×）→ 绝对数字平台相关、比值平台无关。
     的成本形式构成结构性反例（非标定误差）。
   - 这是当前**最强、最可辩护**的一条，也是论文主线候选。
   - 仍缺：真实 trace（换合成 QSA 流）、跨平台（vast PCIe3）、2 卡主平台。
+
+【20. EdgeFlow 对位（v27 新增；ICDCS 2026，arXiv 2610.22172）】
+20.1 出处与一句话
+  - Mingjin Zhang, Jiannong Cao, Tao Wu, Xiangchun Chen, Ne Wang（PolyU / NUDT / WHU），
+    "Efficient KV Cache Migration for Geo-Distributed LLM Inference in Collaborative
+    Edge Computing"，ICDCS 2026；arXiv 2610.22172（2026-10-15）。本轮已读全文。
+  - 一句话：地理分布式协同边缘（CEC）中，LLM 按层切成 shard 放在异构边缘节点；
+    节点过载/退出时，把该 shard 的 KV cache 迁到其他节点。它把"直接传 KV"与
+    "传 activation 再重算 KV"混合，并选目标节点，目标是最小化迁移时间。
+20.2 成本模型（论文 II-B；与我们最相关的部分）
+  - 直接传 KV（逐层）：T_kv = 2·L_seq·H_j·B / B_{k,n}
+  - activation 传输 + 目标节点重算：
+      T_ACT^comm = L_seq·H_j·B / B_{k,n}（= T_kv 的 50%）
+      T_ACT^comp = 2·L_seq·H_j²·B / FLOPS_n
+  - 混合流水：T_{k,n} = max(T_ACT^comp + T_KV, T_ACT^comm)
+    多节点整体：T_MGR = max_{k,n} T_{k,n}
+  - 观察：activation 传输量是 KV 的 50%，但重算受目标节点算力约束；两者可重叠，
+    因此存在"前 p 层用 activation、其余层直接传 KV"的最优分割点。
+  - 关键假设（切割的根）：成本是**一次性迁移动作**的通信时间 + 重算时间；
+    不含迁移后消费侧 refill/冷启动、不含缓存共享被切断的外部性、也不含迁移与
+    decode 回填争用同一通道的代价。
+20.3 机制与算法
+  - 三步骤：采集网络/GPU/显存统计 → scheduler 选目标节点 + 分割点 → 混合迁移。
+  - Theorem 1：固定 act-layers/KV-layers 后，最优流水是先传 activation。
+  - Theorem 2：选哪些层做 activation 等价于选"前 p 层"（只需决定分割点 p）。
+  - MN-KVM：X_{k,n}（源 k 是否迁到目标 n）+ P_k（分割层）；每个源只迁一个目标，
+    目标显存需放下 shard+KV；目标 min T_MGR。P3 是并行机调度变体 ⇒ NP-hard；
+    用 LP 松弛 extreme point + 二分图完美匹配，得 **2-approximation**（Theorem 3）。
+  - Algorithm 1 遍历 P_k（O(N·L_k)）；Algorithm 2 做 2-relaxed decision + 二分搜索。
+20.4 实验（V）
+  - 平台：PolyLink（平台侧 100+ 消费级 GPU；实验用 RTX2080Ti/3060/3090/4090/A6000 Ada
+    五类异构卡，NetBird 组网）；后端 llama-box（llama.cpp），不用 vLLM
+    （论文理由：vLLM 不支持资源自适应切分）。
+  - 模型：Qwen2.5-32B（64 层，H=5120）、Llama3.1-70B（80 层，H=8192），fp16，
+    WikiText-2；batch=32，默认 token length=32；初始 6 节点（Qwen）/10 节点（Llama），
+    需迁移节点比例 Llama 30% / Qwen 50%；带宽 100–900 Mbps（30% 方差）。
+  - 基线：DKV（全量直传 KV）、ACT（全层 activation 重算）、EdgeFlow-G（混合+贪心选目标）、
+    BF（暴力最优上界）。指标：迁移时间（s）。
+  - 主要数字：900 Mbps 下 vs DKV/ACT/EdgeFlow-G：Qwen 39%/20%/25.1%，
+    Llama 35%/29.2%/26%；token=512 时 Llama 40%/18%/26.4%；异构源 41.9–48.2% vs DKV；
+    异构目标 41.1–45.8% vs DKV；大规模仿真 40/50 目标时 BF 仅好 15.6%/15.1%，
+    但 BF 开销 54 min/325 min vs EdgeFlow 2.37 s/3.22 s。
+  - 边界行为：100 Mbps 时 EdgeFlow 趋向 ACT（论文原话）；高带宽端直传占比上升，
+    但论文未称完全退化为 DKV。
+20.5 与 Ferry 的切割（Related Work 用；六条）
+  ① 场景：CEC 地理分布式 / 多节点模型 shard vs 本文单节点多 GPU（4×3090）+ DP 请求分区；
+  ② 触发：节点过载/退出（failover）vs 本文前缀亲和造成的 dest 偏斜 + 持续 decode；
+  ③ 路径：边缘网络 100–900 Mbps vs 本文无 P2P 的 host-staged PCIe 双跳（12–14 GB/s），
+     且与 miss 回填共用同一通道；
+  ④ 搬什么：KV shard（整段）+ 可选 activation vs 本文请求 + 真实 KV 热集
+     （24MB/请求，per-group 去重、只搬 live 槽）；
+  ⑤ 成本对象：一次性迁移时间（通信+重算）vs 本文"迁移动作 + 迁移后消费侧 refill
+     外部性"；v23–v26 已实测后者路径依赖、非局部可加（视野 ~10×、无共享则恒零、
+     规模足够大符号反转），EdgeFlow 的 T_kv/T_ACT 不覆盖这一项；
+  ⑥ 决策粒度：多节点目标 + 层分割点（优化）vs 本文逐决策"迁 vs 留在原卡排队"
+     （成本×收益 / n* 盈亏刻画）。
+  ⇒ 不撞车；但标题级撞车风险最高，必须显式引用与对位。
+20.6 可借用 / 不可借用
+  - 可借用（写作）：
+    · II-B 的"先算清 direct vs recompute 两条路径的代价，再设计混合策略"结构，
+      可直接对应本文"迁移 vs 留在原卡/回填"两条路径 ⇒ 建议在论文加 Cost Analytics 小节；
+    · 真实平台 + 大规模仿真的双轨评测（V-A/V-C），对应本文 4×3090 真实锚点 +
+      X2 虚拟通道仿真；
+    · 基线命名/对照逻辑（DKV/ACT/BF）清晰，可作本文 baseline 表的写法参考。
+  - 不可借用（主张）：
+    · 不能把 T_kv = 2LHB/B 或 2-approx 作为本文贡献：前者是一次性迁移时间，后者是
+      多节点目标选择；本文对象是 decode 存量迁移的逐决策成本，且 v23–v26 已证明
+      成本含非局部 refill 外部性；
+    · 不能与 EdgeFlow 比数字：Mbps 边缘网络 vs PCIe；模型 shard vs DP 请求；
+      迁移时间 vs makespan/字节/尾延迟，形态不可比；
+    · 不能把"activation 重算"当作本文的"搬什么"：本文的 delta/dedup/full 是内容选择，
+      不是同一层的 activation 重算；两者可在 Related Work 并列，但不能合并。
+20.7 写作落点
+  - 18.6 对位总表：五 → 六，新增"地理分布式边缘的 KV 分片迁移（EdgeFlow）"。
+  - 18.1 "不作贡献"清单：追加"一次性迁移时间的加性成本模型"（与 Llumnix/MELL/
+    2610.21500 同属；本文 v23–v26 的路径依赖反例覆盖之）。
+  - 18.9.4 主线：EdgeFlow 的"direct vs recompute"与本文"迁 vs 留在原卡/回填"可并列，
+    但本文 n* = (T0+V/B)/t_step 是 decode 存量场景，不与 EdgeFlow 的迁移时间优化竞争。
+  - 引用状态：ICDCS 2026 已录用（arXiv 2610.22172）；引用标"ICDCS 2026"，不标 preprint。
+20.8 待办
+  - [写作] Related Work 增补 EdgeFlow 一段（按 20.5 六条切割）。
+  - [写作] 18.6 对位总表加第六种解法；18.1 "不作贡献"清单加"一次性迁移时间模型"。
+  - [可选，不新增实验] 若审稿人要求"与 EdgeFlow 比"，以"边缘 Mbps / 多节点 shard /
+    迁移时间" vs "PCIe / DP 请求 / makespan+字节"声明不可比；不做移植。
+  - [可选，阅读] EdgeFlow 的 llama-box / PolyLink 细节与本项目无关，不再展开。
