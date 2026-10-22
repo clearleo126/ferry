@@ -2197,3 +2197,61 @@ T_comm 1.84×）→ 绝对数字平台相关、比值平台无关。
   "只搬独占块"与"合并而非覆盖"两个效应捆在一起改（旧语义的整组覆盖会抹掉消费卡
   上同组其他成员的缓存），**未做 merge-only ablation**；未在真实 trace 与非本地
   带宽下重测。
+
+22.8 v30 异步迁移（L0 分段 → L1 窄锁 → L2 工作线程）：三层都做完了，都没赢
+  实验口径（本小节全部数据）：4×4090、真实 trace `qwen7b_g4_s96_quest.bin`
+  （R=48/S=96/L=28/kv4/d128，hit=0.842）、`--len-dist lognormal(med32,σ0.6)`
+  （实际 p10/p50/p90=13/31/83，截断 3/48）、`--kv-mode delta --prefix-group 4
+  --prefix-steps 8 --cap-mode perreq --steal-batch 4 --steal-precheck 1`，
+  `--vchan-bw B --vchan-t0 0.5 --mig-bw B`（B=1.0 网络受限 / B=0 本地），
+  只跑 C 与 RR（`--modes 2,5`），每档 7 对**交错** A/B。
+
+  L0 分段插桩（`[steal-seg]`）：把一次 steal 拆成 lock/lease/tick/crit/gather/
+  xfer/scatter/net 八段，账目闭合到 100%。定位结论：
+    - 本地带宽（B=0）：tick（等双侧出 tick 的握手）≈25%，net=0，其余为小数；
+    - 网络受限（B=1.0）：net（vchan 注入的虚拟搬运等待）≈52–63%，tick ≈25–33%。
+  ⇒ 低带宽下"迁移的搬运"是最大单项，为 L1/L2 提供动机。
+
+  L1 窄锁 + 按卡传输租约（`--steal-lock-wide 0`，默认）：
+    设计：`steal_lock_` 只覆盖状态临界区，传输按卡 xfer_lock_ 租约并发；
+    pinned 索引表按消费卡隔离（原先靠全局锁串行才安全）。
+    实测（7 对交错，Δ = narrow − wide，负=窄锁更快）：
+      B=0.0  wide 493.6 / narrow 490.7 → Δ中位 **+5.6**（无差异）
+      B=1.0  wide 1067.4 / narrow 1135.6 → Δ中位 **+54.6（更差）**
+    解释：锁内等待和锁外等待**对执行线程都是阻塞**；放开锁只是让两条迁移
+    同时在飞、各自阻塞各自的 exec 线程，总损失不降。分段印证：锁从 124→34ms，
+    但 net 330→420ms、tick 127→185ms 补上来。
+    ⚠️ 顺带修掉一个真 bug：`xfer_lock_` 原先只在 `kv-mode delta` 分支分配，
+    full/drop 下 `xfer_lock_[min(v,g)]` 越界（表现为 std::system_error
+    "Operation not permitted"）。已改为对全部 kv-mode 分配。
+
+  L2 迁移搬出执行线程（`--steal-thread 1`，默认 0）：
+    设计：每卡一个迁移 worker；执行线程"想迁移"时只投递 `post_mig_request(g)`
+    就继续 decode；worker 承担状态临界区 + 传输。配套三处协议改动：
+      (a) `mig_busy_`：只有 worker 完全空闲才投递（否则失衡期间每 tick 投一封，
+          把 victim 的让渡窗口长期占住）；
+      (b) `mig_need_` + `wait_mig_window`：worker 要快照时置位，本卡执行线程在
+          tick 之间**有界让渡**（≤4ms）——`kv_touch` 无锁，快照必须双侧 out-of-tick，
+          内联时 thief 恰在 tick 间隙，异步时必须显式请求这个窗口；
+      (c) `steal_pending_`（victim 让渡）改为"先等本卡出 tick、再通知 victim"，
+          避免 victim 在 worker 等本卡长 tick 的整段时间里每 tick 付 2ms。
+    两版实现的实测（每档 7 对交错，Δ = T1 − T0）：
+      第 1 版（只有 a）：B=1.0 T0 1127.9 / T1 1092.9，Δ中位 **−84.9**
+                        （范围 −144 ~ +217，含 1 个 +217 离群）；B=0.0 **+18.8**
+      第 2 版（a+b+c）：B=1.0 T0 1089.5 / T1 1164.0，Δ中位 **+56.6**
+                        （范围 −163 ~ +192）；B=0.0 **+11.5**
+    分段（第 2 版，B=1.0 中位）：T0 lock 11 / tick 164 / net 382；
+                                  T1 lock 660 / tick 607 / net 348。
+    ⇒ **结论是否定的**：搬运时间确实离开了执行线程（net 382→348），但
+      (1) 快照要等"双侧同时出 tick"，worker 每次多等约一个 tick（tick 164→607）；
+      (2) 等本卡 tick 期间 worker 一直持有 `steal_lock_`，四卡串行化（lock 11→660）；
+      (3) 单位时间完成的迁移变少（migr 356→322MB），纠偏更少。
+    净效应在噪声内，且 B=0 稳定略差（+12~+19ms）。
+    ⇒ 瓶颈不是"谁搬"，而是"决定→握手→生效"的往返延迟。下一刀是 L3
+      （迁移在途状态：thief 不阻塞、不重复决策、不空等握手），而不是继续
+      把搬运挪到别处。L4（pre-copy）只有在 net 仍占主导、且 L3 已去掉握手税
+      之后才有意义。
+
+  备注（口径）：`--vchan-bw` 已把跨卡数据面按 B/T0 计价，但仍是**同一台机器**
+  上的四卡；C/RR 在 B=1.0 时为 2.05（迁移太贵、纠偏太少），在 B=0.0 时为
+  0.92–0.95（Ferry 小胜）。本小节的 A/B 只比较"同一 B 下的两种实现"，不跨 B 比较。

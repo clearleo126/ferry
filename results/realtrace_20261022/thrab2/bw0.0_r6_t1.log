@@ -1,0 +1,8 @@
+[len] dist=lognormal median=32 sigma=0.60 seed=42 | 实际 p10=13 p50=31 p90=83 max=96 | 截断@steps=3 个 (6%) | 总步数 2006
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=imbalanced reqs=48 steps=96 layers=28 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 B_ref=0.0GB/s cost-scale=3.00 mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 cap=perreq steal-delay=0.0ms seed=42 own-carry=0 vchan=0.00GB/s/0.5ms len=lognormal(med32/sig0.60) precheck=1 lock=narrow mthread=1
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  ferry-C   makespan=   523.94ms steps/s=   91.6 p50=  6.211 p99=  25.897 steals=  18(att=   22) migr=  371.8MB( 28 reqs) refill= 130468 seg  4492.97MB imb=0.059 ref=0 live=47584
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  roundrobin-RR makespan=   528.17ms steps/s=   90.9 p50=  6.970 p99=  24.020 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill= 142173 seg  4880.81MB imb=0.000 ref=0 live=0
+  => [steal-cp] precheck: pre-refused=183 att=22 | steal_ms=526.0 (23.91 ms/att, makespan 的 100.4%, 迁移 371.8MB ≈ infms@B_ref) | precheck_ms=0.0
+  => [steal-seg] 占 steal_ms 的份额: lock=171.1(33%) lease=1.9(0%) tick=309.0(59%) crit=16.8(3%) gathr=0.9(0%) xfer=22.8(4%) scttr=1.5(0%) net=0.0(0%) | 和=524.2 (100% of steal_ms)

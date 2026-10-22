@@ -113,6 +113,12 @@ int main(int argc, char** argv) {
   // 临界区、置 steal_pending_ 让 victim 让渡）；1 = 先判"能否成功"，否则
   // 零协调成本返回。默认 0 保证历史结果可复现。
   bool steal_precheck = false;
+  // --steal-lock-wide（v30 L1 ablation）：1 = 旧语义（steal_lock_ 覆盖传输，
+  // 全机迁移串行）；0（默认）= 只覆盖状态临界区，传输按卡租约并发。
+  bool steal_lock_wide = false;
+  // --steal-thread（v30 L2）：1 = 每卡迁移工作线程（执行线程只投递请求，
+  // 迁移与 decode 重叠）；0（默认）= 既有内联语义（迁移阻塞 thief 的执行线程）。
+  bool steal_thread = false;
   int kv_heads = 8, head_dim = 128;
 
   for (int i = 1; i < argc; ++i) {
@@ -181,6 +187,10 @@ int main(int argc, char** argv) {
       len_seed = std::strtoull(next(), nullptr, 10);
     } else if (std::strcmp(argv[i], "--steal-precheck") == 0) {
       steal_precheck = std::atoi(next()) != 0;
+    } else if (std::strcmp(argv[i], "--steal-lock-wide") == 0) {
+      steal_lock_wide = std::atoi(next()) != 0;
+    } else if (std::strcmp(argv[i], "--steal-thread") == 0) {
+      steal_thread = std::atoi(next()) != 0;
     } else if (std::strcmp(argv[i], "--steal-delay") == 0) {
       steal_delay = std::atof(next());
     } else if (std::strcmp(argv[i], "--seed") == 0) {
@@ -302,16 +312,21 @@ int main(int argc, char** argv) {
   spol.margin = mig_margin;
   spol.steal_delay_ms = steal_delay;  // 时机反事实轴（仅 C/E 生效）
   spol.precheck = steal_precheck;     // 控制面前置判定（v30，默认关）
+  spol.lock_wide = steal_lock_wide;   // L1 ablation（默认窄锁）
+  spol.steal_thread = steal_thread;   // L2：迁移搬出执行线程（默认关）
 
   std::printf(
       "[wla-mg] gpus=%s arrival=%s skew=%s reqs=%d steps=%d layers=%d sel=%d "
       "hot=%d attn=%d gap=%.1fms steal-batch=%d B_ref=%.1fGB/s cost-scale=%.2f "
       "mig-margin=%.1f kv-mode=%s rebal=%.0fms/thr%.2f prefix=grp%d/stp%d "
-      "cap=%s steal-delay=%.1fms seed=%llu own-carry=%d vchan=%.2fGB/s/%.1fms\n",
+      "cap=%s steal-delay=%.1fms seed=%llu own-carry=%d vchan=%.2fGB/s/%.1fms "
+      "len=%s(med%d/sig%.2f) precheck=%d lock=%s mthread=%d\n",
       gpu_buf, arrival, skew, reqs, steps, layers, sel, hot, attn, gap,
       steal_batch, b_ref, cost_scale, mig_margin, kvmode_s, rebal_interval,
       rebal_thr, prefix_group, prefix_steps, cap_mode_s, steal_delay, seed,
-      sp.own_carry, vchan_bw, vchan_t0);
+      sp.own_carry, vchan_bw, vchan_t0, len_dist, len_median, len_sigma,
+      (int)steal_precheck, steal_lock_wide ? "wide" : "narrow",
+      (int)steal_thread);
   std::fflush(stdout);
 
   // vchan 参数对全部模式生效（追加在 rebal 参数之后）
@@ -369,12 +384,12 @@ int main(int argc, char** argv) {
         c.migrated_bytes / (b_ref * 1e9) * 1e3, c.precheck_ms);
     // 分段（v30 第0层）：哪一段真在吃时间。% 以 steal_ms 为分母（同一次
     // 采样的内部构成），并给出「各段之和 / steal_ms」看重叠程度。
-    const char* nm[7] = {"lock", "tick", "crit", "gathr",
-                         "xfer", "scttr", "net"};
+    const char* nm[8] = {"lock", "lease", "tick", "crit",
+                         "gathr", "xfer", "scttr", "net"};
     double sum = 0.0;
     for (double v : c.steal_seg) sum += v;
     std::printf("  => [steal-seg] 占 steal_ms 的份额:");
-    for (int i = 0; i < 7; ++i)
+    for (int i = 0; i < 8; ++i)
       std::printf(" %s=%.1f(%.0f%%)", nm[i], c.steal_seg[i],
                   c.steal_ms > 0 ? 100.0 * c.steal_seg[i] / c.steal_ms : 0.0);
     std::printf(" | 和=%.1f (%.0f%% of steal_ms)\n", sum,

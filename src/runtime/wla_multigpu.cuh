@@ -190,8 +190,8 @@ struct WlaMultiStats {
   uint64_t precheck_calls = 0;
   double precheck_ms = 0.0;
   double steal_ms = 0.0;
-  // 分段：{lock, tick, crit, gather, xfer, scatter, net}（见 SegAcc）
-  std::array<double, 7> steal_seg{};
+  // 分段：{lock, lease, tick, crit, gather, xfer, scatter, net}
+  std::array<double, 8> steal_seg{};
 };
 
 // E（mode 3）成本感知窃取策略：与 C 的唯一差异 = 窃取决策。
@@ -220,6 +220,22 @@ struct WlaStealPolicy {
   // 语义差异（须声明）：真实路径在"双方出 tick"之后才判定，等待期间 victim
   // 状态可能变得可偷；前置用当刻快照 ⇒ 会丢掉极少数"等待后才成立"的机会。
   bool precheck = false;
+  // v30 L1 ablation：true = 旧语义（steal_lock_ 持有到传输结束，全机迁移
+  // 串行）。false（默认）= 只持有状态临界区，传输按卡租约并发。
+  bool lock_wide = false;
+  // v30 L2：迁移搬出执行线程。true = 每卡一个迁移工作线程，执行线程只投递
+  // 请求（post_mig_request）后继续 decode；false（默认）= 既有内联语义。
+  // 依据：分段数据显示 lock 缩小后时间只是从 lock 转移到 net/tick —— 因为
+  // 阻塞的是 thief 的执行线程本身，问题不在锁的粒度而在"谁在搬"。
+  // 实测（真实 trace / ln32 / B=1.0 与 0.0 各 7 对交错，见 results/
+  // realtrace_20261022/thrab*）：**没有可复现收益**。B=1.0 两版实现分别为
+  // 配对中位 −85ms 与 +57ms（范围均 ±200ms 量级）；B=0 稳定 +12ms 更差。
+  // 原因：净收益 = 移出执行线程的传输时间 − (1) 快照须等"双侧同时出 tick"
+  // 的窗口（worker 每次多等约一个 tick）(2) victim 让渡税 (3) 单位时间
+  // 完成的迁移次数下降（migr 356→322MB，纠偏更少）。结论：瓶颈不在"谁搬"，
+  // 而在"决定-握手-生效"的往返延迟 ⇒ 下一步应做 L3（在途状态，不阻塞
+  // thief），而不是继续把搬运挪走。
+  bool steal_thread = false;
 };
 
 // 偏移（与 kv_exec.cuh 同布局；独立命名避免头冲突）
@@ -436,13 +452,17 @@ class WlaMultiGpuCtx {
       const size_t stage_bytes = mig_idx_cap_ + (size_t)kMigChunkReqs * seg_;
       mig_stage_v_.assign(n_, nullptr);
       mig_stage_c_.assign(n_, nullptr);
+      h_mig_idx_v_.assign(n_, nullptr);
       for (int g = 0; g < n_; ++g) {
         CUDA_CHECK(cudaSetDevice(devs_[g]));
         CUDA_CHECK(cudaMalloc(&mig_stage_v_[g], stage_bytes));
         CUDA_CHECK(cudaMalloc(&mig_stage_c_[g], stage_bytes));
+        CUDA_CHECK(cudaMallocHost(&h_mig_idx_v_[g], mig_idx_cap_));
       }
-      CUDA_CHECK(cudaMallocHost(&h_mig_idx_, mig_idx_cap_));
     }
+    // v30 L1 修正：按卡传输租约对全部 kv-mode 分配（full/drop 的窃取也要拿
+    // 租约）；原先只在 delta 分支分配 → full/drop 下 xfer_lock_[...] 越界。
+    xfer_lock_ = std::vector<std::mutex>(n_);
     // LRU 镜像（delta/drop 或 C2 前缀亲和需要；索引 = 组 id，组内请求共享
     // 前缀缓存状态。prefix_group=1 时组即请求 → 索引等价既有语义）
     if (kvmode_ != WlaKvMode::Full || sp_.prefix_group > 1) {
@@ -501,8 +521,8 @@ class WlaMultiGpuCtx {
         CUDA_CHECK(cudaSetDevice(devs_[g]));
         cudaFree(mig_stage_v_[g]);
         cudaFree(mig_stage_c_[g]);
+        cudaFreeHost(h_mig_idx_v_[g]);
       }
-      cudaFreeHost(h_mig_idx_);
     }
   }
 
@@ -841,6 +861,17 @@ class WlaMultiGpuCtx {
     std::vector<int> chunk_ns;
     std::vector<std::vector<uint64_t>> naive_offs;
     {
+      // v30 L2：worker 模式下，thief 自己的执行线程也要让出快照窗口
+      // （kv_touch 无锁，快照须双侧 out-of-tick；inline 时 thief 恰在
+      // tick 间隙，异步时须显式请求）。传输不在本作用域 → 不受影响。
+      struct NeedGuard {
+        WlaMultiGpuCtx* c;
+        int g;
+        NeedGuard(WlaMultiGpuCtx* ctx, int gg) : c(ctx), g(gg) {
+          c->set_mig_need(g, true);
+        }
+        ~NeedGuard() { c->set_mig_need(g, false); }
+      } need_guard(this, g);
       const auto t_mtx0 = std::chrono::steady_clock::now();
       std::unique_lock<std::mutex> lk(mtx_);
       if (v < 0) {  // 自选最忙卡（C/E 既有语义）
@@ -856,8 +887,15 @@ class WlaMultiGpuCtx {
       } else {
         if (v == g || local_[v].empty()) return 0;  // 指定源（LLX）
       }
-      // 告诉 victim：有 thief 在等窗口（victim 在 tick_end 后有界让渡）
-      steal_pending_.store(true);
+      // v30 L2：先等本卡（thief）出 tick —— 由 need flag 让执行线程主动让渡，
+      // 期间不惊动 victim（否则 worker 等本卡长时间 tick 的整段时间里，
+      // victim 每个 tick 都付 ≤2ms 让渡税，见 tick=559ms 的实测）。
+      while (in_tick_[g] && completed_.load() < (size_t)R_)
+        cv_.wait_for(lk, std::chrono::microseconds(500));
+      if (in_tick_[g] || completed_.load() >= (size_t)R_) return 0;
+      // 本卡已出 tick → 现在才通知 victim：有 thief 在等窗口
+      //（victim 在 tick_end 后有界让渡）
+      steal_pending_.fetch_add(1);
       // 等双侧出 tick（cv wait 释放 ctx 锁 → 双方可完成 tick 并 notify）：
       //   v = 状态源（下方快照/handoff 读 [v][q]，v 在 tick 内会 kv_touch
       //       插入/逐出同组集合）；g = handoff 写入目标（LLX 由重平衡线程
@@ -865,9 +903,10 @@ class WlaMultiGpuCtx {
       //   C/E：thief 即 g 的执行线程（自身出 tick），g 侧恒直通零成本。
       // 双侧出 tick 后持锁直通快照段（tick_begin 需 mtx_ → 双侧无法再进
       // tick）——F0-a 发现 2（组 LRU 并发修改竞态）的修复。
+      // 等待期间 lk 会释放 ⇒ thief 可能重新进 tick，故仍须同时判双侧
       while ((in_tick_[v] || in_tick_[g]) && completed_.load() < (size_t)R_)
         cv_.wait_for(lk, std::chrono::microseconds(500));
-      steal_pending_.store(false);
+      steal_pending_.fetch_sub(1);
       cv_.notify_all();  // 唤醒让渡中的 victim
       if (in_tick_[v] || in_tick_[g] || completed_.load() >= (size_t)R_)
         return 0;
@@ -1020,6 +1059,23 @@ class WlaMultiGpuCtx {
       }
       seg.crit += ms_since(t_crit0);  // 临界区收尾
     }
+    // v30 L1：状态临界区结束 → 释放全局迁移锁。传输此前被 steal_lock_ 全程
+    // 串行（4 卡一次只能有一条迁移在飞），现在只由"按卡传输租约"约束：
+    //   - staging 缓冲是每卡一块 ⇒ 同一张卡同一时刻只能有一条迁移在搬；
+    //   - 不共享卡的两条迁移（如 0→1 与 2→3）可真正并发。
+    // lock_wide=true 时保留旧语义（ablation 用）。
+    if (!pol.lock_wide) slk.unlock();
+    // 传输租约：按卡索引升序加锁（避免 (v,g) 与 (g,v) 交叉的死锁）
+    std::unique_lock<std::mutex> lease_a(xfer_lock_[std::min(v, g)],
+                                         std::defer_lock);
+    std::unique_lock<std::mutex> lease_b(xfer_lock_[std::max(v, g)],
+                                         std::defer_lock);
+    if (!pol.lock_wide) {
+      const auto t_lease0 = std::chrono::steady_clock::now();
+      lease_a.lock();
+      lease_b.lock();
+      seg.lease += ms_since(t_lease0);
+    }
     // D2D 迁移（victim 段 -> host -> 本卡段）；一批一 sync。
     // kv-mode 分支（见头注释）：
     //   full  = 整段复制（既有语义，数据冻结）
@@ -1043,7 +1099,7 @@ class WlaMultiGpuCtx {
       // + scatter 散射回真实槽位。submit 次数 O(L×live)→每 chunk 1 次。
       char* stg_v = mig_stage_v_[v];
       char* stg_g = mig_stage_c_[g];
-      uint64_t* idx = reinterpret_cast<uint64_t*>(h_mig_idx_);
+      uint64_t* idx = reinterpret_cast<uint64_t*>(h_mig_idx_v_[g]);
       size_t base = 0;
       for (size_t ci = 0; ci < chunk_ns.size(); ++ci) {
         const int ns = chunk_ns[ci];
@@ -1137,12 +1193,15 @@ class WlaMultiGpuCtx {
       seg.xfer += ms_since(t_fin0);
     }
     CUDA_CHECK(cudaSetDevice(devs_[g]));
-    // A1/L1：饱和字节的实测带宽 → B_eff EMA（首测直填，之后 0.7/0.3；
-    // steal_lock_ 串行 → 无并发写）。观测缺失（小 chunk / drop）不更新。
+    // A1/L1：饱和字节的实测带宽 → B_eff EMA（首测直填，之后 0.7/0.3）。
+    // v30 L1：传输可并发 ⇒ 用 CAS 更新（原先依赖 steal_lock_ 串行）
     if (xfer_secs_sat > 0.0) {
       const double inst = xfer_bytes_sat / xfer_secs_sat / 1e9;
-      const double prev = b_eff_gbs_.load();
-      b_eff_gbs_.store(prev > 0.0 ? 0.7 * prev + 0.3 * inst : inst);
+      double prev = b_eff_gbs_.load();
+      for (;;) {
+        const double next = prev > 0.0 ? 0.7 * prev + 0.3 * inst : inst;
+        if (b_eff_gbs_.compare_exchange_weak(prev, next)) break;
+      }
       b_eff_updates_.fetch_add(1);
     }
     // L2：P(t) 观测记账（每 steal 一条）
@@ -1215,11 +1274,11 @@ class WlaMultiGpuCtx {
   uint64_t precheck_calls() const { return precheck_calls_.load(); }
   double precheck_ms() const { return precheck_ms_.load(); }
   double steal_ms() const { return steal_ms_.load(); }
-  // 分段耗时（v30 第0层）：{lock, tick, crit, gather, xfer, scatter, net}
-  std::array<double, 7> steal_segments_ms() const {
-    return {seg_lock_ms_.load(), seg_tick_ms_.load(), seg_crit_ms_.load(),
-            seg_gather_ms_.load(), seg_xfer_ms_.load(),
-            seg_scatter_ms_.load(), seg_net_ms_.load()};
+  // 分段耗时（v30 第0层）：{lock, lease, tick, crit, gather, xfer, scatter, net}
+  std::array<double, 8> steal_segments_ms() const {
+    return {seg_lock_ms_.load(), seg_lease_ms_.load(), seg_tick_ms_.load(),
+            seg_crit_ms_.load(), seg_gather_ms_.load(),
+            seg_xfer_ms_.load(), seg_scatter_ms_.load(), seg_net_ms_.load()};
   }
   uint64_t live_slots() const { return live_slots_.load(); }
   // F0-a 审计遥测（见成员注释；delta=槽位条目，full=请求）
@@ -1270,8 +1329,8 @@ class WlaMultiGpuCtx {
   // 一次 steal 的六个阶段累加器。局部对象在函数返回时由 SegFlush 统一刷到
   // 原子计数器 ⇒ 所有 return 路径都被覆盖，且不引入 6 次原子操作/分支。
   struct SegAcc {
-    double lock = 0, tick = 0, crit = 0, gather = 0, xfer = 0, scatter = 0,
-           net = 0;
+    double lock = 0, lease = 0, tick = 0, crit = 0, gather = 0, xfer = 0,
+           scatter = 0, net = 0;
   };
   struct SegFlush {
     WlaMultiGpuCtx* c;
@@ -1279,6 +1338,7 @@ class WlaMultiGpuCtx {
     SegFlush(WlaMultiGpuCtx* ctx, SegAcc* acc) : c(ctx), s(acc) {}
     ~SegFlush() {
       if (s->lock) add_ms(c->seg_lock_ms_, s->lock);
+      if (s->lease) add_ms(c->seg_lease_ms_, s->lease);
       if (s->tick) add_ms(c->seg_tick_ms_, s->tick);
       if (s->crit) add_ms(c->seg_crit_ms_, s->crit);
       if (s->gather) add_ms(c->seg_gather_ms_, s->gather);
@@ -1287,6 +1347,59 @@ class WlaMultiGpuCtx {
       if (s->net) add_ms(c->seg_net_ms_, s->net);
     }
   };
+
+  // ---- 迁移工作线程投递口（v30 L2，默认关）----
+  // 幂等投递：同一卡重复 post 不产生重复迁移（worker 用 exchange(0) 取走）。
+  // 取走后立即清零 ⇒ exec 线程可在 worker 忙时再投一次（串行两次迁移，
+  // 与内联路径的重复尝试语义一致）。
+  void enable_mig_thread() {
+    mig_req_.reset(new std::atomic<uint8_t>[n_]);
+    mig_busy_.reset(new std::atomic<uint8_t>[n_]);
+    mig_need_.reset(new std::atomic<uint8_t>[n_]);
+    for (int i = 0; i < n_; ++i) {
+      mig_req_[i].store(0);
+      mig_busy_[i].store(0);
+      mig_need_[i].store(0);
+    }
+  }
+  // 执行线程侧：只有"本卡 worker 完全空闲"时才投递 —— 否则失衡期间每个
+  // tick 都会投一封，把 victim 的让渡窗口长期占住（实测该税 > 异步收益）。
+  bool mig_idle(int g) const {
+    return mig_busy_ && mig_busy_[g].load() == 0 && mig_req_[g].load() == 0;
+  }
+  void post_mig_request(int g) {
+    if (mig_req_) mig_req_[g].store(1);
+  }
+  bool take_mig_request(int g) {
+    return mig_req_ && mig_req_[g].exchange(0) != 0;
+  }
+  void set_mig_busy(int g, bool b) {
+    if (mig_busy_) mig_busy_[g].store(b ? 1 : 0);
+  }
+  bool mig_needed(int g) const {
+    return mig_need_ && mig_need_[g].load() != 0;
+  }
+  // 执行线程在 tick 之间调用：本卡 worker 正等一个快照窗口 → 有界让渡。
+  // 只让渡"状态临界区"那几毫秒，传输仍在 worker 上（不阻塞 decode）。
+  void wait_mig_window(int g) {
+    if (!mig_needed(g)) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lk(mtx_);
+    while (mig_need_[g].load() != 0) {
+      cv_.wait_for(lk, std::chrono::microseconds(200));
+      if (ms_since(t0) > 4.0) break;  // 上限：victim 未让渡时下个窗口再试
+    }
+  }
+  // worker 侧：置/清"我需要本卡出 tick"，并在清位时唤醒让渡中的执行线程。
+  void set_mig_need(int g, bool b) {
+    if (!mig_need_) return;
+    mig_need_[g].store(b ? 1 : 0);
+    if (!b) {
+      std::lock_guard<std::mutex> lk(mtx_);
+      cv_.notify_all();
+    }
+  }
+  bool mig_thread_on() const { return mig_req_ != nullptr; }
 
   // ---- 虚拟跨节点链路（v30，默认关；见 WlaVLink 注释）----
   bool vchan_on() const { return vchan_bw_gbs_ > 0.0; }
@@ -1610,8 +1723,14 @@ class WlaMultiGpuCtx {
   std::vector<bool> in_tick_;
   std::vector<size_t> per_gpu_done_;
   std::mutex mtx_, steal_lock_;
+  // v30 L1：按卡传输租约（保护该卡的 staging 缓冲 + 迁移通道）。
+  // steal_lock_ 只在状态临界区持有；传输并发度由这里决定：
+  //   n 卡时最多 floor(n/2) 条迁移同时在飞（不共享卡的对）。
+  std::vector<std::mutex> xfer_lock_;
   std::condition_variable cv_;
-  std::atomic<bool> steal_pending_{false};  // 有 thief 在等窃取窗口
+  // 有 thief 在等窃取窗口的计数（v30 L1：传输并发后可能有多个 thief 同时
+  // 等待；原先的 bool 会被先完成者清零，导致另一个 thief 白等一个 tick）
+  std::atomic<int> steal_pending_{0};
   std::atomic<size_t> next_arrive_{0};
   std::atomic<size_t> completed_{0};
   std::atomic<uint64_t> steals_{0}, migrated_reqs_{0};
@@ -1628,6 +1747,7 @@ class WlaMultiGpuCtx {
   // 分段耗时（v30 第0层）：一次 steal 的六个可归因阶段。多 thief 的等锁
   // 时间会重叠，故各段之和可以 > makespan（占比只作上界读）。
   std::atomic<double> seg_lock_ms_{0.0};     // 等 steal_lock_（全局串行）
+  std::atomic<double> seg_lease_ms_{0.0};    // 等传输租约（按卡，仅同卡对互斥）
   std::atomic<double> seg_tick_ms_{0.0};     // 等 mtx_ + 等双方出 tick（握手）
   std::atomic<double> seg_crit_ms_{0.0};     // 临界区：搬请求/交接镜像/枚举槽
   std::atomic<double> seg_gather_ms_{0.0};   // victim 侧索引 H2D + gather + sync
@@ -1659,7 +1779,9 @@ class WlaMultiGpuCtx {
   // gather 侧 / consumer scatter 侧；steal_lock_ 串行保证互斥复用）
   // + pinned 索引表暂存（chunk 内全部驻留槽的偏移，容量 = 4 请求全满）
   std::vector<char*> mig_stage_v_, mig_stage_c_;
-  char* h_mig_idx_ = nullptr;
+  // v30 L1：pinned 索引表改为每消费卡一块（原先全局一块，靠 steal_lock_
+  // 全程串行来互斥；现在传输可并发，必须按卡隔离）。
+  std::vector<char*> h_mig_idx_v_;
   size_t mig_idx_cap_ = 0;
   size_t rr_counter_ = 0;                  // RR 分发轮转游标（dispatch 线程独占）
   std::atomic<uint64_t> rebal_calls_{0};   // LLX 遥测：重平衡触发次数
@@ -1669,6 +1791,13 @@ class WlaMultiGpuCtx {
   double vchan_bw_gbs_ = 0.0, vchan_t0_ms_ = 0.0;
   std::unique_ptr<WlaVLink[]> vlinks_;
   std::unique_ptr<std::atomic<uint8_t>[]> stolen_;
+  // v30 L2：每卡迁移请求信箱（见 enable_mig_thread）。空 = 迁移仍由执行线程
+  // 内联完成（默认语义）。
+  std::unique_ptr<std::atomic<uint8_t>[]> mig_req_;
+  std::unique_ptr<std::atomic<uint8_t>[]> mig_busy_;  // worker 正在迁移
+  // worker 即将在 [g] 上做状态快照（需要 g 的执行线程短暂出 tick）。
+  // 与 steal_pending_（让 victim 让渡）对称：这是让 thief 自己让渡。
+  std::unique_ptr<std::atomic<uint8_t>[]> mig_need_;
   std::atomic<size_t> vlink_bytes_{0};    // 已计价的跨节点字节
   std::atomic<double> vchan_wait_ms_{0.0};  // 已注入的虚拟等待时间（诊断）
   // 逐卡逐请求逐层 LRU 镜像（与 missstream 生成器同算法同容量 = hot_blocks）
@@ -1756,6 +1885,9 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   WlaMultiGpuCtx ctx(devices, sp, skew, arrival, gap_ms, kvmode, vchan_bw_gbs,
                      vchan_t0_ms);
   ctx.snap_init(mode);
+  // v30 L2：迁移搬出执行线程（--steal-thread 1）。仅在真正会做拉式窃取的
+  // 模式下启用信箱；A/LLX/RR 不使用。
+  if (spol.steal_thread && pull_steal) ctx.enable_mig_thread();
 
   const int n = devices.size();
   WlaMultiStats st;
@@ -1820,6 +1952,28 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   std::vector<std::vector<double>> step_durs(n);
 
   std::vector<std::thread> execs;
+  // v30 L2：每卡一个迁移工作线程。执行线程只在"想迁移"时投递一封请求就返回
+  // decode，实际的状态临界区 + 传输（内联路径里会阻塞 exec 线程的全部阶段）
+  // 由本线程承担。与内联路径的语义差异：迁移在时间上不再严格发生在
+  // "执行完本 tick 之后、下一 tick 之前"，而是与执行重叠 —— 这正是要测的东西。
+  std::atomic<bool> stop_mig{false};
+  std::vector<std::thread> migs;
+  if (ctx.mig_thread_on()) {
+    for (int g = 0; g < n; ++g) {
+      migs.emplace_back([&, g] {
+        CUDA_CHECK(cudaSetDevice(devices[g]));
+        while (!stop_mig.load()) {
+          if (ctx.take_mig_request(g)) {
+            ctx.set_mig_busy(g, true);
+            ctx.steal_migrate(g, steal_k, spol);
+            ctx.set_mig_busy(g, false);
+          } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+          }
+        }
+      });
+    }
+  }
   for (int g = 0; g < n; ++g) {
     execs.emplace_back([&, g] {
       CUDA_CHECK(cudaSetDevice(devices[g]));
@@ -1977,13 +2131,19 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
       int tick_idx = 0;                   // 阶段2：本卡 tick 序号
       while (true) {
         if (ctx.all_done()) break;
+        // v30 L2：本卡 worker 在等状态快照窗口 → 有界让渡（≤4ms）
+        ctx.wait_mig_window(g);
         std::vector<int> resident = ctx.tick_begin(g);
         if (resident.empty()) {
           ctx.tick_end(g, resident, ht.toc_ms() - t0);  // 清 in_tick（空快照）
           // 本地空：B/C/E/D1/D2 拉式窃取（粒度见 steal_k）；A/RR 只等到达；
           // LLX 等重平衡线程迁入（LLX 的迁移是全局调度器驱动的"推"，非执行卡"拉"）
           if (pull_steal) {
-            if (ctx.steal_migrate(g, steal_k, spol) > 0) continue;
+            if (ctx.mig_thread_on()) {
+              if (ctx.mig_idle(g)) ctx.post_mig_request(g);
+            } else if (ctx.steal_migrate(g, steal_k, spol) > 0) {
+              continue;
+            }
           }
           if (!ctx.all_arrived()) {
             ctx.wait_arrival(g);
@@ -2021,7 +2181,10 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                        g, resident.size(),
                        ctx.all_done() ? (size_t)sp.num_requests : (size_t)0,
                        t_tick1);
-        ctx.yield_steal_window();  // 有 thief 在等 → 有界让渡窃取窗口
+        // 有 thief 在等 → 有界让渡窃取窗口。
+        // v30 L2：pending 只在"worker 真的在迁移"期间置位（见 mig_idle），
+        // 不再是"只要失衡就一直置位"，否则 victim 每 tick 都付 ≤2ms 让渡税。
+        ctx.yield_steal_window();
         // C/E/D1/D2：水位 < 公平份额 → tick 间隙窃取（提前纠偏，非等空；粒度
         // 见 steal_k）。三者的触发逻辑完全一致 ⇒ "唯一变量 = 窃取粒度"成立。
         // LLX/RR：执行卡不窃取（重平衡仅由 mode 4 的 rebal 线程驱动）
@@ -2036,7 +2199,13 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
               below_fair_since_ms = now_ms;
             fire = (now_ms - below_fair_since_ms) >= spol.steal_delay_ms;
           }
-          if (fire) ctx.steal_migrate(g, steal_k, spol);
+          if (fire) {
+            if (ctx.mig_thread_on()) {
+              if (ctx.mig_idle(g)) ctx.post_mig_request(g);
+            } else {
+              ctx.steal_migrate(g, steal_k, spol);
+            }
+          }
         } else {
           below_fair_since_ms = -1.0;
         }
@@ -2046,6 +2215,8 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   }
 
   for (auto& t : execs) t.join();
+  stop_mig.store(true);
+  for (auto& t : migs) t.join();
   stop_disp.store(true);
   disp.join();
   if (mode == 4) {
