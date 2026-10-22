@@ -1,4 +1,6 @@
 build/
+# 各 sm_XX 架构的构建目录（build89 = sm_89 原生码，勿入库）
+build*/
 .trae/
 data/*.jsonl
 watch_gpu*.log

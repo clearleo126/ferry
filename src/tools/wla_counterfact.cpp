@@ -252,6 +252,18 @@ SnapFile read_snap(const std::string& path) {
     rd.rd(mg, 4);
     if (std::memcmp(mg, "FTR4", 4) == 0) sf.sp.own_carry = rd.rd_int();
   }
+  // v30 尾部扩展 4：FTR5 + 每请求输出长度（旧快照无此段 → 全等长）
+  if (!rd.eof()) {
+    char mg[4] = {0, 0, 0, 0};
+    rd.rd(mg, 4);
+    if (std::memcmp(mg, "FTR5", 4) == 0) {
+      const int32_t nl = rd.rd_i32();
+      if (nl > 0 && nl <= 1 << 20) {
+        sf.sp.len.resize((size_t)nl);
+        for (int i = 0; i < nl; ++i) sf.sp.len[(size_t)i] = rd.rd_int();
+      }
+    }
+  }
   if (sf.sp.own_carry != 0)
     std::fprintf(stderr,
                  "[warn] 快照为按请求归属 carry（own_carry=1）生成；本工具的 "
@@ -479,7 +491,7 @@ CFResult simulate(const MissSpec& sp, const MissTrace& tr, const SnapDecision& s
     int nv = 0, ng = 0;      // 本 tick 执行请求数
     for (int r : local_v) {
       const int s = next_step[(size_t)r];
-      if (s >= sp.steps) continue;
+      if (s >= wla_len_of(sp, r)) continue;
       alive_v = true; ++nv;
       const int q = wla_grp(sp, r);
       for (int l = 0; l < L; ++l)
@@ -492,7 +504,7 @@ CFResult simulate(const MissSpec& sp, const MissTrace& tr, const SnapDecision& s
     }
     for (int r : local_g) {
       const int s = next_step[(size_t)r];
-      if (s >= sp.steps) continue;
+      if (s >= wla_len_of(sp, r)) continue;
       alive_g = true; ++ng;
       const int q = wla_grp(sp, r);
       for (int l = 0; l < L; ++l)
@@ -684,7 +696,8 @@ int main(int argc, char** argv) {
               need_o((size_t)L);
           auto collect = [&](int req, std::vector<std::unordered_set<uint64_t>>& out) {
             const int s0 = sd.next_step[(size_t)req];
-            const int s1 = h > 0 ? std::min(s0 + h, sp.steps) : sp.steps;
+            const int endl = wla_len_of(sp, req);
+            const int s1 = h > 0 ? std::min(s0 + h, endl) : endl;
             for (int s = s0; s < s1; ++s)
               for (int l = 0; l < L; ++l)
                 for (int k = 0; k < G; ++k)

@@ -64,7 +64,21 @@ struct MissSpec {
 
   // 每 C4 block 字节数：4 token × 2(K/V) × kv_heads × head_dim × 2B(fp16)
   size_t c4_bytes() const { return (size_t)4 * 2 * kv_heads * head_dim * 2; }
+
+  // 输出长度分布（v30）：每请求实际 decode 步数。
+  // 空（默认）= 全部 sp.steps —— 与历史口径逐位等价（长度全等 ⇒ 任何时刻
+  // 剩余工作量按卡均分恒定 ⇒ 分发后不再产生新的失衡）。
+  // 非空时 len.size() == num_requests，且 0 < len[r] <= steps：请求 r 只跑
+  // 前 len[r] 步（trace 事件按原 (r, s) 索引不变，等价于"截断输出"）。
+  // 动机：全等长时 RR 近似 oracle，work stealing 只能纠"亲和分发"造成的
+  // 一次性失衡，因此任何迁移方案在本 benchmark 里都赢不了（见 22.8）。
+  std::vector<int> len;
 };
+
+// 请求 r 的输出长度（步）。空向量 = 历史口径（全体 steps）。
+inline int wla_len_of(const MissSpec& sp, int r) {
+  return sp.len.empty() ? sp.steps : sp.len[(size_t)r];
+}
 
 struct MissEvent {
   int req, layer, step;

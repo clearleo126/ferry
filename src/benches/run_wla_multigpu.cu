@@ -19,6 +19,8 @@
 //                      [--kv-mode full|delta|delta-naive|drop]
 //                      [--rebal-interval 50] [--rebal-thr 0.25]
 //                      [--steal-delay 0]（时机反事实轴：水位窃取去抖延迟，仅 C/E）
+//                      [--vchan-bw 0] [--vchan-t0 0]（v30 两卡虚拟通道：把跨卡
+//                       数据面按 B_net/T0 计价，模拟"两卡分属两节点"; 默认 0=关）
 // 真实 trace（tools/capture_miss_trace.py 产出）：
 //   [--miss-trace <x.bin>] [--layers 28] [--kv-heads 4] [--head-dim 128]
 //   [--sel 64] [--hot 128]，参数必须与 trace 头逐项一致（否则 abort，不退回合成流）
@@ -30,9 +32,12 @@
 // 输出固定含 6 行（A/B/C/E/LLX/RR）+ 汇总 + [C1-结构] 判据行
 // + [WlA-E] 成本感知对照行 + [BASE] 外部基线对照行（LLX/RR vs C 与 vs A）。
 // ⚠️ --gpus 只认逗号（空格静默降级为单卡，见 说明文档 §6 第 2 条）
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -89,7 +94,25 @@ int main(int argc, char** argv) {
   char kvmode_s[32] = "full";
   char cap_mode_s[32] = "group";  // --cap-mode：group（历史）| perreq（v28 §3.3 修正）
   bool own_carry = false;         // --own-carry：按请求归属 carry（只迁独占块）
+  // v30 两卡虚拟通道（默认关）：把跨卡数据面按 --vchan-bw/--vchan-t0 计价，
+  // 模拟"两卡分属两个节点"。关闭时不进入任何新代码路径（历史结果逐位不变）。
+  double vchan_bw = 0.0;   // GB/s（0 = 关闭）
+  double vchan_t0 = 0.0;   // ms（每迁移事件一次建链开销）
   char miss_trace[512] = "";
+  // --modes 2,3,5：只跑指定模式（A/B/C/E/LLX/RR/D1/D2 = 0..7）。
+  // 空（默认）= 跑全部并打印全部汇总行，行为与历史逐字一致。
+  char modes_s[64] = "";
+  // --len-dist（v30）：每请求输出长度分布。equal（默认）= 全体 steps，
+  // 与历史逐位等价；lognormal = 中位 --len-median、σ=--len-sigma，截断到
+  // [1, steps]。动机见 missstream.cuh MissSpec::len 的注释（全等长 ⇒ RR≈oracle）。
+  char len_dist[32] = "equal";
+  int len_median = 32;
+  double len_sigma = 0.6;
+  unsigned long long len_seed = 0;  // 0 = 跟随 --seed
+  // --steal-precheck（v30）：控制面前置判定。0（默认）= 历史语义（每次都进
+  // 临界区、置 steal_pending_ 让 victim 让渡）；1 = 先判"能否成功"，否则
+  // 零协调成本返回。默认 0 保证历史结果可复现。
+  bool steal_precheck = false;
   int kv_heads = 8, head_dim = 128;
 
   for (int i = 1; i < argc; ++i) {
@@ -142,6 +165,22 @@ int main(int argc, char** argv) {
       std::strncpy(cap_mode_s, next(), sizeof(cap_mode_s) - 1);
     } else if (std::strcmp(argv[i], "--own-carry") == 0) {
       own_carry = true;
+    } else if (std::strcmp(argv[i], "--vchan-bw") == 0) {
+      vchan_bw = std::atof(next());
+    } else if (std::strcmp(argv[i], "--vchan-t0") == 0) {
+      vchan_t0 = std::atof(next());
+    } else if (std::strcmp(argv[i], "--modes") == 0) {
+      std::strncpy(modes_s, next(), sizeof(modes_s) - 1);
+    } else if (std::strcmp(argv[i], "--len-dist") == 0) {
+      std::strncpy(len_dist, next(), sizeof(len_dist) - 1);
+    } else if (std::strcmp(argv[i], "--len-median") == 0) {
+      len_median = std::atoi(next());
+    } else if (std::strcmp(argv[i], "--len-sigma") == 0) {
+      len_sigma = std::atof(next());
+    } else if (std::strcmp(argv[i], "--len-seed") == 0) {
+      len_seed = std::strtoull(next(), nullptr, 10);
+    } else if (std::strcmp(argv[i], "--steal-precheck") == 0) {
+      steal_precheck = std::atoi(next()) != 0;
     } else if (std::strcmp(argv[i], "--steal-delay") == 0) {
       steal_delay = std::atof(next());
     } else if (std::strcmp(argv[i], "--seed") == 0) {
@@ -216,55 +255,149 @@ int main(int argc, char** argv) {
   }
   if (miss_trace[0]) setenv("FERRY_MISS_TRACE", miss_trace, 1);
 
+  // 输出长度分布（v30）：equal = 空向量（历史口径，逐位不变）
+  if (std::strcmp(len_dist, "equal") != 0) {
+    if (std::strcmp(len_dist, "lognormal") != 0) {
+      std::fprintf(stderr, "未知 len-dist '%s'（equal|lognormal）\n", len_dist);
+      return 2;
+    }
+    if (len_median < 1 || len_sigma < 0.0) {
+      std::fprintf(stderr, "--len-median 需 >=1，--len-sigma 需 >=0\n");
+      return 2;
+    }
+    // 中止条件：中位数不应超过 steps（否则绝大多数请求被截断，分布失真）
+    if (len_median > steps) {
+      std::fprintf(stderr,
+                   "--len-median=%d > --steps=%d：长度分布会被截断成常数\n",
+                   len_median, steps);
+      return 2;
+    }
+    std::mt19937_64 rng(len_seed ? len_seed : seed);
+    std::lognormal_distribution<double> d(std::log((double)len_median),
+                                          len_sigma);
+    sp.len.resize((size_t)reqs);
+    int clipped = 0;
+    for (int r = 0; r < reqs; ++r) {
+      int v = (int)std::llround(d(rng));
+      if (v < 1) v = 1;
+      if (v > steps) { v = steps; ++clipped; }  // trace 只有 steps 步事件
+      sp.len[(size_t)r] = v;
+    }
+    std::vector<int> srt(sp.len);
+    std::sort(srt.begin(), srt.end());
+    std::printf(
+        "[len] dist=lognormal median=%d sigma=%.2f seed=%llu | 实际 p10=%d "
+        "p50=%d p90=%d max=%d | 截断@steps=%d 个 (%.0f%%) | 总步数 %llu\n",
+        len_median, len_sigma, len_seed ? len_seed : seed,
+        srt[srt.size() / 10], srt[srt.size() / 2], srt[srt.size() * 9 / 10],
+        srt.back(), clipped, 100.0 * clipped / (double)reqs,
+        (unsigned long long)std::accumulate(sp.len.begin(), sp.len.end(), 0LL));
+    std::fflush(stdout);
+  }
+
   AdaptiveBatchPolicy pol;  // min 1MB / max 4MB / target_batches 4（与 WlA 单卡同）
   WlaStealPolicy spol;     // b_ref/cost_scale/margin 仅 E 使用；A/B/C 语义不变
   spol.b_ref_gbs = b_ref;
   spol.cost_scale = cost_scale;
   spol.margin = mig_margin;
   spol.steal_delay_ms = steal_delay;  // 时机反事实轴（仅 C/E 生效）
+  spol.precheck = steal_precheck;     // 控制面前置判定（v30，默认关）
 
   std::printf(
       "[wla-mg] gpus=%s arrival=%s skew=%s reqs=%d steps=%d layers=%d sel=%d "
       "hot=%d attn=%d gap=%.1fms steal-batch=%d B_ref=%.1fGB/s cost-scale=%.2f "
       "mig-margin=%.1f kv-mode=%s rebal=%.0fms/thr%.2f prefix=grp%d/stp%d "
-      "cap=%s steal-delay=%.1fms seed=%llu own-carry=%d\n",
+      "cap=%s steal-delay=%.1fms seed=%llu own-carry=%d vchan=%.2fGB/s/%.1fms\n",
       gpu_buf, arrival, skew, reqs, steps, layers, sel, hot, attn, gap,
       steal_batch, b_ref, cost_scale, mig_margin, kvmode_s, rebal_interval,
       rebal_thr, prefix_group, prefix_steps, cap_mode_s, steal_delay, seed,
-      sp.own_carry);
+      sp.own_carry, vchan_bw, vchan_t0);
   std::fflush(stdout);
 
-  WlaMultiStats a = run_wla_multigpu(devices, sp, 0, pol, spol, skew, arrival,
-                                     gap, steal_batch, attn, kvmode);
-  print_row("static-A", a);
-  WlaMultiStats b = run_wla_multigpu(devices, sp, 1, pol, spol, skew, arrival,
-                                     gap, steal_batch, attn, kvmode);
-  print_row("dyn-B", b);
-  WlaMultiStats c = run_wla_multigpu(devices, sp, 2, pol, spol, skew, arrival,
-                                     gap, steal_batch, attn, kvmode);
-  print_row("ferry-C", c);
-  WlaMultiStats e = run_wla_multigpu(devices, sp, 3, pol, spol, skew, arrival,
-                                     gap, steal_batch, attn, kvmode);
-  print_row("costaware-E", e);
-  // 外部基线（v9）：LLX=Llumnix-style（分发+重平衡），RR=round-robin（仅分发）
-  WlaMultiStats llx = run_wla_multigpu(devices, sp, 4, pol, spol, skew, arrival,
-                                       gap, steal_batch, attn, kvmode,
-                                       rebal_interval, rebal_thr);
-  print_row("llumnix-LLX", llx);
-  WlaMultiStats rr = run_wla_multigpu(devices, sp, 5, pol, spol, skew, arrival,
-                                      gap, steal_batch, attn, kvmode);
-  print_row("roundrobin-RR", rr);
-  // B1 公平对照（WlA 版，--with-b1 开启）：与 C 同引擎同通道同迁移成本，
-  // 唯一变量 = 窃取粒度（D1=1 请求/窃取；D2=victim 一半）。用于把 C/E 相对
-  // 基线的差异拆成"引擎/触发"与"粒度"两段——对齐 WlB B1 的归因口径。
-  WlaMultiStats d1, d2;
-  if (with_b1) {
-    d1 = run_wla_multigpu(devices, sp, 6, pol, spol, skew, arrival, gap,
-                          steal_batch, attn, kvmode);
-    print_row("d1-one", d1);
-    d2 = run_wla_multigpu(devices, sp, 7, pol, spol, skew, arrival, gap,
-                          steal_batch, attn, kvmode);
-    print_row("d2-half", d2);
+  // vchan 参数对全部模式生效（追加在 rebal 参数之后）
+  auto runm = [&](int mode, double ri = 50.0, double rt = 0.25) {
+    return run_wla_multigpu(devices, sp, mode, pol, spol, skew, arrival, gap,
+                            steal_batch, attn, kvmode, ri, rt, vchan_bw,
+                            vchan_t0);
+  };
+
+  // --modes：只跑指定模式子集。默认（空）= 全跑，下面的汇总行逐字不变。
+  // 用途：真实 trace 上 A 模式要 28s（62GB 逐块同步 H2D，且与 vchan 无关），
+  // 大规模重复扫描时跳过它，只留 C/RR 等需要对比的模式。
+  const bool full_run = (modes_s[0] == '\0');
+  std::vector<int> want;
+  if (full_run) {
+    const int nmax = with_b1 ? 8 : 6;
+    for (int m = 0; m < nmax; ++m) want.push_back(m);
+  } else {
+    char mb[64];
+    std::strncpy(mb, modes_s, sizeof(mb) - 1);
+    mb[sizeof(mb) - 1] = '\0';
+    for (char* t = std::strtok(mb, ","); t; t = std::strtok(nullptr, ",")) {
+      const int m = std::atoi(t);
+      if (m < 0 || m > 7) {
+        std::fprintf(stderr, "未知 mode %d（0..7：A/B/C/E/LLX/RR/D1/D2）\n", m);
+        return 2;
+      }
+      want.push_back(m);
+    }
+  }
+  static const char* kModeName[] = {"static-A",  "dyn-B",   "ferry-C",
+                                    "costaware-E", "llumnix-LLX",
+                                    "roundrobin-RR", "d1-one", "d2-half"};
+  WlaMultiStats ms[8];
+  for (int m : want) {
+    ms[m] = (m == 4) ? runm(4, rebal_interval, rebal_thr) : runm(m);
+    print_row(kModeName[m], ms[m]);
+  }
+  WlaMultiStats a = ms[0], b = ms[1], c = ms[2], e = ms[3], llx = ms[4],
+               rr = ms[5], d1 = ms[6], d2 = ms[7];
+
+  // ---- 诊断行 ----
+  // 控制面前置判定（v30）：pre = 前置拒绝（零协调成本），att = 进入临界路径
+  // 的尝试数，steal_ms = 这些尝试累计占用的墙钟（含让渡等待与传输）。
+  auto print_steal_cp = [&] {
+    if (c.precheck_calls == 0 && c.steal_attempts == 0) return;
+    const double per_att = c.steal_attempts ? c.steal_ms / c.steal_attempts : 0.0;
+    std::printf(
+        "  => [steal-cp] precheck: pre-refused=%llu att=%llu | steal_ms=%.1f "
+        "(%.2f ms/att, makespan 的 %.1f%%, 迁移 %.1fMB ≈ %.1fms@B_ref) | "
+        "precheck_ms=%.1f\n",
+        (unsigned long long)c.steal_pre_refused,
+        (unsigned long long)c.steal_attempts, c.steal_ms, per_att,
+        100.0 * c.steal_ms / c.makespan_ms, c.migrated_bytes / 1048576.0,
+        c.migrated_bytes / (b_ref * 1e9) * 1e3, c.precheck_ms);
+    // 分段（v30 第0层）：哪一段真在吃时间。% 以 steal_ms 为分母（同一次
+    // 采样的内部构成），并给出「各段之和 / steal_ms」看重叠程度。
+    const char* nm[7] = {"lock", "tick", "crit", "gathr",
+                         "xfer", "scttr", "net"};
+    double sum = 0.0;
+    for (double v : c.steal_seg) sum += v;
+    std::printf("  => [steal-seg] 占 steal_ms 的份额:");
+    for (int i = 0; i < 7; ++i)
+      std::printf(" %s=%.1f(%.0f%%)", nm[i], c.steal_seg[i],
+                  c.steal_ms > 0 ? 100.0 * c.steal_seg[i] / c.steal_ms : 0.0);
+    std::printf(" | 和=%.1f (%.0f%% of steal_ms)\n", sum,
+                c.steal_ms > 0 ? 100.0 * sum / c.steal_ms : 0.0);
+  };
+  // vchan 诊断（--vchan-bw>0 才有）：注入的虚拟网络等待 = makespan 的可归因
+  // 部分。A 恒 0（无迁移 ⇒ 无跨节点字节）。
+  auto print_vchan = [&] {
+    if (vchan_bw <= 0.0) return;
+    std::printf(
+        "  => [vchan] B=%.2fGB/s T0=%.1fms | 注入等待: A=%.1f B=%.1f C=%.1f "
+        "E=%.1f LLX=%.1f RR=%.1f ms | 计价字节: C=%.2f E=%.2f LLX=%.2f "
+        "RR=%.2f MB\n",
+        vchan_bw, vchan_t0, a.vchan_wait_ms, b.vchan_wait_ms, c.vchan_wait_ms,
+        e.vchan_wait_ms, llx.vchan_wait_ms, rr.vchan_wait_ms,
+        c.vchan_bytes / 1048576.0, e.vchan_bytes / 1048576.0,
+        llx.vchan_bytes / 1048576.0, rr.vchan_bytes / 1048576.0);
+  };
+  if (!full_run) {  // 子集跑：只回显已跑模式的行 + 诊断行
+    print_steal_cp();
+    print_vchan();
+    std::fflush(stdout);
+    return 0;
   }
 
   std::printf("  => C/A %.2fx  C/B %.2fx  E/A %.2fx\n",
@@ -395,6 +528,9 @@ int main(int argc, char** argv) {
       (unsigned long long)e.b_eff_updates, b_ref, cost_scale, c.p_t_mean_mb,
       c.p_t_max_mb, e.p_t_mean_mb, e.p_t_max_mb,
       (unsigned long long)c.b_eff_updates, (unsigned long long)e.b_eff_updates);
+  // vchan 诊断（定义见上；全跑分支在此收尾）
+  print_steal_cp();
+  print_vchan();
   std::fflush(stdout);
   return 0;
 }

@@ -1,0 +1,4 @@
+[len] dist=lognormal median=32 sigma=0.60 seed=42 | 实际 p10=13 p50=31 p90=83 max=96 | 截断@steps=3 个 (6%) | 总步数 2006
+[wla-mg] gpus=1,2 arrival=steady skew=imbalanced reqs=48 steps=96 layers=28 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 B_ref=16.6GB/s cost-scale=3.00 mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 cap=perreq steal-delay=0.0ms seed=42 own-carry=0 vchan=0.00GB/s/0.0ms
+  ferry-C   makespan=   869.79ms steps/s=   55.2 p50= 12.079 p99=  50.365 steals=   7(att=   57) migr=  133.1MB( 12 reqs) refill= 126616 seg  4366.53MB imb=0.000 ref=0 live=17040
+  roundrobin-RR makespan=   884.82ms steps/s=   54.2 p50= 11.592 p99=  40.038 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill= 128993 seg  4439.78MB imb=0.000 ref=0 live=0

@@ -1,0 +1,5 @@
+[len] dist=lognormal median=32 sigma=0.60 seed=42 | 实际 p10=13 p50=31 p90=83 max=96 | 截断@steps=3 个 (6%) | 总步数 2006
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=imbalanced reqs=48 steps=96 layers=28 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 B_ref=16.6GB/s cost-scale=3.00 mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 cap=perreq steal-delay=0.0ms seed=42 own-carry=0 vchan=0.00GB/s/0.0ms
+  ferry-C   makespan=   497.55ms steps/s=   96.5 p50=  6.551 p99=  22.376 steals=  21(att=   24) migr=  398.2MB( 29 reqs) refill= 129060 seg  4450.91MB imb=0.312 ref=0 live=50968
+  => [steal-cp] precheck: pre-refused=186 att=24 | steal_ms=186.8 (7.78 ms/att, makespan 的 37.5%, 迁移 398.2MB ≈ 25.2ms@B_ref) | precheck_ms=0.0
+  => [steal-seg] 占 steal_ms 的份额: lock=37.6(20%) tick=110.2(59%) crit=13.1(7%) gathr=0.8(0%) xfer=23.7(13%) scttr=1.1(1%) net=0.0(0%) | 和=186.5 (100% of steal_ms)

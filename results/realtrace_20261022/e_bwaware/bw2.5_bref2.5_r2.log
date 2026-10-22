@@ -1,0 +1,6 @@
+[len] dist=lognormal median=32 sigma=0.60 seed=42 | 实际 p10=13 p50=31 p90=83 max=96 | 截断@steps=3 个 (6%) | 总步数 2006
+[wla-mg] gpus=1,2 arrival=steady skew=imbalanced reqs=48 steps=96 layers=28 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 B_ref=2.5GB/s cost-scale=3.00 mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 cap=perreq steal-delay=0.0ms seed=42 own-carry=0 vchan=2.50GB/s/0.5ms
+  ferry-C   makespan=  1236.04ms steps/s=   38.8 p50= 14.271 p99=  83.538 steals=  11(att=   69) migr=  223.5MB( 16 reqs) refill= 125214 seg  4327.22MB imb=0.083 ref=0 live=28612
+  costaware-E makespan=  1037.33ms steps/s=   46.3 p50= 12.046 p99=  50.277 steals=   3(att=   92) migr=   37.0MB(  6 reqs) refill= 121652 seg  4197.53MB imb=0.083 ref=65 live=4732
+  roundrobin-RR makespan=   872.78ms steps/s=   55.0 p50= 11.793 p99=  51.625 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill= 129144 seg  4445.19MB imb=0.000 ref=0 live=0
+  => [vchan] B=2.50GB/s T0=0.5ms | 注入等待: A=0.0 B=0.0 C=636.7 E=266.2 LLX=0.0 RR=0.0 ms | 计价字节: C=1504.94 E=631.00 LLX=0.00 RR=0.00 MB
