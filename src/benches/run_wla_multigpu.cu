@@ -87,6 +87,8 @@ int main(int argc, char** argv) {
   double rebal_interval = 50.0, rebal_thr = 0.25, steal_delay = 0.0;
   char arrival[32] = "steady", skew[32] = "imbalanced";
   char kvmode_s[32] = "full";
+  char cap_mode_s[32] = "group";  // --cap-mode：group（历史）| perreq（v28 §3.3 修正）
+  bool own_carry = false;         // --own-carry：按请求归属 carry（只迁独占块）
   char miss_trace[512] = "";
   int kv_heads = 8, head_dim = 128;
 
@@ -136,6 +138,10 @@ int main(int argc, char** argv) {
       prefix_group = std::atoi(next());
     } else if (std::strcmp(argv[i], "--prefix-steps") == 0) {
       prefix_steps = std::atoi(next());
+    } else if (std::strcmp(argv[i], "--cap-mode") == 0) {
+      std::strncpy(cap_mode_s, next(), sizeof(cap_mode_s) - 1);
+    } else if (std::strcmp(argv[i], "--own-carry") == 0) {
+      own_carry = true;
     } else if (std::strcmp(argv[i], "--steal-delay") == 0) {
       steal_delay = std::atof(next());
     } else if (std::strcmp(argv[i], "--seed") == 0) {
@@ -186,6 +192,28 @@ int main(int argc, char** argv) {
   sp.seed = seed;
   sp.prefix_group = prefix_group;
   sp.prefix_steps = prefix_steps;
+  // 组缓存容量口径：group（历史默认，每组每层容量恒为 hot_blocks）|
+  // perreq（每请求一份容量预算，容量 = hot_blocks × 该卡该组常驻成员数）
+  if (std::strcmp(cap_mode_s, "group") == 0)
+    sp.cap_mode = 0;
+  else if (std::strcmp(cap_mode_s, "perreq") == 0)
+    sp.cap_mode = 1;
+  else {
+    std::fprintf(stderr, "未知 cap-mode '%s'（group|perreq）\n", cap_mode_s);
+    return 2;
+  }
+  // 迁移单位口径：own=按请求归属 carry（只迁独占块）；缺省 = 整组 carry
+  sp.own_carry = own_carry ? 1 : 0;
+  if (sp.own_carry && kvmode != ferry::WlaKvMode::Delta &&
+      kvmode != ferry::WlaKvMode::DeltaNaive) {
+    std::fprintf(stderr, "--own-carry 仅对 delta/delta-naive 生效（当前 %s）\n",
+                 kvmode_s);
+    return 2;
+  }
+  if (sp.own_carry && prefix_group > 32) {
+    std::fprintf(stderr, "--own-carry 需 prefix-group <= 32（归属掩码为 uint32）\n");
+    return 2;
+  }
   if (miss_trace[0]) setenv("FERRY_MISS_TRACE", miss_trace, 1);
 
   AdaptiveBatchPolicy pol;  // min 1MB / max 4MB / target_batches 4（与 WlA 单卡同）
@@ -199,10 +227,11 @@ int main(int argc, char** argv) {
       "[wla-mg] gpus=%s arrival=%s skew=%s reqs=%d steps=%d layers=%d sel=%d "
       "hot=%d attn=%d gap=%.1fms steal-batch=%d B_ref=%.1fGB/s cost-scale=%.2f "
       "mig-margin=%.1f kv-mode=%s rebal=%.0fms/thr%.2f prefix=grp%d/stp%d "
-      "steal-delay=%.1fms seed=%llu\n",
+      "cap=%s steal-delay=%.1fms seed=%llu own-carry=%d\n",
       gpu_buf, arrival, skew, reqs, steps, layers, sel, hot, attn, gap,
       steal_batch, b_ref, cost_scale, mig_margin, kvmode_s, rebal_interval,
-      rebal_thr, prefix_group, prefix_steps, steal_delay, seed);
+      rebal_thr, prefix_group, prefix_steps, cap_mode_s, steal_delay, seed,
+      sp.own_carry);
   std::fflush(stdout);
 
   WlaMultiStats a = run_wla_multigpu(devices, sp, 0, pol, spol, skew, arrival,

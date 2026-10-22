@@ -4,10 +4,14 @@
 // 用确定性 miss trace 精确计算字节，用逐 tick 线性模型预测时间。
 //
 // 编译：CMake target wla_counterfact
-// 用法：./wla_counterfact <snap_file.m3> [--horizon N] [--closure]
+// 用法：./wla_counterfact <snap_file.m3> [--horizon N] [--closure] [--ownership]
 //   --horizon N: 只模拟 N 个 tick（默认 = 推到全部完成）
 //   --closure: 迁移单位实验（a0/partial/partial_same/close_expand/close_full），
 //              输出独立 CSV（见下方列名）
+//   --ownership: 块归属实验（独占/共享/死块三分），判定"按请求归属 carry"
+//              能省多少传输、共享块在目的侧的回填代价多大；输出独立 CSV
+//   跨节点代价注入（不改字节口径，只改计价）：
+//   --node-map 0,1  --net-bw <GB/s>  --net-t0 <ms>  [--full-history]
 //
 // 输出 CSV（stdout）：
 //   dec_id,action,req,mode,V_transfer_MB,
@@ -68,6 +72,9 @@ inline void wla_recompute_stats(MissTrace& tr, const MissSpec& sp) {
   tr.miss_bytes = 0;
   for (int r = 0; r < R; ++r) {
     const int grp = wla_grp(sp, r);
+    // 理想基线 = 同组全部成员在同一张卡 ⇒ members = 该组实际成员数
+    const int cap = wla_group_cap(sp, std::min(sp.prefix_group,
+                                               R - grp * sp.prefix_group));
     for (int s = 0; s < sp.steps; ++s) {
       const size_t base = ((size_t)r * sp.steps + s) * L * G;
       for (int l = 0; l < L; ++l) {
@@ -83,7 +90,7 @@ inline void wla_recompute_stats(MissTrace& tr, const MissSpec& sp) {
           } else {
             ++tr.total_misses;
             tr.miss_bytes += sp.c4_bytes();
-            if ((int)d.size() >= sp.hot_blocks) {
+            while ((int)d.size() >= cap) {
               sset.erase(d.front());
               d.pop_front();
             }
@@ -233,6 +240,22 @@ SnapFile read_snap(const std::string& path) {
     rd.rd(mg, 4);
     if (std::memcmp(mg, "FTR2", 4) == 0) sf.sp.slab_blocks = rd.rd_int();
   }
+  // v28 尾部扩展 2：FTR3 + cap_mode（旧快照无此段 → cap_mode 保持默认 0）
+  if (!rd.eof()) {
+    char mg[4] = {0, 0, 0, 0};
+    rd.rd(mg, 4);
+    if (std::memcmp(mg, "FTR3", 4) == 0) sf.sp.cap_mode = rd.rd_int();
+  }
+  // v29 尾部扩展 3：FTR4 + own_carry（旧快照无此段 → 0 = 整组 carry）
+  if (!rd.eof()) {
+    char mg[4] = {0, 0, 0, 0};
+    rd.rd(mg, 4);
+    if (std::memcmp(mg, "FTR4", 4) == 0) sf.sp.own_carry = rd.rd_int();
+  }
+  if (sf.sp.own_carry != 0)
+    std::fprintf(stderr,
+                 "[warn] 快照为按请求归属 carry（own_carry=1）生成；本工具的 "
+                 "simulate 不重放逐块归属 ⇒ 决策回放口径不一致，只可作定性参考\n");
   return sf;
 }
 
@@ -332,17 +355,20 @@ TimeModels fit_time_models(const std::vector<SnapTick>& ticks, int ngpu) {
 struct LRUState {
   std::deque<uint64_t> dq;
   std::unordered_set<uint64_t> st;
-  bool touch(uint64_t blk, int hot_blocks) {
+  bool touch(uint64_t blk, int cap) {
     bool hit = st.count(blk) > 0;
     if (hit) {
       for (auto it = dq.begin(); it != dq.end(); ++it)
         if (*it == blk) { dq.erase(it); break; }
       dq.push_back(blk);
     } else {
-      if ((int)dq.size() >= hot_blocks) { st.erase(dq.front()); dq.pop_front(); }
+      while ((int)dq.size() >= cap) { st.erase(dq.front()); dq.pop_front(); }
       dq.push_back(blk); st.insert(blk);
     }
     return hit;
+  }
+  void trim(int cap) {
+    while ((int)dq.size() > cap) { st.erase(dq.front()); dq.pop_front(); }
   }
   void assign(const std::deque<uint64_t>& src) {
     dq = src; st.clear();
@@ -360,14 +386,32 @@ struct CFResult {
   size_t refill_v_bytes = 0;
   size_t refill_g_bytes = 0;
   size_t transfer_bytes = 0;
+  size_t refill_g_remote_bytes = 0;  // 跨节点迁移后，目的卡上"远端回填"的字节
   double tv_ms = 0, tg_ms = 0;
+};
+
+// 多节点代价注入（本机模拟器用）：不改字节口径，只改计价。
+//   hot-set 模式（默认）：只搬热集，目的节点没有该请求的完整 KV → 迁入请求
+//     之后的所有 miss 都从远端节点回填（+ 网络时间）。
+//   full-history 模式：整段历史随迁（回填恢复本地），迁移字节 = 每请求
+//     完整历史（slab 容量）× c4。
+struct NodeCfg {
+  bool enabled = false;
+  std::vector<int> node_of;    // ctx 卡索引 -> 节点 id（如 0,0,1,1）
+  double net_bw_gbs = 2.5;     // 跨节点链路带宽（25GbE ≈ 2.5 GB/s）
+  double net_t0_ms = 0.5;      // 跨节点固定开销（TCP 建链/握手）
+  bool full_history = false;
+  int node(int g) const {
+    return (g >= 0 && g < (int)node_of.size()) ? node_of[(size_t)g] : 0;
+  }
+  bool cross(int v, int g) const { return enabled && node(v) != node(g); }
 };
 
 // 模拟：从快照出发，把 moved 里的请求从 v 移到 g（carry/drop），
 // 按 tick 同步推进到完成或 horizon；同时累加两卡的预测耗时。
 CFResult simulate(const MissSpec& sp, const MissTrace& tr, const SnapDecision& sd,
                   const std::vector<int>& moved, bool carry, const TimeModels& tm,
-                  int horizon) {
+                  int horizon, const NodeCfg& nc = NodeCfg{}) {
   const int L = sp.num_layers, G = sp.sel_blocks;
   const size_t c4 = sp.c4_bytes();
   const int ngrp = sp.prefix_group > 1
@@ -410,12 +454,28 @@ CFResult simulate(const MissSpec& sp, const MissTrace& tr, const SnapDecision& s
     }
   }
 
+  // cap_mode=1：容量 = hot_blocks × 该卡该组常驻成员数（与运行时 kv_cap 同口径）
+  std::vector<int> mem_v((size_t)ngrp, 0), mem_g((size_t)ngrp, 0);
+  for (int r : local_v) ++mem_v[(size_t)wla_grp(sp, r)];
+  for (int r : local_g) ++mem_g[(size_t)wla_grp(sp, r)];
+  auto cap_v = [&](int q) { return wla_group_cap(sp, mem_v[(size_t)q]); };
+  auto cap_g = [&](int q) { return wla_group_cap(sp, mem_g[(size_t)q]); };
+  // 成员迁出 → victim 侧容量收缩，按运行时 grp_trim 同语义裁剪
+  if (sp.cap_mode == 1) {
+    for (int q = 0; q < ngrp; ++q)
+      for (int l = 0; l < L; ++l) lru[0][(size_t)q][(size_t)l].trim(cap_v(q));
+  }
+
   double tv = 0, tg = 0;
+  // 多节点：迁入请求在目的卡上的回填 = 远端回填（hot-set 模式）
+  const bool xnode = nc.cross(v, g);
+  std::unordered_set<int> moved_set(moved.begin(), moved.end());
   int tick = 0;
   while (true) {
     if (horizon > 0 && tick >= horizon) break;
     bool alive_v = false, alive_g = false;
     size_t rv = 0, rg = 0;   // 本 tick 回填字节
+    size_t rg_moved = 0;     // 其中来自迁入请求的部分（跨节点时走远端）
     int nv = 0, ng = 0;      // 本 tick 执行请求数
     for (int r : local_v) {
       const int s = next_step[(size_t)r];
@@ -425,7 +485,7 @@ CFResult simulate(const MissSpec& sp, const MissTrace& tr, const SnapDecision& s
       for (int l = 0; l < L; ++l)
         for (int k = 0; k < G; ++k) {
           const MissEvent& e = get_event(tr, sp, r, s, l, k);
-          if (!lru[0][(size_t)q][(size_t)l].touch(e.block_id, sp.hot_blocks))
+          if (!lru[0][(size_t)q][(size_t)l].touch(e.block_id, cap_v(q)))
             rv += c4;
         }
       next_step[(size_t)r] = s + 1;
@@ -438,14 +498,17 @@ CFResult simulate(const MissSpec& sp, const MissTrace& tr, const SnapDecision& s
       for (int l = 0; l < L; ++l)
         for (int k = 0; k < G; ++k) {
           const MissEvent& e = get_event(tr, sp, r, s, l, k);
-          if (!lru[1][(size_t)q][(size_t)l].touch(e.block_id, sp.hot_blocks))
+          if (!lru[1][(size_t)q][(size_t)l].touch(e.block_id, cap_g(q))) {
             rg += c4;
+            if (!moved_set.empty() && moved_set.count(r)) rg_moved += c4;
+          }
         }
       next_step[(size_t)r] = s + 1;
     }
     if (!alive_v && !alive_g) break;
     res.refill_v_bytes += rv;
     res.refill_g_bytes += rg;
+    if (xnode && !nc.full_history) res.refill_g_remote_bytes += rg_moved;
     if (tm.valid()) {
       if (alive_v) tv += mv.predict(nv, (double)rv / 1048576.0);
       if (alive_g) tg += mg.predict(ng, (double)rg / 1048576.0);
@@ -453,9 +516,28 @@ CFResult simulate(const MissSpec& sp, const MissTrace& tr, const SnapDecision& s
     ++tick;
   }
   res.tv_ms = tv;
-  // 迁移传输时间计入目的卡（按在位带宽；回退 13 GB/s）
-  const double bw = sd.b_eff_gbs > 1.0 ? sd.b_eff_gbs : 13.0;
-  res.tg_ms = tg + (double)res.transfer_bytes / (bw * 1e9) * 1e3;
+  // full-history：整段历史随迁 → 迁移字节按 slab 容量计，回填恢复本地
+  if (xnode && nc.full_history) {
+    const uint64_t hist_blocks =
+        sp.slab_blocks > 0 ? (uint64_t)sp.slab_blocks
+                           : 64 + (uint64_t)sp.steps * 8;
+    // slab 容量是每 (请求, 层) 的 ⇒ 完整历史 = L × hist_blocks × c4
+    res.transfer_bytes = moved.size() * (size_t)sp.num_layers *
+                         (size_t)hist_blocks * c4;
+    res.refill_g_remote_bytes = 0;
+  }
+  double xfer_ms;
+  if (xnode) {
+    xfer_ms = (double)res.transfer_bytes / (nc.net_bw_gbs * 1e9) * 1e3 +
+              nc.net_t0_ms;
+  } else {
+    const double bw = sd.b_eff_gbs > 1.0 ? sd.b_eff_gbs : 13.0;
+    xfer_ms = (double)res.transfer_bytes / (bw * 1e9) * 1e3;
+  }
+  // 远端回填附加时间 = 字节 / 网络带宽（本地写入成本已含在拟合的 b 里）
+  const double remote_refill_ms =
+      (double)res.refill_g_remote_bytes / (nc.net_bw_gbs * 1e9) * 1e3;
+  res.tg_ms = tg + xfer_ms + remote_refill_ms;
   return res;
 }
 
@@ -468,6 +550,8 @@ int main(int argc, char** argv) {
   int horizon = 0;
   bool dump_ticks = false;
   bool closure_mode = false;
+  bool ownership_mode = false;
+  NodeCfg nc;
   for (int i = 2; i < argc; ++i) {
     if (std::strcmp(argv[i], "--horizon") == 0 && i + 1 < argc)
       horizon = std::atoi(argv[++i]);
@@ -475,6 +559,34 @@ int main(int argc, char** argv) {
       dump_ticks = true;
     else if (std::strcmp(argv[i], "--closure") == 0)
       closure_mode = true;
+    else if (std::strcmp(argv[i], "--ownership") == 0)
+      ownership_mode = true;
+    else if (std::strcmp(argv[i], "--node-map") == 0 && i + 1 < argc) {
+      // 形如 "0,0,1,1"：ctx 卡索引 -> 节点 id（本项目两卡模拟 = "0,1"）
+      nc.enabled = true;
+      const char* s = argv[++i];
+      nc.node_of.clear();
+      while (*s) {
+        nc.node_of.push_back(std::atoi(s));
+        while (*s && *s != ',') ++s;
+        if (*s == ',') ++s;
+      }
+    } else if (std::strcmp(argv[i], "--net-bw") == 0 && i + 1 < argc) {
+      nc.net_bw_gbs = std::atof(argv[++i]);
+    } else if (std::strcmp(argv[i], "--net-t0") == 0 && i + 1 < argc) {
+      nc.net_t0_ms = std::atof(argv[++i]);
+    } else if (std::strcmp(argv[i], "--full-history") == 0) {
+      nc.full_history = true;
+    }
+  }
+  if (nc.enabled) {
+    std::fprintf(stderr, "[node] map=");
+    for (size_t i = 0; i < nc.node_of.size(); ++i)
+      std::fprintf(stderr, "%s%d", i ? "," : "", nc.node_of[i]);
+    std::fprintf(stderr,
+                 " B_net=%.2f GB/s T0=%.2f ms mode=%s\n", nc.net_bw_gbs,
+                 nc.net_t0_ms, nc.full_history ? "full-history"
+                                               : "hot-set+remote-refill");
   }
 
   SnapFile sf = read_snap(path);
@@ -532,6 +644,91 @@ int main(int argc, char** argv) {
 
   const double MB = 1048576.0;
 
+  // ---- 归属实验（--ownership）：拆开"整组 carry"里到底搬了谁的块 ----
+  // 目的：判定"按请求归属 carry（只搬独占块 + 共享块交接引用）"能省多少、
+  // 以及共享块在目的侧的回填代价有多大。纯离线、零决策影响。
+  //
+  // 对每个决策点的每个候选请求 r（组 q）、每个前瞻视野 h：
+  //   把 victim 侧 lru[v][q][l] 的每个常驻块按"未来 h 步内谁会选中"分类——
+  //     excl   = 只有 r 会选中        → 选项 A 需要搬
+  //     shared = 还有 v 上同组其他常驻成员会选中 → 留在 v（A 不搬）
+  //       其中 shared_need_r = r 也要选中 → r 在目的侧必须回填（A 的代价）
+  //     dead   = 未来 h 步内无人选中  → 当前 carry 的纯浪费
+  //   V_group = 三类之和 = 今天"整组 carry"的实际传输量。
+  // ⚠️ 只看 victim 侧常驻成员：组在别的卡上的成员不影响 v 的容量释放。
+  if (ownership_mode) {
+    std::printf("dec_id,v,g,req,h,n_blocks,V_group_MB,V_excl_MB,V_shared_MB,"
+                "V_dead_MB,V_shared_need_r_MB,excl_pct,dead_pct,"
+                "remote_refill_ms,saved_xfer_MB\n");
+    const int L = sp.num_layers, G = sp.sel_blocks;
+    const size_t c4 = sp.c4_bytes();
+    const std::vector<int> hs = {1, 2, 4, 8, 0};  // 0 = 到完成（全程）
+    for (size_t di = 0; di < sf.decs.size(); ++di) {
+      const auto& sd = sf.decs[di];
+      // (q,l) -> victim 侧 LRU deque
+      std::unordered_map<long long, const std::deque<uint64_t>*> lruv;
+      for (const auto& sl : sd.lru_snap)
+        if (sl.g == sd.v)
+          lruv[(long long)sl.q * 1024 + sl.l] = &sl.dq;
+
+      for (int r : sd.local_v) {
+        const int q = wla_grp(sp, r);
+        // v 上同组的其他常驻成员
+        std::vector<int> peers;
+        for (int r2 : sd.local_v)
+          if (r2 != r && wla_grp(sp, r2) == q) peers.push_back(r2);
+
+        for (int h : hs) {
+          // 未来需求集合（逐层）：r 自己 / v 上同组其他成员
+          std::vector<std::unordered_set<uint64_t>> need_r((size_t)L),
+              need_o((size_t)L);
+          auto collect = [&](int req, std::vector<std::unordered_set<uint64_t>>& out) {
+            const int s0 = sd.next_step[(size_t)req];
+            const int s1 = h > 0 ? std::min(s0 + h, sp.steps) : sp.steps;
+            for (int s = s0; s < s1; ++s)
+              for (int l = 0; l < L; ++l)
+                for (int k = 0; k < G; ++k)
+                  out[(size_t)l].insert(get_event(tr, sp, req, s, l, k).block_id);
+          };
+          collect(r, need_r);
+          for (int p : peers) collect(p, need_o);
+
+          size_t nb = 0, n_excl = 0, n_shared = 0, n_dead = 0, n_sh_r = 0;
+          for (int l = 0; l < L; ++l) {
+            auto it = lruv.find((long long)q * 1024 + l);
+            if (it == lruv.end()) continue;
+            for (uint64_t blk : *it->second) {
+              ++nb;
+              const bool byr = need_r[(size_t)l].count(blk) > 0;
+              const bool byo = need_o[(size_t)l].count(blk) > 0;
+              if (byo) {
+                ++n_shared;
+                if (byr) ++n_sh_r;
+              } else if (byr) {
+                ++n_excl;
+              } else {
+                ++n_dead;
+              }
+            }
+          }
+          if (nb == 0) continue;
+          const double mb = (double)c4 / MB;
+          const double rem_ms =
+              (double)(n_sh_r * c4) / (nc.net_bw_gbs * 1e9) * 1e3;
+          std::printf("%zu,%d,%d,%d,%d,%zu,%.3f,%.3f,%.3f,%.3f,%.3f,"
+                      "%.1f,%.1f,%.3f,%.3f\n",
+                      di, sd.v, sd.g, r, h, nb, (double)nb * mb,
+                      (double)n_excl * mb, (double)n_shared * mb,
+                      (double)n_dead * mb, (double)n_sh_r * mb,
+                      100.0 * (double)n_excl / (double)nb,
+                      100.0 * (double)n_dead / (double)nb, rem_ms,
+                      (double)(nb - n_excl) * mb);
+        }
+      }
+    }
+    return 0;
+  }
+
   // ---- 闭包实验：同一决策点比较迁移单位（部分组 vs 整组）----
   // nbase = 运行时该批拟迁移量（E 过滤前的候选数）；所有动作都以它为
   // 目标体量，避免"多搬几个所以看起来更好"。
@@ -543,7 +740,7 @@ int main(int argc, char** argv) {
   if (closure_mode) {
     std::printf("dec_id,action,n_moved,n_groups,gsize,on_v,leak_v,leak_all,"
                 "V_transfer_MB,total_refill_MB,d_total_MB,"
-                "pred_makespan_ms,d_makespan_ms\n");
+                "pred_makespan_ms,d_makespan_ms,xnode,remote_refill_MB\n");
     const int R = sp.num_requests;
     const int pg = sp.prefix_group > 1 ? sp.prefix_group : 1;
     for (size_t di = 0; di < sf.decs.size(); ++di) {
@@ -605,7 +802,8 @@ int main(int argc, char** argv) {
       };
       for (const auto& a : acts) {
         CFResult cf = a.mv.empty() ? a0
-                                   : simulate(sp, tr, sd, a.mv, true, tm, horizon);
+                                   : simulate(sp, tr, sd, a.mv, true, tm,
+                                              horizon, nc);
         const double tot = (double)(cf.refill_v_bytes + cf.refill_g_bytes);
         const double mk = std::max(cf.tv_ms, cf.tg_ms);
         std::unordered_set<int> Qa;
@@ -618,10 +816,12 @@ int main(int argc, char** argv) {
         const int nm = (int)a.mv.size();
         std::printf("%zu,%s,%d,%zu,%d,%d,%d,%d,", di, a.name, nm, Qa.size(),
                     gsize, onv, onv - nm, gsize - nm);
-        std::printf("%.2f,%.2f,%.2f,%.2f,%.2f\n",
+        std::printf("%.2f,%.2f,%.2f,%.2f,%.2f,%d,%.2f\n",
                     (double)cf.transfer_bytes / MB, tot / MB,
                     (tot - a0_total) / MB, mk,
-                    tm.valid() ? mk - a0_mk : 0.0);
+                    tm.valid() ? mk - a0_mk : 0.0,
+                    (int)nc.cross(sd.v, sd.g),
+                    (double)cf.refill_g_remote_bytes / MB);
       }
     }
     return 0;
@@ -632,12 +832,12 @@ int main(int argc, char** argv) {
               "d_refill_v_MB,d_refill_g_MB,d_total_MB,"
               "pred_Tv_ms,pred_Tg_ms,pred_makespan_ms,d_makespan_ms,"
               "ebyte_value_ms,ebyte_cost_ms,ebyte_accept,"
-              "is_oracle_bytes,is_oracle_time\n");
+              "is_oracle_bytes,is_oracle_time,xnode,remote_refill_MB\n");
 
   for (size_t di = 0; di < sf.decs.size(); ++di) {
     const auto& sd = sf.decs[di];
     const std::vector<int> none;
-    CFResult a0 = simulate(sp, tr, sd, none, true, tm, horizon);
+    CFResult a0 = simulate(sp, tr, sd, none, true, tm, horizon, nc);
     const double a0_total = (double)(a0.refill_v_bytes + a0.refill_g_bytes);
     const double a0_mk = std::max(a0.tv_ms, a0.tg_ms);
 
@@ -651,7 +851,7 @@ int main(int argc, char** argv) {
     // 单请求动作
     for (int r : sd.local_v) {
       for (bool carry : {true, false}) {
-        CFResult cf = simulate(sp, tr, sd, {r}, carry, tm, horizon);
+        CFResult cf = simulate(sp, tr, sd, {r}, carry, tm, horizon, nc);
         rows.push_back({"cand", r, carry ? "carry" : "drop", cf, false});
       }
     }
@@ -662,7 +862,7 @@ int main(int argc, char** argv) {
       else break;
     }
     if (!e_moved.empty()) {
-      CFResult cf = simulate(sp, tr, sd, e_moved, true, tm, horizon);
+      CFResult cf = simulate(sp, tr, sd, e_moved, true, tm, horizon, nc);
       rows.push_back({"ebyte_batch", e_moved.front(), "carry", cf, true});
     }
 
@@ -697,7 +897,9 @@ int main(int argc, char** argv) {
         std::printf("%.3f,%.3f,%d,", ec->value_ms, ec->cost_ms, (int)ec->accept);
       else
         std::printf(",,,");
-      std::printf("%d,%d\n", (int)(i == best_b), (int)(i == best_t));
+      std::printf("%d,%d,", (int)(i == best_b), (int)(i == best_t));
+      std::printf("%d,%.2f\n", (int)nc.cross(sd.v, sd.g),
+                  (double)r.cf.refill_g_remote_bytes / MB);
     }
   }
   return 0;

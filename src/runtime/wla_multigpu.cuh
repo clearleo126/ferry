@@ -261,7 +261,8 @@ inline void wla_recompute_stats(MissTrace& tr, const MissSpec& sp) {
   if (sp.prefix_group <= 1) return;  // 未变换：生成器统计本就正确
   const int L = sp.num_layers, G = sp.sel_blocks;
   const int R = sp.num_requests;
-  // 组粒度 LRU（组内共享 = 前缀缓存；容量同 hot_blocks）
+  // 组粒度 LRU（组内共享 = 前缀缓存；容量口径见 wla_group_cap）。
+  // 理想基线 = 同组全部成员在同一张卡 ⇒ members = 该组实际成员数。
   const int ngrp = (R + sp.prefix_group - 1) / sp.prefix_group;
   std::vector<std::deque<uint64_t>> dq(ngrp * L);
   std::vector<std::unordered_set<uint64_t>> st(ngrp * L);
@@ -275,6 +276,8 @@ inline void wla_recompute_stats(MissTrace& tr, const MissSpec& sp) {
       for (int l = 0; l < L; ++l) {
         auto& d = dq[grp * L + l];
         auto& sset = st[grp * L + l];
+        const int cap = wla_group_cap(
+            sp, std::min(sp.prefix_group, R - grp * sp.prefix_group));
         for (int k = 0; k < G; ++k) {
           const MissEvent& e = tr.events[base + (size_t)l * G + k];
           ++tr.total_selects;
@@ -285,7 +288,7 @@ inline void wla_recompute_stats(MissTrace& tr, const MissSpec& sp) {
           } else {
             ++tr.total_misses;
             tr.miss_bytes += sp.c4_bytes();
-            if ((int)d.size() >= sp.hot_blocks) {
+            while ((int)d.size() >= cap) {
               sset.erase(d.front());
               d.pop_front();
             }
@@ -309,6 +312,8 @@ class WlaMultiGpuCtx {
       : devs_(devices), n_(devices.size()), sp_(sp), kvmode_(kvmode) {
     R_ = sp.num_requests;
     c4_ = sp.c4_bytes();
+    ngrp_ = sp.prefix_group > 1 ? (R_ + sp.prefix_group - 1) / sp.prefix_group
+                                : R_;
     max_blocks_ = wla_slab_cap(sp);
     seg_ = (size_t)sp.num_layers * sp.hot_blocks * c4_;  // 单请求热集
     // 请求归属（偏斜）与到达
@@ -417,6 +422,11 @@ class WlaMultiGpuCtx {
         }
       }
     }
+    // 按请求归属 carry 的逐块掩码（仅 delta 族：full 整段复制无归属可言）
+    if (sp_.own_carry &&
+        (kvmode_ == WlaKvMode::Delta || kvmode_ == WlaKvMode::DeltaNaive)) {
+      own_.assign((size_t)n_ * (size_t)ngrp_ * (size_t)sp_.num_layers, {});
+    }
     // per-GPU 回填压力遥测（L2 前瞻项，只观测不决策）：执行线程在回填
     // submit 前后 +/− 本卡在途回填字节。steal_from 决策读其余卡之和 =
     // 决策时刻真实并发回填压力 P(t) 的直接观测（v/g 双侧出 tick，自身
@@ -433,6 +443,9 @@ class WlaMultiGpuCtx {
     next_arrive_.store(0);
     refill_g_bytes_.reset(new std::atomic<uint64_t>[n_]);
     for (int i = 0; i < n_; ++i) refill_g_bytes_[i].store(0);
+    grp_members_.reset(new std::atomic<int>[(size_t)n_ * (size_t)ngrp_]);
+    for (size_t i = 0; i < (size_t)n_ * (size_t)ngrp_; ++i)
+      grp_members_[i].store(0);
     CUDA_CHECK(cudaSetDevice(devs_[0]));
   }
 
@@ -564,6 +577,14 @@ class WlaMultiGpuCtx {
     const char tr_magic[4] = {'F', 'T', 'R', '2'};
     ofs.write(tr_magic, 4);
     ofs.write(reinterpret_cast<const char*>(&sp_.slab_blocks), sizeof(int));
+    // v28 尾部扩展 2：cap_mode（组缓存容量口径；反事实必须同口径重放）
+    const char cm_magic[4] = {'F', 'T', 'R', '3'};
+    ofs.write(cm_magic, 4);
+    ofs.write(reinterpret_cast<const char*>(&sp_.cap_mode), sizeof(int));
+    // v29 尾部扩展 3：own_carry（迁移单位口径；反事实不支持归属重放）
+    const char oc_magic[4] = {'F', 'T', 'R', '4'};
+    ofs.write(oc_magic, 4);
+    ofs.write(reinterpret_cast<const char*>(&sp_.own_carry), sizeof(int));
     ofs.close();
 
     // 真实 trace 旁车文件：反事实必须读同一条 trace（否则会静默退回合成流）
@@ -589,6 +610,7 @@ class WlaMultiGpuCtx {
       int dest = reqs_[i].dest;
       if (kind == WlaDispatch::RoundRobin) dest = rr_counter_++ % n_;
       local_[dest].push_back((int)i);
+      grp_member_add(dest, wla_grp(sp_, (int)i), +1);
       ++i;
     }
     next_arrive_.store(i);
@@ -605,6 +627,7 @@ class WlaMultiGpuCtx {
       for (int g = 0; g < n_; ++g)
         if (local_[g].size() < best) { best = local_[g].size(); dest = g; }
       local_[dest].push_back((int)i);
+      grp_member_add(dest, wla_grp(sp_, (int)i), +1);
       ++i;
     }
     next_arrive_.store(i);
@@ -622,6 +645,7 @@ class WlaMultiGpuCtx {
   void tick_end(int g, const std::vector<int>& resident, double now_ms) {
     std::unique_lock<std::mutex> lk(mtx_);
     in_tick_[g] = false;
+    std::vector<int> trim_groups;
     for (int r : resident) {
       ++next_step_[r];
       if (next_step_[r] >= sp_.steps) {
@@ -632,11 +656,20 @@ class WlaMultiGpuCtx {
           else
             ++it;
         }
+        const int q = wla_grp(sp_, r);
+        grp_member_add(g, q, -1);
+        own_release(g, r);  // 归属位随请求离开作废（own_carry 关闭时空操作）
+        trim_groups.push_back(q);
         done_ms_[r] = now_ms;
         ++per_gpu_done_[g];
         completed_.fetch_add(1);
       }
     }
+    // 成员离开 → per-request 容量口径下该组容量收缩（CapGroup 下为空操作）
+    std::sort(trim_groups.begin(), trim_groups.end());
+    trim_groups.erase(std::unique(trim_groups.begin(), trim_groups.end()),
+                      trim_groups.end());
+    for (int q : trim_groups) grp_trim(g, q);
     cv_.notify_all();
   }
 
@@ -716,7 +749,10 @@ class WlaMultiGpuCtx {
           if (kvmode_ == WlaKvMode::Full) {
             cost_ms = pol.cost_scale * (double)seg_ * bw_ms_per_byte;
           } else {
-            const double live_b = (double)kv_live(v, r) * (double)c4_;
+            // 按请求归属 carry 下真实传输量 = 独占块数（共享/死块不搬）
+            const double live_b =
+                (double)(own_on() ? kv_live_owned(v, r) : kv_live(v, r)) *
+                (double)c4_;
             // delta（批量化）：同通道同每字节价 + 每 chunk 固定开销
             //（kMigDeltaFixedMs，微基准标定）；delta-naive 保留 v8 的
             // 2.0 每字节惩罚（其逐槽 submit 真实如此，仅 ablation）；
@@ -786,21 +822,35 @@ class WlaMultiGpuCtx {
       }
       for (auto it = moved.rbegin(); it != moved.rend(); ++it)
         local_[g].push_front(*it);
+      // cap_mode=1：成员归属变化 → 维护每卡每组的常驻成员数（容量口径）。
+      // 必须在 kv_handoff 之前更新（victim 容量收缩不应影响本次交接的数据
+      // 集合），裁剪放到 handoff 之后。
+      for (int r : moved) {
+        const int q = wla_grp(sp_, r);
+        grp_member_add(v, q, -1);
+        grp_member_add(g, q, +1);
+      }
       // ---- 状态快照 + 交接 + F0-a 审计（本临界区内一次完成；此后传输
       // 阶段不触碰 host LRU 容器）。idx 枚举与 handoff 拷贝同临界区 ⇒
       // 消费卡镜像 == 实际传输集合（修复"镜像含未传输块"的语义裂缝：
       // 组拆散时 victim 侧剩余组员的 kv_touch 不再能插进两者之间）。----
       if (kvmode_ == WlaKvMode::Delta || kvmode_ == WlaKvMode::DeltaNaive) {
+        // 按请求归属 carry：枚举口径与 handoff 口径必须逐位一致（只发独占块）
+        auto emit = [&](int r, std::vector<uint64_t>& out) {
+          const int q = wla_grp(sp_, r);
+          const uint32_t bit = own_bit(r);
+          for (int l = 0; l < sp_.num_layers; ++l)
+            for (uint64_t blk : kv_set(v, r, l)) {
+              if (own_on() && own_mask(v, q, l, blk) != bit) continue;
+              out.push_back((uint64_t)wla_gslot_off(sp_, r, l, blk));
+            }
+        };
         for (int r : moved) {
           if (kvmode_ == WlaKvMode::Delta) {
-            for (int l = 0; l < sp_.num_layers; ++l)
-              for (uint64_t blk : kv_set(v, r, l))
-                idx_all.push_back((uint64_t)wla_gslot_off(sp_, r, l, blk));
+            emit(r, idx_all);
           } else {  // naive：保留原始枚举（ablation 语义，不享受去重）
             std::vector<uint64_t> offs;
-            for (int l = 0; l < sp_.num_layers; ++l)
-              for (uint64_t blk : kv_set(v, r, l))
-                offs.push_back((uint64_t)wla_gslot_off(sp_, r, l, blk));
+            emit(r, offs);
             naive_offs.push_back(std::move(offs));
           }
         }
@@ -842,6 +892,18 @@ class WlaMultiGpuCtx {
         for (int r : moved) uniq.insert(wla_grp(sp_, r));
         mig_units_total_.fetch_add((uint64_t)moved.size());
         mig_units_distinct_.fetch_add((uint64_t)uniq.size());
+      }
+      // 所有者离开 victim：交接全部完成后统一释放归属位（若逐个交接即释放，
+      // 同批后交者的"独占"判定会把已离开者的块误算成共享）
+      if (own_on())
+        for (int r : moved) own_release(v, r);
+      // cap_mode=1：handoff 已拷贝完 → victim 侧按收缩后的容量裁剪。
+      if (sp_.cap_mode == 1 && !moved.empty()) {
+        std::vector<int> vg;
+        for (int r : moved) vg.push_back(wla_grp(sp_, r));
+        std::sort(vg.begin(), vg.end());
+        vg.erase(std::unique(vg.begin(), vg.end()), vg.end());
+        for (int q : vg) grp_trim(v, q);
       }
     }
     // D2D 迁移（victim 段 -> host -> 本卡段）；一批一 sync。
@@ -1046,6 +1108,87 @@ class WlaMultiGpuCtx {
   // （命中则 LRU touch；未命中则按容量逐出最旧再插入）。
   // C2：索引 = 组 id（同组请求共享前缀缓存 → 跨请求命中 = 亲和收益）；
   // prefix_group=1 时组即请求，与既有语义逐字一致。
+  // 组容量口径（与 counterfact 共用 wla_group_cap）
+  int grp_members(int g, int q) const {
+    if (!grp_members_) return 1;
+    return grp_members_[(size_t)g * (size_t)ngrp_ + (size_t)q].load(
+        std::memory_order_relaxed);
+  }
+  void grp_member_add(int g, int q, int d) {
+    if (!grp_members_) return;
+    grp_members_[(size_t)g * (size_t)ngrp_ + (size_t)q].fetch_add(
+        d, std::memory_order_relaxed);
+  }
+  int kv_cap(int g, int q) const {
+    return wla_group_cap(sp_, sp_.cap_mode == 1 ? grp_members(g, q) : 1);
+  }
+  // ---- 按请求归属 carry 的逐块掩码（v29 §22.6）----
+  // 归属 = "本卡该组还有哪些常驻成员触碰过这个块"。在线可观测，无需前瞻：
+  //   mask == bit(r)       独占 → 只有 r 需要 ⇒ 迁移时搬
+  //   mask 含其他位         共享 → victim 侧仍有成员会用 ⇒ 留在原地，消费卡
+  //                        按 miss 回填（离线 A_lazy 就是这笔回填）
+  //   mask == 0            死块 → 所有触碰者都已离开 ⇒ 不搬
+  bool own_on() const { return !own_.empty(); }
+  uint32_t own_bit(int r) const {
+    return sp_.prefix_group > 1 ? (1u << (uint32_t)(r % sp_.prefix_group)) : 1u;
+  }
+  size_t own_idx(int g, int q, int l) const {
+    return ((size_t)g * (size_t)ngrp_ + (size_t)q) * (size_t)sp_.num_layers +
+           (size_t)l;
+  }
+  uint32_t own_mask(int g, int q, int l, uint64_t blk) const {
+    const auto& m = own_[own_idx(g, q, l)];
+    auto it = m.find(blk);
+    return it == m.end() ? 0u : it->second;
+  }
+  // 块被逐出 LRU ⇒ 归属条目一并作废（否则掩码会泄漏到重新装入的同一 id）
+  void own_drop(int g, int q, int l, uint64_t blk) {
+    if (!own_on()) return;
+    own_[own_idx(g, q, l)].erase(blk);
+  }
+  // 请求离开该卡（被窃走 / 完成）：清掉它在所有块上的归属位。
+  // 只遍历掩码表、不遍历 LRU（离开者的位是其全部足迹）。
+  void own_release(int g, int r) {
+    if (!own_on()) return;
+    const int q = wla_grp(sp_, r);
+    const uint32_t bit = own_bit(r);
+    for (int l = 0; l < sp_.num_layers; ++l) {
+      auto& m = own_[own_idx(g, q, l)];
+      for (auto it = m.begin(); it != m.end();) {
+        it->second &= ~bit;
+        if (it->second == 0)
+          it = m.erase(it);
+        else
+          ++it;
+      }
+    }
+  }
+  // 该请求的独占块数 = 按请求归属 carry 的真实传输量（成本模型用）
+  size_t kv_live_owned(int g, int r) const {
+    const int q = wla_grp(sp_, r);
+    const uint32_t bit = own_bit(r);
+    size_t tot = 0;
+    for (int l = 0; l < sp_.num_layers; ++l)
+      for (uint64_t blk : lru_dq_[g][q][l])
+        if (own_mask(g, q, l, blk) == bit) ++tot;
+    return tot;
+  }
+  // 成员离开后容量收缩 → 把该组 LRU 裁到新容量（cap_mode=1 专有；
+  // CapGroup 下容量与成员数无关，恒不触发）。
+  void grp_trim(int g, int q) {
+    if (sp_.cap_mode != 1) return;
+    if (g < 0 || g >= (int)lru_dq_.size() || lru_dq_[g].empty()) return;
+    const int cap = kv_cap(g, q);
+    for (int l = 0; l < sp_.num_layers; ++l) {
+      auto& dq = lru_dq_[g][q][l];
+      auto& st = lru_set_[g][q][l];
+      while ((int)dq.size() > cap) {
+        own_drop(g, q, l, dq.front());
+        st.erase(dq.front());
+        dq.pop_front();
+      }
+    }
+  }
   bool kv_touch(int g, int r, int l, uint64_t blk) {
     const int q = wla_grp(sp_, r);
     auto& dq = lru_dq_[g][q][l];
@@ -1059,13 +1202,17 @@ class WlaMultiGpuCtx {
         }
       dq.push_back(blk);
     } else {
-      if ((int)dq.size() >= sp_.hot_blocks) {
+      const int cap = kv_cap(g, q);
+      while ((int)dq.size() >= cap) {
+        own_drop(g, q, l, dq.front());
         st.erase(dq.front());
         dq.pop_front();
       }
       dq.push_back(blk);
       st.insert(blk);
     }
+    // 归属：命中与装入都算"该请求需要这个块"
+    if (own_on()) own_[own_idx(g, q, l)][blk] |= own_bit(r);
     return hit;
   }
   // 迁移时热集状态交接（carry=true）或清空（drop → 消费卡冷启动）。
@@ -1078,6 +1225,10 @@ class WlaMultiGpuCtx {
   void kv_handoff(int v, int c, int r, bool carry) {
     if (kvmode_ == WlaKvMode::Full) return;  // full+C2：热集随整段 D2D 迁移
     const int q = wla_grp(sp_, r);
+    if (carry && own_on()) {  // 按请求归属 carry：只并入独占块
+      kv_handoff_owned(v, c, r);
+      return;
+    }
     for (int l = 0; l < sp_.num_layers; ++l) {
       if (carry) {
         lru_dq_[c][q][l] = lru_dq_[v][q][l];
@@ -1085,6 +1236,36 @@ class WlaMultiGpuCtx {
       } else {
         lru_dq_[c][q][l].clear();
         lru_set_[c][q][l].clear();
+        if (own_on()) own_[own_idx(c, q, l)].clear();
+      }
+    }
+  }
+  // 按请求归属 carry（v29 §22.6）：只把"仅被 r 触碰"的块并入消费卡的组
+  // 镜像。合并而非覆盖 —— 消费卡可能已因同组其他成员持有该组缓存，覆盖会
+  // 抹掉它们的命中（这正是"共享块留原地"的收益侧）。
+  void kv_handoff_owned(int v, int c, int r) {
+    const int q = wla_grp(sp_, r);
+    const uint32_t bit = own_bit(r);
+    for (int l = 0; l < sp_.num_layers; ++l) {
+      const auto& sdq = lru_dq_[v][q][l];
+      auto& cdq = lru_dq_[c][q][l];
+      auto& cst = lru_set_[c][q][l];
+      auto& cm = own_[own_idx(c, q, l)];
+      const int cap = kv_cap(c, q);
+      for (uint64_t blk : sdq) {
+        if (own_mask(v, q, l, blk) != bit) continue;  // 共享/死块不搬
+        if (cst.count(blk) > 0) {
+          cm[blk] |= bit;
+          continue;
+        }
+        while ((int)cdq.size() >= cap) {
+          own_drop(c, q, l, cdq.front());
+          cst.erase(cdq.front());
+          cdq.pop_front();
+        }
+        cdq.push_back(blk);
+        cst.insert(blk);
+        cm[blk] |= bit;
       }
     }
   }
@@ -1190,6 +1371,11 @@ class WlaMultiGpuCtx {
   std::vector<std::vector<std::unique_ptr<HostStagedChannel>>> mig_;
   std::vector<std::deque<int>> local_;
   std::vector<int> next_step_;
+  // v28 §3.3 容量口径修正（cap_mode=1）：每卡每组的常驻成员数。
+  // 只在 local_ 变动的同一临界区更新（dispatch / steal_from / tick_end），
+  // kv_touch 侧原子读；CapGroup（默认）下不参与容量计算。
+  int ngrp_ = 0;
+  std::unique_ptr<std::atomic<int>[]> grp_members_;
   std::vector<double> done_ms_;
   std::vector<bool> in_tick_;
   std::vector<size_t> per_gpu_done_;
@@ -1237,6 +1423,11 @@ class WlaMultiGpuCtx {
   // 逐卡逐请求逐层 LRU 镜像（与 missstream 生成器同算法同容量 = hot_blocks）
   std::vector<std::vector<std::vector<std::deque<uint64_t>>>> lru_dq_;
   std::vector<std::vector<std::vector<std::unordered_set<uint64_t>>>> lru_set_;
+  // 按请求归属 carry（v29 §22.6）：每 (卡, 组, 层) 的块归属掩码。
+  //   bit i 表示该组在该卡的常驻成员 r（i = r % prefix_group）触碰过该块。
+  //   与 lru_set_ 严格同生命周期：touch 置位、逐出/裁剪清条目、请求离开
+  //   （被窃走/完成）清位。空 = 关闭（own_carry=0 或非 delta 模式）。
+  std::vector<std::unordered_map<uint64_t, uint32_t>> own_;
 };
 
 // ---- N 卡驱动（mode: 0=A 1=B 2=C 3=E 4=LLX 5=RR 6=D1 7=D2）----

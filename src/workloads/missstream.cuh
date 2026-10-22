@@ -38,6 +38,24 @@ struct MissSpec {
   int prefix_group = 1;        // 组大小（1 = 关闭，退化为既有语义）
   int prefix_steps = 8;        // 组内共享前缀的步数（其余步分歧）
 
+  // 组缓存容量口径（v28 §3.3 的建模缺陷修正）：
+  //   CapGroup（0，默认/历史口径）= 每组每层容量恒为 hot_blocks（组内共享
+  //     一份）⇒ 组被拆到 N 张卡时总容量 ×N，"拆组白拿容量"，C/RR 不可比。
+  //   CapPerReq（1）= 每组每层容量 = hot_blocks × 该卡上该组常驻成员数
+  //     （每请求自带一份容量预算，共享块仍只存一份）⇒ 拆组不改变总容量。
+  // 默认 0 保证历史结果逐位不变。
+  int cap_mode = 0;
+
+  // 迁移单位口径（v29 §22.6 的判定结论）：
+  //   0（默认）= 整组 carry —— 迁移时把 victim 侧 (组,层) 的整个 LRU 镜像
+  //               复制到消费卡（历史语义）。
+  //   1 = 按请求归属 carry —— 只迁"仅被该请求触碰过"的独占块；被本卡同组
+  //       其他常驻成员触碰过的共享块留在 victim（消费卡按 miss 回填），
+  //       未来无人触碰的死块直接丢弃。需逐块归属掩码，故仅对 delta/
+  //       delta-naive 生效；prefix_group=1 时每组仅一成员 ⇒ 全部块均独占
+  //       ⇒ 与整组 carry 逐位等价（零对照）。
+  int own_carry = 0;
+
   // 真实 trace（FERRY_MISS_TRACE）专用：单请求 slab 容量（4-token block 数）。
   // 0 = 关闭 → 沿用合成口径 64 + steps*8（既有结果逐位不变）。
   // 真实 trace 的 block id 是链式内容哈希（全局一致，用于跨请求共享），
@@ -53,6 +71,13 @@ struct MissEvent {
   uint64_t block_id;   // 请求内逻辑 KV block 索引
   bool is_miss;
 };
+
+// 组缓存每层槽位容量（runtime / counterfact 共用同一口径，防两处漂移）。
+// members = 该卡上该组的常驻成员数（CapGroup 下不参与计算）。
+inline int wla_group_cap(const MissSpec& sp, int members) {
+  if (sp.cap_mode != 1) return sp.hot_blocks;
+  return sp.hot_blocks * (members > 0 ? members : 1);
+}
 
 struct MissTrace {
   std::vector<MissEvent> events;
