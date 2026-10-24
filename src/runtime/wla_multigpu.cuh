@@ -205,6 +205,9 @@ struct WlaMultiStats {
   // vchan（v30，默认关）：已计价的跨节点字节 + 注入的虚拟等待时间
   double vchan_wait_ms = 0.0;
   size_t vchan_bytes = 0;
+  // v31.2 迁移范围遥测：把 KV home 一起搬走的请求数与字节
+  uint64_t home_reqs = 0;
+  uint64_t home_bytes = 0;
   // 控制面遥测（v30）：前置拒绝 / 前置判定耗时 / 实路径耗时
   uint64_t steal_pre_refused = 0;
   uint64_t precheck_calls = 0;
@@ -265,6 +268,13 @@ struct WlaStealPolicy {
   bool remote_tax = false;
   // v31：容量加权窃取（见 WlaMultiGpuCtx::capacity）。等速时逐位等价旧语义。
   bool speed_aware = false;
+  // v31.2 迁移范围（--mig-scope）：跨节点迁移时搬多少 KV。
+  //   0 = hot  ：只搬热集（现状），之后的 miss 付远端回填税
+  //   1 = home ：连整条上下文的 host 副本一起搬到目标节点，之后全部本地读
+  //   2 = auto ：逐请求按盈亏判据决定（剩余步数 × 每步 miss 字节 > home 字节）
+  // 依据（§26）：长输出下远端回填是反复项，home 是一次性项；
+  //   实测盈亏点 = 剩余 62 步（miss 4.09MB/步、home 252MB）。
+  int mig_scope = 0;
   // v30.1 分类带宽：同节点迁移走本地 PCIe/NVLink，跨节点才走 NIC。
   // 用同一个 B_ref 给两类迁移计价会双重惩罚节点内迁移 —— 实测在 B_net=1GB/s
   // 下 E 连"同节点搬一个请求"都拒绝（每请求 3×11MB/1GB/s ≈ 33ms），于是
@@ -936,9 +946,24 @@ class WlaMultiGpuCtx {
       // 读。真实 trace + B=1GB/s 下这笔税占跨节点字节 ~83%（实验设计 §22.9）
       // —— 不计入成本模型，E 就会批准"搬一次、然后每步流血"的迁移。
       // 每步 miss 字节 = sel_blocks × layers × c4 × (1−hit)，trace 静态量。
-      if (pol.remote_tax && is_remote(g, r)) {
-        cost_ms += (double)(wla_len_of(sp_, r) - next_step_[r]) *
-                   miss_b_per_step_ / (vchan_bw_gbs_ * 1e9) * 1e3;
+      // v31.2 迁移范围：把「一次性搬 home」与「每步缴税」放进同一个成本模型。
+      // 否则 E 会按 hot 价批准迁移，实际却付了整条上下文（252MB），
+      // home 模式的 E 结果不可解释。
+      if (vchan_on() && !same_node(v, g) && kvmode_ == WlaKvMode::Delta) {
+        const double tax_ms =
+            (double)(wla_len_of(sp_, r) - next_step_[r]) * miss_b_per_step_ /
+            (vchan_bw_gbs_ * 1e9) * 1e3;
+        const double cur_ms = (pol.remote_tax && is_remote(g, r)) ? tax_ms : 0.0;
+        double eff_ms = cur_ms;
+        if (pol.mig_scope != 0) {
+          const double home_ms = (double)max_blocks_ *
+                                 (double)sp_.num_layers * (double)c4_ /
+                                 (vchan_bw_gbs_ * 1e9) * 1e3;
+          // home = 无条件搬；auto = 两者取便宜
+          eff_ms = (pol.mig_scope == 1) ? home_ms
+                                        : std::min(cur_ms, home_ms);
+        }
+        cost_ms += eff_ms - cur_ms;
       }
       const double value =
           (double)(wla_len_of(sp_, r) - next_step_[r]) * step_ms;
@@ -979,6 +1004,7 @@ class WlaMultiGpuCtx {
     }
     int v = v_sel;
     std::vector<int> moved;
+    double home_charge = 0.0;  // v31.2：本次 steal 的 home 额外网络字节
     // F0-a 竞态修复：状态快照产物（在下方临界区内构建，传输阶段只消费，
     // 不再触碰 host LRU 容器）。delta = 整批偏移表 + 每 chunk 条目数；
     // naive = 每请求偏移表（moved 顺序索引）。
@@ -1117,16 +1143,51 @@ class WlaMultiGpuCtx {
               out.push_back((uint64_t)wla_gslot_off(sp_, r, l, blk));
             }
         };
-        for (int r : moved) {
+        // v31.2：逐请求记录热集条目数（home 模式的额外计价要扣掉这部分）
+        std::vector<std::pair<int, uint64_t>> per_req(  // (r, 热集块层数)
+            moved.size(), {0, 0});
+        for (size_t j = 0; j < moved.size(); ++j) {
+          const int r = moved[j];
+          per_req[j].first = r;
           if (kvmode_ == WlaKvMode::Delta) {
+            const size_t before = idx_all.size();
             emit(r, idx_all);
+            per_req[j].second = (uint64_t)(idx_all.size() - before);
           } else {  // naive：保留原始枚举（ablation 语义，不享受去重）
             std::vector<uint64_t> offs;
             emit(r, offs);
+            per_req[j].second = (uint64_t)offs.size();
             naive_offs.push_back(std::move(offs));
           }
         }
         for (int r : moved) kv_handoff(v, g, r, /*carry=*/true);
+        // ---- v31.2 迁移范围：home 搬运（一次性），此后该请求的 miss 变本地 ----
+        // 判据：remaining × miss_per_step > home_bytes 才搬 home。
+        if (pol.mig_scope != 0 && vchan_on() && !same_node(v, g) &&
+            kvmode_ == WlaKvMode::Delta) {
+          // ⚠️ home 大小的口径：**不是** kv_set(v,r,l) 的大小 —— 那是 GPU 侧
+          // LRU 镜像，容量上限 = hot_blocks(128)，会把 home 低估到 28.7MB。
+          // 真正要搬的是该请求整条上下文的 host 副本 ≈ slab 容量
+          // max_blocks_（= 单请求最大块数；真实 trace 的 prompt 4096 占大头，
+          // 所以 slab 容量 ≈ 全上下文）。取上界是保守方向。
+          const double home_b = (double)max_blocks_ *
+                               (double)sp_.num_layers * (double)c4_;
+          for (auto& pr : per_req) {
+            const int r = pr.first;
+            const double hot_b = (double)pr.second * (double)c4_;
+            const double remain =
+                (double)(wla_len_of(sp_, r) - next_step_[r]);
+            const double tax = remain * miss_b_per_step_;
+            const bool do_home =
+                (pol.mig_scope == 1) || (pol.mig_scope == 2 && tax > home_b);
+            if (!do_home) continue;
+            // 扣掉已经算进 payload 的热集部分，避免重复计价
+            home_charge += std::max(0.0, home_b - hot_b);
+            home_bytes_ += (uint64_t)home_b;
+            home_reqs_ += 1;
+            set_home_node(r, node_of_[g]);  // 之后 miss 在本地
+          }
+        }
         // F0-a 审计（原始枚举口径）：total = 去重前条目数（= naive 实际
         // 发送的槽数），distinct = 去重后槽数（= delta 实际传输）→
         // dup% = 去重节省份额。不变量：delta live==distinct、naive
@@ -1341,7 +1402,8 @@ class WlaMultiGpuCtx {
     // 只在真的跨节点时计价：同节点迁移走本地 PCIe/NVLink，不计网络成本
     if (vchan_on() && !moved.empty() && !same_node(v, g)) {
       const auto t_net0 = std::chrono::steady_clock::now();
-      vlink_charge(g, moved_bytes, /*with_t0=*/true);
+      // v31.2：hot 模式的 payload + 可选 home 额外字节，一次建链
+      vlink_charge(g, moved_bytes + (size_t)home_charge, /*with_t0=*/true);
       seg.net += ms_since(t_net0);
     }
     migrated_reqs_.fetch_add(moved.size());
@@ -1541,6 +1603,10 @@ class WlaMultiGpuCtx {
   // 请求 r 在卡 g 上的 miss 回填是否跨节点（KV home 不在 g 所在节点）。
   // 取代 v30 的 stolen_ 布尔：请求可能被偷两次、也可能被偷回原节点，按"当前
   // 卡与 home 节点是否同节点"判定才正确；单节点拓扑下与旧语义等价。
+  // 迁移范围 = home 时，KV home 跟着请求走（此后该请求的 miss 在本地）
+  void set_home_node(int r, int node) {
+    if (r >= 0 && r < (int)home_node_.size()) home_node_[r] = node;
+  }
   bool is_remote(int g, int r) const {
     return vchan_on() && home_node_[r] >= 0 && node_of_[g] != home_node_[r];
   }
@@ -1604,6 +1670,8 @@ class WlaMultiGpuCtx {
   size_t cost_bytes() const { return layer_cost_bytes_; }
   float* cost_sink() { return d_cost_sink_; }
   double vchan_wait_ms() const { return vchan_wait_ms_.load(); }
+  uint64_t home_bytes() const { return home_bytes_.load(); }
+  uint64_t home_reqs() const { return home_reqs_.load(); }
   uint64_t vchan_bytes() const { return vlink_bytes_.load(); }
   WlaKvMode kv_mode() const { return kvmode_; }
   // 状态化命中判定（delta/drop/C2）：语义与 missstream 生成器逐字一致
@@ -1978,6 +2046,8 @@ class WlaMultiGpuCtx {
   std::vector<char*> d_cost_;   // 每卡计算成本 buffer（layer_cost_bytes_）
   float* d_cost_sink_ = nullptr;
   size_t layer_cost_bytes_ = 0;
+  std::atomic<uint64_t> home_bytes_{0};  // 累计：home 搬运字节
+  std::atomic<uint64_t> home_reqs_{0};   // 累计：搬 home 的请求数
   std::vector<double> slow_mult_;  // 每卡计算成本倍数（v31）
   double slow_at_ms_ = 0.0;        // 从该时刻起生效
   std::vector<int> node_of_;    // GPU -> 节点 id（v30.1 拓扑）
@@ -2445,6 +2515,8 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   }
 
   st.makespan_ms = ht.toc_ms() - t0;
+  st.home_reqs = ctx.home_reqs();
+  st.home_bytes = ctx.home_bytes();
   st.steals = ctx.steals();
   st.steal_refused = ctx.steal_refused();
   st.steal_attempts = ctx.steal_attempts();

@@ -1,0 +1,11 @@
+[len] dist=lognormal median=32 sigma=0.60 seed=42 | 实际 p10=13 p50=31 p90=83 max=96 | 截断@steps=3 个 (6%) | 总步数 2006
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=balanced reqs=48 steps=96 layers=28 sel=64 hot=128 attn=8 gap=20.0ms steal-batch=4 B_ref=1.0GB/s cost-scale=3.00 mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 cap=perreq steal-delay=0.0ms seed=42 own-carry=0 vchan=2.50GB/s/0.5ms len=lognormal(med32/sig0.60) precheck=1 lock=narrow mthread=0 nodes=0,0,1,1 hier=1 rtax=1 lbw=16.60 lcost=271MB slow=none@0ms spd=0 scope=home
+[trace] real model trace: results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  ferry-C   makespan=  2208.62ms steps/s=   21.7 p50= 13.105 p99=  36.953 steals=  22(att=   30) migr=  310.7MB( 27 reqs) refill= 131536 seg  4534.31MB imb=0.102 ref=0 live=39772
+[trace] real model trace: results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  costaware-E makespan=  1876.87ms steps/s=   25.6 p50= 11.045 p99=  15.302 steals=  12(att=   15) migr=  264.8MB( 18 reqs) refill= 125853 seg  4338.44MB imb=0.144 ref=0 live=33896
+[trace] real model trace: results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  roundrobin-RR makespan=  1866.73ms steps/s=   25.7 p50= 10.398 p99=  14.953 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill= 142173 seg  4880.81MB imb=0.000 ref=0 live=0
+  => [steal-cp] precheck: pre-refused=2654 att=30 | steal_ms=3549.1 (118.30 ms/att, makespan 的 160.7%, 迁移 310.7MB ≈ 325.8ms@B_ref) | precheck_ms=0.2
+  => [steal-seg] 占 steal_ms 的份额: lock=53.0(1%) lease=1860.4(52%) tick=87.6(2%) crit=11.4(0%) gathr=0.9(0%) xfer=18.1(1%) scttr=0.9(0%) net=1516.5(43%) | 和=3548.8 (100% of steal_ms)
+  => [vchan] B=2.50GB/s T0=0.5ms | 注入等待: A=0.0 B=0.0 C=1516.5 E=212.3 LLX=0.0 RR=0.0 ms | 计价字节: C=3170.62 E=451.03 LLX=0.00 RR=0.00 MB | home: C=15 reqs/3425.6MB E=2/456.8MB

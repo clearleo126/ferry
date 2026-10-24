@@ -141,6 +141,16 @@ int main(int argc, char** argv) {
   // 准入侧路由无法预见，也修不了已在 decode 的存量请求。默认关。
   char slow_s[64] = "";
   double slow_at = 0.0;
+  // --speed-aware（v31）：容量加权窃取（每卡按自己的吞吐分公平份额）。
+  // ⚠️ 2026-10-22 修正：该 flag 此前从未接入 CLI（模板断言失败导致漏改），
+  // 所以 §24.4 里"容量加权无效"的结论作废，需重测。
+  bool speed_aware = false;
+  // --mig-scope（v31.2）：跨节点迁移搬多少。
+  //   hot（默认）= 只搬热集，之后 miss 付远端回填税（既有语义，逐位不变）
+  //   home       = 连整条上下文的 host 副本一起搬，之后全部本地读
+  //   auto       = 逐请求按「剩余步数 × 每步 miss 字节 > home 字节」判定
+  // 依据 §26：长输出实测盈亏点 = 剩余 62 步（miss 4.09MB/步、home 252MB）。
+  char mig_scope_s[16] = "hot";
   int kv_heads = 8, head_dim = 128;
 
   for (int i = 1; i < argc; ++i) {
@@ -227,6 +237,10 @@ int main(int argc, char** argv) {
       std::strncpy(slow_s, next(), sizeof(slow_s) - 1);
     } else if (std::strcmp(argv[i], "--slow-at") == 0) {
       slow_at = std::atof(next());
+    } else if (std::strcmp(argv[i], "--speed-aware") == 0) {
+      speed_aware = std::atoi(next()) != 0;
+    } else if (std::strcmp(argv[i], "--mig-scope") == 0) {
+      std::strncpy(mig_scope_s, next(), sizeof(mig_scope_s) - 1);
     } else if (std::strcmp(argv[i], "--steal-delay") == 0) {
       steal_delay = std::atof(next());
     } else if (std::strcmp(argv[i], "--seed") == 0) {
@@ -382,6 +396,10 @@ int main(int argc, char** argv) {
   spol.steal_thread = steal_thread;   // L2：迁移搬出执行线程（默认关）
   spol.hier_steal = hier_steal;       // v30.1 分层窃取（仅多节点生效）
   spol.remote_tax = remote_tax;       // v30.1 E 计入远端回填税
+  spol.speed_aware = speed_aware;     // v31 容量加权窃取
+  if (std::strcmp(mig_scope_s, "home") == 0) spol.mig_scope = 1;
+  else if (std::strcmp(mig_scope_s, "auto") == 0) spol.mig_scope = 2;
+  else spol.mig_scope = 0;            // hot（默认）
   spol.b_local_gbs = local_bw;        // v30.1 同节点迁移带宽（0=跟随 mig-bw）
 
   std::printf(
@@ -390,7 +408,8 @@ int main(int argc, char** argv) {
       "mig-margin=%.1f kv-mode=%s rebal=%.0fms/thr%.2f prefix=grp%d/stp%d "
       "cap=%s steal-delay=%.1fms seed=%llu own-carry=%d vchan=%.2fGB/s/%.1fms "
       "len=%s(med%d/sig%.2f) precheck=%d lock=%s mthread=%d nodes=%s "
-      "hier=%d rtax=%d lbw=%.2f lcost=%.0fMB slow=%s@%.0fms\n",
+      "hier=%d rtax=%d lbw=%.2f lcost=%.0fMB slow=%s@%.0fms spd=%d "
+      "scope=%s\n",
       gpu_buf, arrival, skew, reqs, steps, layers, sel, hot, attn, gap,
       steal_batch, b_ref, cost_scale, mig_margin, kvmode_s, rebal_interval,
       rebal_thr, prefix_group, prefix_steps, cap_mode_s, steal_delay, seed,
@@ -398,7 +417,7 @@ int main(int argc, char** argv) {
       (int)steal_precheck, steal_lock_wide ? "wide" : "narrow",
       (int)steal_thread, vchan_nodes_s[0] ? vchan_nodes_s : "per-gpu",
       (int)hier_steal, (int)remote_tax, local_bw, layer_cost_mb,
-      slow_s[0] ? slow_s : "none", slow_at);
+      slow_s[0] ? slow_s : "none", slow_at, (int)speed_aware, mig_scope_s);
   std::fflush(stdout);
 
   // vchan 参数对全部模式生效（追加在 rebal 参数之后）
@@ -475,11 +494,13 @@ int main(int argc, char** argv) {
     std::printf(
         "  => [vchan] B=%.2fGB/s T0=%.1fms | 注入等待: A=%.1f B=%.1f C=%.1f "
         "E=%.1f LLX=%.1f RR=%.1f ms | 计价字节: C=%.2f E=%.2f LLX=%.2f "
-        "RR=%.2f MB\n",
+        "RR=%.2f MB | home: C=%llu reqs/%.1fMB E=%llu/%.1fMB\n",
         vchan_bw, vchan_t0, a.vchan_wait_ms, b.vchan_wait_ms, c.vchan_wait_ms,
         e.vchan_wait_ms, llx.vchan_wait_ms, rr.vchan_wait_ms,
         c.vchan_bytes / 1048576.0, e.vchan_bytes / 1048576.0,
-        llx.vchan_bytes / 1048576.0, rr.vchan_bytes / 1048576.0);
+        llx.vchan_bytes / 1048576.0, rr.vchan_bytes / 1048576.0,
+        (unsigned long long)c.home_reqs, c.home_bytes / 1048576.0,
+        (unsigned long long)e.home_reqs, e.home_bytes / 1048576.0);
   };
   if (!full_run) {  // 子集跑：只回显已跑模式的行 + 诊断行
     print_steal_cp();

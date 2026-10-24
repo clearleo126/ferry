@@ -1,0 +1,11 @@
+[len] dist=lognormal median=32 sigma=0.60 seed=42 | 实际 p10=13 p50=31 p90=83 max=96 | 截断@steps=3 个 (6%) | 总步数 2006
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=balanced reqs=48 steps=96 layers=28 sel=64 hot=128 attn=8 gap=20.0ms steal-batch=4 B_ref=25.0GB/s cost-scale=3.00 mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 cap=perreq steal-delay=0.0ms seed=42 own-carry=0 vchan=25.00GB/s/0.5ms len=lognormal(med32/sig0.60) precheck=1 lock=narrow mthread=0 nodes=0,0,0,0 hier=1 rtax=1 lbw=16.60 lcost=271MB slow=2:3.0@0ms
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  ferry-C   makespan=  1966.02ms steps/s=   24.4 p50= 11.459 p99=  28.807 steals=  34(att=   53) migr=  587.6MB( 37 reqs) refill= 137666 seg  4745.03MB imb=0.283 ref=0 live=75216
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  costaware-E makespan=  1890.26ms steps/s=   25.4 p50= 11.711 p99=  29.370 steals=  32(att=   59) migr=  529.6MB( 36 reqs) refill= 140069 seg  4817.62MB imb=0.186 ref=1 live=67792
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  roundrobin-RR makespan=  2445.75ms steps/s=   19.6 p50= 11.164 p99=  29.525 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill= 142173 seg  4880.81MB imb=0.000 ref=0 live=0
+  => [steal-cp] precheck: pre-refused=2381 att=53 | steal_ms=544.9 (10.28 ms/att, makespan 的 27.7%, 迁移 587.6MB ≈ 24.6ms@B_ref) | precheck_ms=0.2
+  => [steal-seg] 占 steal_ms 的份额: lock=152.9(28%) lease=0.3(0%) tick=334.4(61%) crit=18.6(3%) gathr=1.5(0%) xfer=35.3(6%) scttr=1.4(0%) net=0.0(0%) | 和=544.3 (100% of steal_ms)
+  => [vchan] B=25.00GB/s T0=0.5ms | 注入等待: A=0.0 B=0.0 C=0.0 E=0.0 LLX=0.0 RR=0.0 ms | 计价字节: C=0.00 E=0.00 LLX=0.00 RR=0.00 MB
