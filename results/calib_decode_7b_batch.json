@@ -1,0 +1,64 @@
+{
+  "model": "/workspace/.models/Qwen2.5-7B-Instruct",
+  "layers": 28,
+  "kv_heads": 4,
+  "head_dim": 128,
+  "hidden": 3584,
+  "intermediate": 18944,
+  "rows": [
+    {
+      "batch": 1,
+      "ctx": 4096,
+      "step_ms": 18.981679916381836,
+      "step_ms_min": 18.964448928833008,
+      "per_layer_ms": 0.6779171398707798,
+      "per_layer_per_req_ms": 0.6779171398707798,
+      "kv_bytes": 234881024
+    },
+    {
+      "batch": 4,
+      "ctx": 4096,
+      "step_ms": 21.80521583557129,
+      "step_ms_min": 21.789791107177734,
+      "per_layer_ms": 0.7787577084132603,
+      "per_layer_per_req_ms": 0.19468942710331508,
+      "kv_bytes": 939524096
+    },
+    {
+      "batch": 8,
+      "ctx": 4096,
+      "step_ms": 24.352767944335938,
+      "step_ms_min": 24.317951202392578,
+      "per_layer_ms": 0.869741712297712,
+      "per_layer_per_req_ms": 0.108717714037214,
+      "kv_bytes": 1879048192
+    },
+    {
+      "batch": 12,
+      "ctx": 4096,
+      "step_ms": 27.71712017059326,
+      "step_ms_min": 27.666431427001953,
+      "per_layer_ms": 0.9898971489497593,
+      "per_layer_per_req_ms": 0.08249142907914661,
+      "kv_bytes": 2818572288
+    },
+    {
+      "batch": 16,
+      "ctx": 4096,
+      "step_ms": 31.429951667785645,
+      "step_ms_min": 31.393024444580078,
+      "per_layer_ms": 1.1224982738494873,
+      "per_layer_per_req_ms": 0.07015614211559296,
+      "kv_bytes": 3758096384
+    },
+    {
+      "batch": 24,
+      "ctx": 4096,
+      "step_ms": 39.143903732299805,
+      "step_ms_min": 39.04703903198242,
+      "per_layer_ms": 1.3979965618678503,
+      "per_layer_per_req_ms": 0.05824985674449376,
+      "kv_bytes": 5637144576
+    }
+  ]
+}

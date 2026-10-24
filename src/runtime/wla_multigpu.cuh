@@ -102,6 +102,26 @@ __global__ inline void wla_attn_kernel(const __half* in, __half* out,
   out[i] = __float2half(v);
 }
 
+// v30.1 第①步：真实 decode 的"计算"成本。实测（tools/calib_decode_cost.py，
+// 4090 + Qwen2.5-7B）每层每请求 0.064ms（batch 12）/ 0.655ms（batch 1）；
+// 其中 ~98% 是**权重读取**（7B×2B/28 层 = 536MB/层），与 KV 长度几乎无关
+// （ctx 1024→4096 只 +12%）。`wla_attn_kernel` 只读 KV 段，比真实低 10–107×。
+// 本 kernel 用真实 HBM 读量补齐这一项：每 (卡, 层) 读 layer_bytes 字节，
+// 与回填争抢同一份 HBM 带宽（真实 serving 也是如此）。
+__global__ void wla_tick_cost_kernel(const uint4* p, size_t n4, int loops,
+                                     float* sink) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t stride = (size_t)gridDim.x * blockDim.x;
+  uint4 acc = make_uint4(0, 0, 0, 0);
+  for (int l = 0; l < loops; ++l)
+    for (size_t j = i; j < n4; j += stride) {
+      const uint4 v = p[j];
+      acc.x ^= v.x; acc.y ^= v.y; acc.z ^= v.z; acc.w ^= v.w;
+    }
+  // 防优化：结果取决于数据，编译器不能删掉上面的读
+  if (acc.x == 0xdeadbeefu && acc.y == 0xfeedfaceu) *sink = 1.0f;
+}
+
 // 迁移内容模式（见头注释"KV 迁移内容"）
 // delta     = 批量化压实（gather → 单次 submit → scatter，2026-10-04）
 // delta-naive = v8 逐槽 submit 路径（仅作 ablation 保留：证明"增量必须
@@ -236,6 +256,21 @@ struct WlaStealPolicy {
   // 而在"决定-握手-生效"的往返延迟 ⇒ 下一步应做 L3（在途状态，不阻塞
   // thief），而不是继续把搬运挪走。
   bool steal_thread = false;
+  // v30.1 多节点两步法（只在拓扑真的多节点时生效；单节点下逐位不变）：
+  //   hier_steal：分层窃取 —— 优先同节点 victim（不跨网络），同节点无盈余
+  //               才考虑跨节点。默认开（但 multi_node()==false 时是空操作）。
+  bool hier_steal = true;
+  //   remote_tax：E 的成本模型计入"迁移后远端回填税"——
+  //               跨节点偷来的请求此后每一步 miss 都要回原节点读。
+  bool remote_tax = false;
+  // v31：容量加权窃取（见 WlaMultiGpuCtx::capacity）。等速时逐位等价旧语义。
+  bool speed_aware = false;
+  // v30.1 分类带宽：同节点迁移走本地 PCIe/NVLink，跨节点才走 NIC。
+  // 用同一个 B_ref 给两类迁移计价会双重惩罚节点内迁移 —— 实测在 B_net=1GB/s
+  // 下 E 连"同节点搬一个请求"都拒绝（每请求 3×11MB/1GB/s ≈ 33ms），于是
+  // 完全退化到不迁移、白丢本可拿到的均衡收益。
+  // 0 = 跟随 b_ref（默认，单节点/历史口径逐位不变）。
+  double b_local_gbs = 0.0;
 };
 
 // 偏移（与 kv_exec.cuh 同布局；独立命名避免头冲突）
@@ -356,15 +391,32 @@ class WlaMultiGpuCtx {
   WlaMultiGpuCtx(const std::vector<int>& devices, const MissSpec& sp,
                  const std::string& skew, const std::string& arrival,
                  double gap_ms, WlaKvMode kvmode, double vchan_bw_gbs = 0.0,
-                 double vchan_t0_ms = 0.0)
+                 double vchan_t0_ms = 0.0,
+                 const std::vector<int>& vchan_nodes = std::vector<int>(),
+                 double layer_cost_mb = 0.0,
+                 const std::vector<double>& slow_mult = std::vector<double>(),
+                 double slow_at_ms = 0.0)
       : devs_(devices), n_(devices.size()), sp_(sp), kvmode_(kvmode),
-        vchan_bw_gbs_(vchan_bw_gbs), vchan_t0_ms_(vchan_t0_ms) {
+        vchan_bw_gbs_(vchan_bw_gbs), vchan_t0_ms_(vchan_t0_ms),
+        layer_cost_bytes_((size_t)(layer_cost_mb * 1048576.0)),
+        slow_at_ms_(slow_at_ms) {
+    // v31：卡变慢场景（干扰/降频/共租户/撤离预备）。slow_mult[g] = 该卡计算
+    // 成本的倍数（1.0 = 不变），从 slow_at_ms 起生效 —— 模拟"准入时卡是快的，
+    // 后来变慢"。这类事件准入侧路由无法预见、也无法修正已在 decode 的请求。
+    slow_mult_.assign(n_, 1.0);
+    for (int g = 0; g < n_ && g < (int)slow_mult.size(); ++g)
+      slow_mult_[g] = slow_mult[g] > 0.0 ? slow_mult[g] : 1.0;
     R_ = sp.num_requests;
-    if (vchan_bw_gbs_ > 0.0) {
-      vlinks_.reset(new WlaVLink[n_]);
-      stolen_.reset(new std::atomic<uint8_t>[R_]);
-      for (int r = 0; r < R_; ++r) stolen_[r].store(0);
-    }
+    // 拓扑（v30.1）：--vchan-nodes 给出每卡所属节点 id（4 卡 2+2 = "0,0,1,1"）。
+    // 缺省 = 每卡独占一个节点 —— 与 v30"每卡一条链路"的口径逐位等价。
+    // 链路数 = 节点数（每节点一块 NIC，同节点多卡共享），这是 2+2 的关键
+    // 差异：同节点两张卡不能各自拿满 B。
+    node_of_.resize(n_);
+    for (int g = 0; g < n_; ++g)
+      node_of_[g] = ((int)vchan_nodes.size() == n_) ? vchan_nodes[g] : g;
+    nnodes_ = 1;
+    for (int g = 0; g < n_; ++g) nnodes_ = std::max(nnodes_, node_of_[g] + 1);
+    if (vchan_bw_gbs_ > 0.0) vlinks_.reset(new WlaVLink[nnodes_]);
     c4_ = sp.c4_bytes();
     ngrp_ = sp.prefix_group > 1 ? (R_ + sp.prefix_group - 1) / sp.prefix_group
                                 : R_;
@@ -407,6 +459,12 @@ class WlaMultiGpuCtx {
         arrive_ms_[r] = t;
       }
     }
+    // KV home 节点：**实际分发落卡**时定死（见 dispatch*）。不能用
+    // reqs_[r].dest 反推 —— RR/LLX 的实际落卡与亲和 dest 不同，否则 RR 会被
+    // 错误地计成"全都在远端读"（实测把 RR 的 makespan 从 74ms 抬到 261ms）。
+    // 此后不随迁移改变：跨节点偷走后其 miss 回填仍要回原节点读，这是 v30.1
+    // 认定的主成本项；被偷回 home 节点所在卡时 is_remote 自然变假。
+    home_node_.assign(R_, -1);
     // 各卡缓冲（全尺寸，按请求 id 分段）
     d_cache_.resize(n_);
     d_out_.resize(n_);
@@ -415,6 +473,17 @@ class WlaMultiGpuCtx {
       CUDA_CHECK(cudaMalloc(&d_cache_[g], (size_t)R_ * seg_));
       CUDA_CHECK(cudaMalloc(&d_out_[g], (size_t)R_ * seg_));
       CUDA_CHECK(cudaMemset(d_cache_[g], 0, (size_t)R_ * seg_));
+    }
+    // v30.1：计算成本模拟用的只读 buffer（每卡一块，每层读一遍）。
+    // 只在 layer_cost_bytes>0 时分配；否则全程序与历史口径逐位一致。
+    if (layer_cost_bytes_ > 0) {
+      d_cost_.resize(n_);
+      for (int g = 0; g < n_; ++g) {
+        CUDA_CHECK(cudaSetDevice(devs_[g]));
+        CUDA_CHECK(cudaMalloc(&d_cost_[g], layer_cost_bytes_));
+        CUDA_CHECK(cudaMemset(d_cost_[g], 0x5a, layer_cost_bytes_));
+      }
+      CUDA_CHECK(cudaMalloc(&d_cost_sink_, sizeof(float)));
     }
     // host pinned KV slab（tile 填充合法 half 载荷）
     slab_bytes_ = (size_t)R_ * sp.num_layers * max_blocks_ * c4_;
@@ -493,6 +562,8 @@ class WlaMultiGpuCtx {
     for (int i = 0; i < n_; ++i) refill_inflight_[i].store(0.0);
     // 状态
     local_.resize(n_);
+    step_ema_g_.reset(new std::atomic<double>[n_]);
+    for (int i = 0; i < n_; ++i) step_ema_g_[i].store(0.0);
     next_step_.assign(R_, 0);
     done_ms_.assign(R_, 0.0);
     in_tick_.assign(n_, false);
@@ -522,6 +593,9 @@ class WlaMultiGpuCtx {
         cudaFree(mig_stage_v_[g]);
         cudaFree(mig_stage_c_[g]);
         cudaFreeHost(h_mig_idx_v_[g]);
+      for (char* p : d_cost_)
+        if (p) cudaFree(p);
+      if (d_cost_sink_) cudaFree(d_cost_sink_);
       }
     }
   }
@@ -678,6 +752,7 @@ class WlaMultiGpuCtx {
     while (i < (size_t)R_ && reqs_[i].arrive_ms <= now_ms) {
       int dest = reqs_[i].dest;
       if (kind == WlaDispatch::RoundRobin) dest = rr_counter_++ % n_;
+      home_node_[i] = node_of_[dest];  // v30.1：home = 首次落卡所在节点
       local_[dest].push_back((int)i);
       grp_member_add(dest, wla_grp(sp_, (int)i), +1);
       ++i;
@@ -695,6 +770,7 @@ class WlaMultiGpuCtx {
       size_t best = SIZE_MAX;
       for (int g = 0; g < n_; ++g)
         if (local_[g].size() < best) { best = local_[g].size(); dest = g; }
+      home_node_[i] = node_of_[dest];  // v30.1：home = 首次落卡所在节点
       local_[dest].push_back((int)i);
       grp_member_add(dest, wla_grp(sp_, (int)i), +1);
       ++i;
@@ -751,6 +827,44 @@ class WlaMultiGpuCtx {
   // 指定 victim 的窃取内核（LLX 重平衡复用：src 由全局视角指定，
   // 而非 thief 自选最忙卡；公平性：同一让渡协议、同一条 D2D 通道）
   // v_sel=-1 = 自选最忙卡（C/E 语义）；v_sel>=0 = 指定源卡（LLX 语义）
+  // 分层窃取（v30.1）：优先同节点 victim（迁移不跨网络），同节点全无盈余
+  // 才跨节点。调用方须持 mtx_。返回 -1 = 无候选。
+  // 注意：这是"拓扑优先"，不是"成本优先" —— 是否该跨节点仍由 E 的
+  // remote_tax 判定（C 语义不做成本过滤，只做分层）。
+  // 盈余口径（v31）：每个候选 victim 用**它自己的**容量份额判盈余，
+  // 而不是拿 thief 的份额去比。等速时两者相同（逐位等价）；慢卡的份额更小，
+  // 同样 24 个请求对它是"超载"、对快卡是"正常"，只有按各自份额判才看得出。
+  double excess(int s) const {
+    return (double)local_[s].size() - (double)fair_share(s);
+  }
+  int pick_victim_hier(int g) const {
+    int best_same = -1, best_x = -1;
+    double ex_same = 0.0, ex_x = 0.0;
+    for (int s = 0; s < n_; ++s) {
+      if (s == g || local_[s].empty()) continue;
+      const double ex = excess(s);
+      if (ex <= 0.0) continue;
+      if (same_node(s, g)) {
+        if (ex > ex_same) { ex_same = ex; best_same = s; }
+      } else if (ex > ex_x) {
+        ex_x = ex;
+        best_x = s;
+      }
+    }
+    return best_same >= 0 ? best_same : best_x;
+  }
+  // 自选最忙卡（等速 = 旧语义"队列最长"；速度感知 = 盈余最大）
+  int pick_victim_busiest(int g) const {
+    int best = -1;
+    double best_ex = 0.0;
+    for (int s = 0; s < n_; ++s) {
+      if (s == g || local_[s].empty()) continue;
+      const double ex = excess(s);
+      if (ex > best_ex) { best_ex = ex; best = s; }
+    }
+    return best;
+  }
+
   // 控制面前置判定（调用方须持 mtx_；见 WlaStealPolicy::precheck）：
   // 只做"这次尝试有没有可能成功"的判定，不改变任何状态。
   bool steal_precheck(int g, int v_sel, size_t k, const WlaStealPolicy& pol) {
@@ -758,31 +872,29 @@ class WlaMultiGpuCtx {
     if (completed_.load() >= (size_t)R_) return false;
     int v = v_sel;
     if (v < 0) {  // 自选最忙卡（与 steal_from 同一口径）
-      size_t best = 0;
-      for (int s = 0; s < n_; ++s) {
-        if (s == g) continue;
-        if (local_[s].size() > best) {
-          best = local_[s].size();
-          v = s;
-        }
+      if (pol.hier_steal && multi_node()) {
+        v = pick_victim_hier(g);
+        if (v < 0) return false;
+      } else {
+        v = pick_victim_busiest(g);
+        if (v < 0) return false;
       }
-      if (v < 0) return false;
     } else if (v == g || local_[v].empty()) {
       return false;
     }
     const size_t cur = local_[v].size();
-    const size_t fair = (v_sel < 0) ? fair_share() : 0;
+    const size_t fair = (v_sel < 0) ? fair_share(v) : 0;
     if (cur <= fair) return false;  // victim 无盈余 → 真实路径也必失败
     const size_t take = std::min(std::min(k, cur - fair), cur / 2 + 1);
     if (take == 0) return false;
     if (!pol.cost_filter) return true;
-    return cost_filter_ok(v, take, pol, nullptr) > 0;
+    return cost_filter_ok(g, v, take, pol, nullptr) > 0;
   }
 
   // E 的成本过滤（调用方须持 mtx_）：候选自队尾起（最近到达 = 剩余步最多），
   // 取通过过滤的最长前缀，返回通过数。snap_cands 非空时收集逐候选判定。
   // steal_from 与 steal_precheck 共用本函数 ⇒ 两处口径不会漂移。
-  size_t cost_filter_ok(int v, size_t take, const WlaStealPolicy& pol,
+  size_t cost_filter_ok(int g, int v, size_t take, const WlaStealPolicy& pol,
                         std::vector<SnapDecision::EbyteCand>* snap_cands) const {
     // E：价值过滤 —— 只迁"剩余工作 ≥ margin × 真实迁移成本"的请求。
     // 成本必须按当前 kv-mode 的真实代价计（否则 E 基于未支付的成本决策，
@@ -791,7 +903,12 @@ class WlaMultiGpuCtx {
     //   delta = κ×live×c4/B_ref + c_fix（双跳只发驻留槽）
     //   drop  = live×c4/B_ref（消费卡冷启动回填，单跳 H2D，不随 κ 缩放）
     // R-cal（v19）：B_ref/κ 分离；旧公式数值 = --b-ref 11 --cost-scale 2
-    const double bw_ms_per_byte = 1e3 / (pol.b_ref_gbs * 1e9);
+    // 按迁移类别选带宽：同节点 = 本地链路，跨节点 = 网络参考带宽
+    const double bw_eff_gbs = ((multi_node() && !same_node(v, g)) ||
+                               pol.b_local_gbs <= 0.0)
+                                  ? pol.b_ref_gbs
+                                  : pol.b_local_gbs;
+    const double bw_ms_per_byte = 1e3 / (bw_eff_gbs * 1e9);
     const double step_ms = step_ms_ema_.load();
     size_t ok = 0;
     for (size_t j = 0; j < take; ++j) {
@@ -814,6 +931,14 @@ class WlaMultiGpuCtx {
                       : (kvmode_ == WlaKvMode::DeltaNaive
                              ? 2.0 * live_b * bw_ms_per_byte
                              : 1.0 * live_b * bw_ms_per_byte);
+      }
+      // v30.1 远端回填税：跨节点偷来的请求，此后每一步 miss 都要回原节点
+      // 读。真实 trace + B=1GB/s 下这笔税占跨节点字节 ~83%（实验设计 §22.9）
+      // —— 不计入成本模型，E 就会批准"搬一次、然后每步流血"的迁移。
+      // 每步 miss 字节 = sel_blocks × layers × c4 × (1−hit)，trace 静态量。
+      if (pol.remote_tax && is_remote(g, r)) {
+        cost_ms += (double)(wla_len_of(sp_, r) - next_step_[r]) *
+                   miss_b_per_step_ / (vchan_bw_gbs_ * 1e9) * 1e3;
       }
       const double value =
           (double)(wla_len_of(sp_, r) - next_step_[r]) * step_ms;
@@ -875,15 +1000,13 @@ class WlaMultiGpuCtx {
       const auto t_mtx0 = std::chrono::steady_clock::now();
       std::unique_lock<std::mutex> lk(mtx_);
       if (v < 0) {  // 自选最忙卡（C/E 既有语义）
-        size_t best = 0;
-        for (int s = 0; s < n_; ++s) {
-          if (s == g) continue;
-          if (local_[s].size() > best) {
-            best = local_[s].size();
-            v = s;
-          }
+        if (pol.hier_steal && multi_node()) {
+          v = pick_victim_hier(g);
+          if (v < 0) return 0;
+        } else {
+          v = pick_victim_busiest(g);
+          if (v < 0) return 0;
         }
-        if (v < 0) return 0;
       } else {
         if (v == g || local_[v].empty()) return 0;  // 指定源（LLX）
       }
@@ -914,14 +1037,14 @@ class WlaMultiGpuCtx {
       const auto t_crit0 = std::chrono::steady_clock::now();
       const size_t cur = local_[v].size();
       // LLX 指定源时按全局份额判定盈余；C/E 自选时沿用公平份额（冻结语义）
-      const size_t fair = (v_sel < 0) ? fair_share() : 0;
+      const size_t fair = (v_sel < 0) ? fair_share(v) : 0;
       if (cur <= fair) return 0;  // victim 无盈余（防乒乓：不让其跌破公平份额）
       size_t take = std::min(std::min(k, cur - fair), cur / 2 + 1);
       if (take == 0) return 0;
       // 反事实快照：在 cost_filter 之前收集 E-byte 逐候选判定
       std::vector<SnapDecision::EbyteCand> snap_cands;
       if (pol.cost_filter) {
-        const size_t ok = cost_filter_ok(v, take, pol,
+        const size_t ok = cost_filter_ok(g, v, take, pol,
                                          snap_on_ ? &snap_cands : nullptr);
         if (ok == 0) {
           if (snap_on_) {
@@ -1046,9 +1169,6 @@ class WlaMultiGpuCtx {
       // 同批后交者的"独占"判定会把已离开者的块误算成共享）
       if (own_on())
         for (int r : moved) own_release(v, r);
-      // vchan：请求已跨节点 ⇒ 其后续 miss 回填按远端读计价（见 is_stolen）
-      if (vchan_on())
-        for (int r : moved) mark_stolen(r);
       // cap_mode=1：handoff 已拷贝完 → victim 侧按收缩后的容量裁剪。
       if (sp_.cap_mode == 1 && !moved.empty()) {
         std::vector<int> vg;
@@ -1218,7 +1338,8 @@ class WlaMultiGpuCtx {
     p_t_samples_.fetch_add(1);
     // vchan：迁移 payload 走跨节点链路（T0 每迁移事件一次）。放在 B_eff 观测
     // 之后 —— b_eff 量的是真实硬件达成带宽，不应被虚拟等待污染。
-    if (vchan_on() && !moved.empty()) {
+    // 只在真的跨节点时计价：同节点迁移走本地 PCIe/NVLink，不计网络成本
+    if (vchan_on() && !moved.empty() && !same_node(v, g)) {
       const auto t_net0 = std::chrono::steady_clock::now();
       vlink_charge(g, moved_bytes, /*with_t0=*/true);
       seg.net += ms_since(t_net0);
@@ -1235,10 +1356,18 @@ class WlaMultiGpuCtx {
     std::unique_lock<std::mutex> lk(mtx_);
     return local_[g].size();
   }
-  // 公平份额（C 窃取水位）：已到达未完成请求均摊到各卡（向上取整）
-  size_t fair_share() const {
+  // 公平份额（C 窃取水位）：已到达未完成请求按**容量**分到卡 g。
+  // v31：容量 = 1/该卡每请求步成本。全卡等速 ⇒ capacity≡1 ⇒ 与旧式"均摊"
+  // 逐位等价（size_t 取整方式见下）。某卡变慢 ⇒ 它分到的份额按比例变小，
+  // 快卡因此会立刻（而不是等自己跑空）去偷它的请求。
+  size_t fair_share(int g) const {
     const size_t arrived_remaining = next_arrive_.load() - completed_.load();
-    return (arrived_remaining + n_ - 1) / n_;
+    if (!speed_aware_) return (arrived_remaining + n_ - 1) / n_;
+    double cap_sum = 0.0;
+    for (int i = 0; i < n_; ++i) cap_sum += capacity(i);
+    const double mine = capacity(g);
+    if (cap_sum <= 0.0 || mine <= 0.0) return (arrived_remaining + n_ - 1) / n_;
+    return (size_t)std::ceil((double)arrived_remaining * mine / cap_sum);
   }
   // victim 侧：有 thief 等待窃取窗口时有界让渡（≤2ms；超时也不破坏
   // 正确性——thief 的 in_tick 检查会重新等待）
@@ -1400,14 +1529,28 @@ class WlaMultiGpuCtx {
     }
   }
   bool mig_thread_on() const { return mig_req_ != nullptr; }
+  void enable_speed_aware(bool b) { speed_aware_ = b; }
 
   // ---- 虚拟跨节点链路（v30，默认关；见 WlaVLink 注释）----
   bool vchan_on() const { return vchan_bw_gbs_ > 0.0; }
-  // 请求已跨节点迁移 ⇒ 其 KV home 在原节点，后续 miss 回填按远端读计价
-  void mark_stolen(int r) {
-    if (stolen_) stolen_[r].store(1);
+  int node_of(int g) const { return node_of_[g]; }
+  int n_nodes() const { return nnodes_; }
+  bool same_node(int a, int b) const { return node_of_[a] == node_of_[b]; }
+  // 真多节点拓扑（有卡共节点）→ 分层窃取/远端税才有意义
+  bool multi_node() const { return nnodes_ < n_; }
+  // 请求 r 在卡 g 上的 miss 回填是否跨节点（KV home 不在 g 所在节点）。
+  // 取代 v30 的 stolen_ 布尔：请求可能被偷两次、也可能被偷回原节点，按"当前
+  // 卡与 home 节点是否同节点"判定才正确；单节点拓扑下与旧语义等价。
+  bool is_remote(int g, int r) const {
+    return vchan_on() && home_node_[r] >= 0 && node_of_[g] != home_node_[r];
   }
-  bool is_stolen(int r) const { return stolen_ && stolen_[r].load() != 0; }
+  // E 成本模型的"远端回填税"输入：每执行一步的 miss 字节（trace 静态量）
+  void set_hit_rate(double hit) {
+    miss_b_per_step_ =
+        (double)sp_.sel_blocks * (double)sp_.num_layers * (double)c4_ *
+        (1.0 - hit);
+  }
+  double miss_bytes_per_step() const { return miss_b_per_step_; }
   // 把 bytes 排上卡 g 的跨节点链路并阻塞到传输完成；with_t0 = 付一次建链开销
   void vlink_charge(int g, size_t bytes, bool with_t0) {
     if (vchan_bw_gbs_ <= 0.0) return;
@@ -1416,11 +1559,13 @@ class WlaMultiGpuCtx {
                            .count();
     double done = 0.0;
     {
-      std::lock_guard<std::mutex> lk(vlinks_[g].m);
-      const double start = std::max(now, vlinks_[g].free_at_ms);
+      // 索引 = 发送端节点（同节点两张卡共享这块 NIC → 2+2 下互相排队）
+      WlaVLink& lk_node = vlinks_[node_of_[g]];
+      std::lock_guard<std::mutex> lk(lk_node.m);
+      const double start = std::max(now, lk_node.free_at_ms);
       done = start + (with_t0 ? vchan_t0_ms_ : 0.0) +
              (double)bytes / (vchan_bw_gbs_ * 1e9) * 1e3;
-      vlinks_[g].free_at_ms = done;
+      lk_node.free_at_ms = done;
     }
     vlink_bytes_.fetch_add(bytes);
     const double wait = done - now;
@@ -1444,6 +1589,20 @@ class WlaMultiGpuCtx {
       while (now_ms() < deadline) std::this_thread::yield();
     }
   }
+  // v31：本卡当前的计算成本倍数（now_ms 为相对起点的毫秒）
+  double slow_mult(int g, double now_ms) const {
+    if (slow_mult_.empty() || now_ms < slow_at_ms_) return 1.0;
+    return slow_mult_[g];
+  }
+  bool any_slow() const {
+    for (double m : slow_mult_)
+      if (m != 1.0) return true;
+    return false;
+  }
+  bool layer_cost_on() const { return layer_cost_bytes_ > 0; }
+  char* cost_buf(int g) { return d_cost_[g]; }
+  size_t cost_bytes() const { return layer_cost_bytes_; }
+  float* cost_sink() { return d_cost_sink_; }
   double vchan_wait_ms() const { return vchan_wait_ms_.load(); }
   uint64_t vchan_bytes() const { return vlink_bytes_.load(); }
   WlaKvMode kv_mode() const { return kvmode_; }
@@ -1640,10 +1799,35 @@ class WlaMultiGpuCtx {
     return refill_g_bytes_ ? refill_g_bytes_[g].load(std::memory_order_relaxed) : 0;
   }
   // E 决策输入④：tick 实测的每请求步成本（含回填/迁移的通道争用）
-  void update_step_ema(double tick_ms, size_t executed) {
+  void update_step_ema(int g, double tick_ms, size_t executed) {
     if (executed == 0) return;
     const double per = tick_ms / (double)executed;
-    step_ms_ema_.store(0.9 * step_ms_ema_.load() + 0.1 * per);
+    {  // 全局（E 的成本模型用）
+      const double prev = step_ms_ema_.load();
+      step_ms_ema_.store(0.9 * prev + 0.1 * per);
+    }
+    // v31：每卡一份 —— 存**吞吐**（请求/ms）而非每请求耗时。
+    // 用 per-request 耗时会在低占用时被固定成本（权重读 18ms）稀释：慢卡
+    // 24 请求 60ms/24=2.5ms，快卡 39ms/24=1.6ms，比值只有 1.56，而真实
+    // 速度比是 2.0 ⇒ 容量份额被压扁，窃取不够。吞吐口径（executed/tick）
+    // 与"每副本打点"的实际工程做法一致。
+    const double thr = tick_ms > 0.0 ? (double)executed / tick_ms : 0.0;
+    const double prev = step_ema_g_[g].load();
+    step_ema_g_[g].store(prev > 0.0 ? 0.9 * prev + 0.1 * thr : thr);
+  }
+  // 卡 g 的相对容量（= 该卡吞吐 / 各卡平均吞吐）。全卡等速时恒为 1 ⇒ 与
+  // 既有"均摊"语义逐位等价；某卡变慢时自动变小。
+  double capacity(int g) const {
+    if (!speed_aware_) return 1.0;
+    double sum = 0.0;
+    int cnt = 0;
+    for (int i = 0; i < n_; ++i) {
+      const double ti = step_ema_g_[i].load();
+      if (ti > 0.0) { sum += ti; ++cnt; }
+    }
+    const double mine = step_ema_g_[g].load();
+    if (cnt < n_ || sum <= 0.0 || mine <= 0.0) return 1.0;  // 未测全 → 等权
+    return mine / (sum / n_);
   }
 
   // ---- LLX（Llumnix-style）周期全局重平衡 ----
@@ -1736,6 +1920,8 @@ class WlaMultiGpuCtx {
   std::atomic<uint64_t> steals_{0}, migrated_reqs_{0};
   std::atomic<size_t> migrated_bytes_{0};
   std::atomic<double> step_ms_ema_{2.0};   // E 决策输入④：每请求步成本 EMA
+  std::unique_ptr<std::atomic<double>[]> step_ema_g_;  // v31：每卡一份
+  bool speed_aware_ = false;  // v31：容量加权窃取（默认关 = 等权，旧语义）
   std::atomic<uint64_t> steal_refused_{0}; // E 遥测：价值不足拒绝的窃取数
   std::atomic<uint64_t> steal_attempts_{0}; // 小实验 C：总尝试（含失败）
   // 控制面遥测（v30，只读）：前置判定把"注定失败的尝试"挡在临界路径之外，
@@ -1789,8 +1975,16 @@ class WlaMultiGpuCtx {
   WlaKvMode kvmode_;
   // 虚拟跨节点链路（v30，默认关）：bw<=0 时 vlinks_/stolen_ 为空，全部空操作
   double vchan_bw_gbs_ = 0.0, vchan_t0_ms_ = 0.0;
-  std::unique_ptr<WlaVLink[]> vlinks_;
-  std::unique_ptr<std::atomic<uint8_t>[]> stolen_;
+  std::vector<char*> d_cost_;   // 每卡计算成本 buffer（layer_cost_bytes_）
+  float* d_cost_sink_ = nullptr;
+  size_t layer_cost_bytes_ = 0;
+  std::vector<double> slow_mult_;  // 每卡计算成本倍数（v31）
+  double slow_at_ms_ = 0.0;        // 从该时刻起生效
+  std::vector<int> node_of_;    // GPU -> 节点 id（v30.1 拓扑）
+  std::vector<int> home_node_;  // 请求 -> KV home 节点（分发时定）
+  int nnodes_ = 1;
+  double miss_b_per_step_ = 0.0;  // set_hit_rate 计算，供 E 的远端税使用
+  std::unique_ptr<WlaVLink[]> vlinks_;  // 索引 = 节点
   // v30 L2：每卡迁移请求信箱（见 enable_mig_thread）。空 = 迁移仍由执行线程
   // 内联完成（默认语义）。
   std::unique_ptr<std::atomic<uint8_t>[]> mig_req_;
@@ -1840,7 +2034,13 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                                       double rebal_interval_ms = 50.0,
                                       double rebal_thr = 0.25,
                                       double vchan_bw_gbs = 0.0,
-                                      double vchan_t0_ms = 0.0) {
+                                      double vchan_t0_ms = 0.0,
+                                      const std::vector<int>& vchan_nodes =
+                                          std::vector<int>(),
+                                      double layer_cost_mb = 0.0,
+                                      const std::vector<double>& slow_mult =
+                                          std::vector<double>(),
+                                      double slow_at_ms = 0.0) {
   WlaStealPolicy spol = spol_in;
   spol.cost_filter = (mode == 3);  // E 开关；A/B/C/D1/D2/RR 恒 false（语义不变）
   // LLX/RR/D1/D2 归一：执行引擎一律 = C（mengine=2 控制流），差异仅在
@@ -1883,11 +2083,13 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
     wla_recompute_stats(tr, sp);       // C2：按组全局 LRU 重算 miss/命中率
   }
   WlaMultiGpuCtx ctx(devices, sp, skew, arrival, gap_ms, kvmode, vchan_bw_gbs,
-                     vchan_t0_ms);
+                     vchan_t0_ms, vchan_nodes, layer_cost_mb, slow_mult,
+                     slow_at_ms);
   ctx.snap_init(mode);
   // v30 L2：迁移搬出执行线程（--steal-thread 1）。仅在真正会做拉式窃取的
   // 模式下启用信箱；A/LLX/RR 不使用。
   if (spol.steal_thread && pull_steal) ctx.enable_mig_thread();
+  ctx.enable_speed_aware(spol.speed_aware);
 
   const int n = devices.size();
   WlaMultiStats st;
@@ -1914,6 +2116,8 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
     st.trace_miss_bytes = mis * sp.c4_bytes();
     st.hit_rate = sel ? 1.0 - (double)mis / (double)sel : 0.0;
   }
+  // E 的远端回填税需要"每步 miss 字节"这个静态量（含变长重算后的 hit 率）
+  ctx.set_hit_rate(st.hit_rate);
 
   HostTimer ht;
   ht.tick();
@@ -1982,6 +2186,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
       const int L = sp.num_layers, G = sp.sel_blocks;
       const size_t c4 = ctx.c4();
 
+      double tick_slow = 1.0;  // 本 tick 的卡级慢速倍数（v31）
       auto attn_layer = [&](int r, int l) {
         // C2：attn 源读组段（数据在组偏移）；out 为 scratch，同组偏移
         const int q = wla_grp(sp, r);
@@ -1990,8 +2195,10 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
         __half* out = reinterpret_cast<__half*>(
             ctx.out(g) + (size_t)(q * L + l) * sp.hot_blocks * c4);
         const uint64_t ne = (size_t)sp.hot_blocks * c4 / sizeof(__half);
+        const int iters =
+            (int)llround((double)attn_iters * tick_slow);
         wla_attn_kernel<<<(int)((ne + 255) / 256), 256, 0, cs>>>(src, out, ne,
-                                                                 attn_iters);
+                                                                 iters);
         CUDA_CHECK_LAST();
       };
 
@@ -2038,7 +2245,8 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
               const MissEvent& e = tr.events[base_ev + (size_t)l * G + k];
               if (!is_miss(r, s, l, k)) continue;
               // vchan：被迁移请求的 miss = 远端读（其 KV home 仍在原节点）
-              if (ctx.is_stolen(r)) ctx.vlink_charge(g, c4, /*with_t0=*/false);
+              if (ctx.is_remote(g, r))
+                ctx.vlink_charge(g, c4, /*with_t0=*/false);
               ch->submit(ctx.slab() + wla_slab_off(sp, r, l, e.block_id), c4,
                          ctx.cache(g) + slot_off(r, l, e.block_id));
               ch->sync();
@@ -2116,7 +2324,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
             ch->wait_last_arrival(cs);
             CUDA_CHECK(cudaSetDevice(devices[g]));
             // vchan：本批字节若属被迁移请求 = 远端读，按链路 B 计价后串行等待
-            if (ctx.is_stolen(r))
+            if (ctx.is_remote(g, r))
               ctx.vlink_charge(g, take * c4, /*with_t0=*/false);
             // L2 遥测：批完成，撤回在途回填字节
             ctx.refill_inflight_add(g, -(double)take * c4 / (1 << 20));
@@ -2159,6 +2367,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
           continue;
         }
         const double t_tick0 = ht.toc_ms() - t0;
+        tick_slow = ctx.slow_mult(g, t_tick0);  // v31：卡变慢（默认恒 1.0）
         const uint64_t rb0 = ctx.refill_g_get(g);
         size_t executed = 0;
         for (int r : resident) {
@@ -2168,12 +2377,23 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
           ++executed;
         }
         CUDA_CHECK(cudaSetDevice(devices[g]));
+        // v30.1 第①步：tick 级计算成本（真实 decode 的权重读取量）。
+        // 一次读 L 遍 layer_cost_bytes_（= 每层每卡的量），总流 =
+        // L × 536MB ≈ 15GB ≈ 实测 18–28ms/step。
+        if (ctx.layer_cost_on()) {
+          const size_t n4 = ctx.cost_bytes() / sizeof(uint4);
+          const int loops = std::max(1, (int)llround((double)L * tick_slow));
+          wla_tick_cost_kernel<<<1024, 256, 0, cs>>>(
+              reinterpret_cast<const uint4*>(ctx.cost_buf(g)), n4, loops,
+              ctx.cost_sink());
+          CUDA_CHECK_LAST();
+        }
         CUDA_CHECK(cudaStreamSynchronize(cs));
         const double t_tick1 = ht.toc_ms() - t0;
         ctx.record_tick(g, tick_idx++, (int)resident.size(),
                         ctx.refill_g_get(g) - rb0, t_tick1 - t_tick0);
         ctx.tick_end(g, resident, t_tick1);
-        ctx.update_step_ema(t_tick1 - t_tick0, executed);  // E 决策输入④
+        ctx.update_step_ema(g, t_tick1 - t_tick0, executed);  // E 决策输入④
         for (size_t i = 0; i < executed; ++i)
           step_durs[g].push_back(t_tick1 - t_tick0);
         if (std::getenv("FERRY_WLA_DEBUG"))
@@ -2191,7 +2411,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
         // steal_delay_ms：失衡须持续 ≥ delay 才触发首次干预（时机反事实轴）；
         // 触发后连续纠偏不再等待；occ ≥ fair 即清零计时（自愈/到达补齐）。
         if (pull_steal && mode != 1 && !ctx.all_done() &&
-            ctx.occ(g) < ctx.fair_share()) {
+            ctx.occ(g) < ctx.fair_share(g)) {
           bool fire = true;
           if (spol.steal_delay_ms > 0.0) {
             const double now_ms = ht.toc_ms() - t0;

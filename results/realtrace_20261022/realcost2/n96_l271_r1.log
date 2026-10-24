@@ -1,0 +1,4 @@
+[len] dist=lognormal median=32 sigma=0.60 seed=42 | 实际 p10=14 p50=34 p90=80 max=96 | 截断@steps=4 个 (4%) | 总步数 3950
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=imbalanced reqs=96 steps=96 layers=28 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 B_ref=25.0GB/s cost-scale=3.00 mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 cap=perreq steal-delay=0.0ms seed=42 own-carry=0 vchan=25.00GB/s/0.5ms len=lognormal(med32/sig0.60) precheck=1 lock=narrow mthread=0 nodes=0,0,1,1 hier=1 rtax=1 lbw=16.60 lcost=271MB
+[miss_trace] /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin: num_requests 不一致
+[miss_trace] 真实 trace 参数与本次运行不一致，或文件损坏；拒绝退回合成流。

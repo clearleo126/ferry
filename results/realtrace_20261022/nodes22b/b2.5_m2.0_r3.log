@@ -1,0 +1,11 @@
+[len] dist=lognormal median=32 sigma=0.60 seed=42 | 实际 p10=13 p50=31 p90=83 max=96 | 截断@steps=3 个 (6%) | 总步数 2006
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=imbalanced reqs=48 steps=96 layers=28 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 B_ref=2.5GB/s cost-scale=3.00 mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 cap=perreq steal-delay=0.0ms seed=42 own-carry=0 vchan=2.50GB/s/0.5ms len=lognormal(med32/sig0.60) precheck=1 lock=narrow mthread=0 nodes=0,0,1,1 hier=1 rtax=1
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  ferry-C   makespan=   649.96ms steps/s=   73.9 p50=  7.892 p99=  28.894 steals=  21(att=   24) migr=  380.5MB( 30 reqs) refill= 130515 seg  4498.22MB imb=0.339 ref=0 live=48708
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  costaware-E makespan=   760.02ms steps/s=   63.2 p50=  7.218 p99=  36.589 steals=   6(att=    8) migr=   12.3MB( 15 reqs) refill= 125703 seg  4334.22MB imb=0.059 ref=2 live=1580
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  roundrobin-RR makespan=   558.10ms steps/s=   86.0 p50=  6.851 p99=  23.620 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill= 142173 seg  4880.81MB imb=0.000 ref=0 live=0
+  => [steal-cp] precheck: pre-refused=461 att=24 | steal_ms=271.6 (11.32 ms/att, makespan 的 41.8%, 迁移 380.5MB ≈ 159.6ms@B_ref) | precheck_ms=0.0
+  => [steal-seg] 占 steal_ms 的份额: lock=32.7(12%) lease=15.8(6%) tick=92.6(34%) crit=14.3(5%) gathr=1.0(0%) xfer=23.5(9%) scttr=1.1(0%) net=90.3(33%) | 和=271.3 (100% of steal_ms)
+  => [vchan] B=2.50GB/s T0=0.5ms | 注入等待: A=0.0 B=0.0 C=588.5 E=465.8 LLX=0.0 RR=0.0 ms | 计价字节: C=1145.38 E=896.94 LLX=0.00 RR=0.00 MB

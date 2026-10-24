@@ -1,0 +1,11 @@
+[len] dist=lognormal median=32 sigma=0.60 seed=42 | 实际 p10=13 p50=31 p90=83 max=96 | 截断@steps=3 个 (6%) | 总步数 2006
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=imbalanced reqs=48 steps=96 layers=28 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 B_ref=2.5GB/s cost-scale=3.00 mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 cap=perreq steal-delay=0.0ms seed=42 own-carry=0 vchan=2.50GB/s/0.5ms len=lognormal(med32/sig0.60) precheck=1 lock=narrow mthread=0 nodes=0,0,1,1 hier=1 rtax=1 lbw=0.00
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  ferry-C   makespan=   679.16ms steps/s=   70.7 p50=  7.649 p99=  31.187 steals=  21(att=   23) migr=  359.5MB( 29 reqs) refill= 130493 seg  4497.62MB imb=0.306 ref=0 live=46020
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  costaware-E makespan=   594.55ms steps/s=   80.7 p50=  7.201 p99=  37.769 steals=   5(att=    6) migr=   12.3MB( 13 reqs) refill= 124101 seg  4279.72MB imb=0.102 ref=1 live=1580
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  roundrobin-RR makespan=   530.83ms steps/s=   90.4 p50=  6.913 p99=  25.268 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill= 142173 seg  4880.81MB imb=0.000 ref=0 live=0
+  => [steal-cp] precheck: pre-refused=313 att=23 | steal_ms=256.0 (11.13 ms/att, makespan 的 37.7%, 迁移 359.5MB ≈ 150.8ms@B_ref) | precheck_ms=0.1
+  => [steal-seg] 占 steal_ms 的份额: lock=8.2(3%) lease=18.3(7%) tick=97.8(38%) crit=13.6(5%) gathr=0.8(0%) xfer=21.8(8%) scttr=1.0(0%) net=94.0(37%) | 和=255.6 (100% of steal_ms)
+  => [vchan] B=2.50GB/s T0=0.5ms | 注入等待: A=0.0 B=0.0 C=783.5 E=342.2 LLX=0.0 RR=0.0 ms | 计价字节: C=1424.31 E=661.28 LLX=0.00 RR=0.00 MB

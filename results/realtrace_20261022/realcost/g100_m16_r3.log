@@ -1,0 +1,11 @@
+[len] dist=lognormal median=16 sigma=1.20 seed=42 | 实际 p10=3 p50=15 p90=96 max=96 | 截断@steps=6 个 (12%) | 总步数 1631
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=imbalanced reqs=48 steps=96 layers=28 sel=64 hot=128 attn=8 gap=100.0ms steal-batch=4 B_ref=25.0GB/s cost-scale=3.00 mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 cap=perreq steal-delay=0.0ms seed=42 own-carry=0 vchan=25.00GB/s/0.5ms len=lognormal(med16/sig1.20) precheck=1 lock=narrow mthread=0 nodes=0,0,1,1 hier=1 rtax=1 lbw=16.60 lcost=536MB
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  ferry-C   makespan=  6136.08ms steps/s=    7.8 p50= 17.421 p99=  20.676 steals=  26(att=   41) migr=  363.4MB( 26 reqs) refill= 117836 seg  4083.72MB imb=0.283 ref=0 live=46516
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  costaware-E makespan=  6167.65ms steps/s=    7.8 p50= 17.387 p99=  20.330 steals=  27(att=   42) migr=  471.7MB( 27 reqs) refill= 117528 seg  4073.81MB imb=0.339 ref=0 live=60376
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  roundrobin-RR makespan=  6188.96ms steps/s=    7.8 p50= 17.684 p99=  20.657 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill= 118656 seg  4112.28MB imb=0.000 ref=0 live=0
+  => [steal-cp] precheck: pre-refused=7177 att=41 | steal_ms=310.1 (7.56 ms/att, makespan 的 5.1%, 迁移 363.4MB ≈ 15.2ms@B_ref) | precheck_ms=0.5
+  => [steal-seg] 占 steal_ms 的份额: lock=70.0(23%) lease=0.0(0%) tick=192.4(62%) crit=9.8(3%) gathr=1.0(0%) xfer=21.6(7%) scttr=0.9(0%) net=14.3(5%) | 和=309.9 (100% of steal_ms)
+  => [vchan] B=25.00GB/s T0=0.5ms | 注入等待: A=0.0 B=0.0 C=76.8 E=58.7 LLX=0.0 RR=0.0 ms | 计价字节: C=1642.31 E=1267.94 LLX=0.00 RR=0.00 MB

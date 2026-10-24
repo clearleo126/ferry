@@ -1,0 +1,11 @@
+[len] dist=lognormal median=32 sigma=0.60 seed=42 | 实际 p10=13 p50=31 p90=83 max=96 | 截断@steps=3 个 (6%) | 总步数 2006
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=imbalanced reqs=48 steps=96 layers=28 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 B_ref=1.0GB/s cost-scale=3.00 mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 cap=perreq steal-delay=0.0ms seed=42 own-carry=0 vchan=1.00GB/s/0.5ms len=lognormal(med32/sig0.60) precheck=1 lock=narrow mthread=0 nodes=0,0,1,1 hier=0 rtax=0
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  ferry-C   makespan=  1182.08ms steps/s=   40.6 p50=  9.036 p99=  41.409 steals=  21(att=   25) migr=  400.2MB( 30 reqs) refill= 129820 seg  4469.03MB imb=0.328 ref=0 live=51232
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  costaware-E makespan=   972.52ms steps/s=   49.4 p50=  7.582 p99=  53.990 steals=   3(att=    4) migr=    0.0MB( 10 reqs) refill= 121766 seg  4200.94MB imb=0.118 ref=1 live=0
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  roundrobin-RR makespan=   548.36ms steps/s=   87.5 p50=  7.258 p99=  22.055 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill= 142173 seg  4880.81MB imb=0.000 ref=0 live=0
+  => [steal-cp] precheck: pre-refused=1164 att=25 | steal_ms=621.8 (24.87 ms/att, makespan 的 52.6%, 迁移 400.2MB ≈ 419.7ms@B_ref) | precheck_ms=0.1
+  => [steal-seg] 占 steal_ms 的份额: lock=58.5(9%) lease=21.4(3%) tick=190.7(31%) crit=14.1(2%) gathr=0.9(0%) xfer=23.7(4%) scttr=1.2(0%) net=310.9(50%) | 和=621.5 (100% of steal_ms)
+  => [vchan] B=1.00GB/s T0=0.5ms | 注入等待: A=0.0 B=0.0 C=2453.9 E=917.5 LLX=0.0 RR=0.0 ms | 计价字节: C=1522.56 E=650.38 LLX=0.00 RR=0.00 MB

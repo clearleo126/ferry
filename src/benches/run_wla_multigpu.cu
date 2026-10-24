@@ -119,6 +119,28 @@ int main(int argc, char** argv) {
   // --steal-thread（v30 L2）：1 = 每卡迁移工作线程（执行线程只投递请求，
   // 迁移与 decode 重叠）；0（默认）= 既有内联语义（迁移阻塞 thief 的执行线程）。
   bool steal_thread = false;
+  // --vchan-nodes（v30.1）：每卡所属节点 id，逗号分隔，长度须等于 --gpus。
+  // 例：4 卡 2+2 = "0,0,1,1"（两节点各两张卡）。缺省 = 每卡一节点（v30 口径）。
+  char vchan_nodes_s[128] = "";
+  // --hier-steal（v30.1）：分层窃取，优先同节点 victim。默认 1，但只有真多节点
+  // 拓扑下才生效（单节点逐位不变）。
+  bool hier_steal = true;
+  // --remote-tax（v30.1）：E 的成本模型计入"迁移后远端回填税"。默认 0。
+  bool remote_tax = false;
+  // --local-bw（v30.1）：同节点迁移的带宽（PCIe/NVLink）。0 = 跟随 --mig-bw
+  // （单节点/历史口径不变）。多节点必须显式给，否则 E 会把节点内迁移也按
+  // 网络价计价而拒绝。
+  double local_bw = 0.0;
+  // --layer-cost-mb（v30.1 第①步）：每卡每层"计算"读取的 MB 数，把 dummy
+  // kernel 校准到真实 decode 量级。实测 Qwen2.5-7B / 4090：权重 15GB / 28 层
+  // = **536MB/层**（与 KV 长度几乎无关，ctx 1024→4096 仅 +12%）。
+  // 0（默认）= 关闭，历史口径逐位不变。
+  double layer_cost_mb = 0.0;
+  // --slow-gpu（v31）：让某张卡在 --slow-at 之后变慢，模拟干扰/降频/共租户。
+  // 格式 "1:2.0"（卡号:倍数）。动机：准入时卡是快的、后来变慢 —— 这类事件
+  // 准入侧路由无法预见，也修不了已在 decode 的存量请求。默认关。
+  char slow_s[64] = "";
+  double slow_at = 0.0;
   int kv_heads = 8, head_dim = 128;
 
   for (int i = 1; i < argc; ++i) {
@@ -191,6 +213,20 @@ int main(int argc, char** argv) {
       steal_lock_wide = std::atoi(next()) != 0;
     } else if (std::strcmp(argv[i], "--steal-thread") == 0) {
       steal_thread = std::atoi(next()) != 0;
+    } else if (std::strcmp(argv[i], "--vchan-nodes") == 0) {
+      std::strncpy(vchan_nodes_s, next(), sizeof(vchan_nodes_s) - 1);
+    } else if (std::strcmp(argv[i], "--hier-steal") == 0) {
+      hier_steal = std::atoi(next()) != 0;
+    } else if (std::strcmp(argv[i], "--remote-tax") == 0) {
+      remote_tax = std::atoi(next()) != 0;
+    } else if (std::strcmp(argv[i], "--local-bw") == 0) {
+      local_bw = std::atof(next());
+    } else if (std::strcmp(argv[i], "--layer-cost-mb") == 0) {
+      layer_cost_mb = std::atof(next());
+    } else if (std::strcmp(argv[i], "--slow-gpu") == 0) {
+      std::strncpy(slow_s, next(), sizeof(slow_s) - 1);
+    } else if (std::strcmp(argv[i], "--slow-at") == 0) {
+      slow_at = std::atof(next());
     } else if (std::strcmp(argv[i], "--steal-delay") == 0) {
       steal_delay = std::atof(next());
     } else if (std::strcmp(argv[i], "--seed") == 0) {
@@ -305,6 +341,36 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
   }
 
+  // --vchan-nodes 解析（v30.1）：长度必须等于 --gpus，否则报错退出（不静默
+  // 退回单节点口径 —— 拓扑错会让整组多节点结论失效）。
+  // --slow-gpu 解析：卡号必须在 --gpus 范围内（按 devices 下标，非物理卡号）
+  std::vector<double> slow_mult(devices.size(), 1.0);
+  if (slow_s[0]) {
+    int g = -1;
+    double m = 1.0;
+    if (std::sscanf(slow_s, "%d:%lf", &g, &m) != 2 || g < 0 ||
+        g >= (int)devices.size() || m <= 0.0) {
+      std::fprintf(stderr, "--slow-gpu 需要 \"卡下标:倍数\"，如 1:2.0（下标 0..%zu）\n",
+                   devices.size() - 1);
+      return 2;
+    }
+    slow_mult[g] = m;
+  }
+  std::vector<int> vchan_nodes;
+  if (vchan_nodes_s[0]) {
+    char nb[128];
+    std::strncpy(nb, vchan_nodes_s, sizeof(nb) - 1);
+    nb[sizeof(nb) - 1] = '\0';
+    for (char* t = std::strtok(nb, ","); t; t = std::strtok(nullptr, ","))
+      vchan_nodes.push_back(std::atoi(t));
+    if ((int)vchan_nodes.size() != (int)devices.size()) {
+      std::fprintf(stderr,
+                   "--vchan-nodes 给 %zu 个节点 id，但 --gpus 有 %zu 张卡\n",
+                   vchan_nodes.size(), devices.size());
+      return 2;
+    }
+  }
+
   AdaptiveBatchPolicy pol;  // min 1MB / max 4MB / target_batches 4（与 WlA 单卡同）
   WlaStealPolicy spol;     // b_ref/cost_scale/margin 仅 E 使用；A/B/C 语义不变
   spol.b_ref_gbs = b_ref;
@@ -314,26 +380,33 @@ int main(int argc, char** argv) {
   spol.precheck = steal_precheck;     // 控制面前置判定（v30，默认关）
   spol.lock_wide = steal_lock_wide;   // L1 ablation（默认窄锁）
   spol.steal_thread = steal_thread;   // L2：迁移搬出执行线程（默认关）
+  spol.hier_steal = hier_steal;       // v30.1 分层窃取（仅多节点生效）
+  spol.remote_tax = remote_tax;       // v30.1 E 计入远端回填税
+  spol.b_local_gbs = local_bw;        // v30.1 同节点迁移带宽（0=跟随 mig-bw）
 
   std::printf(
       "[wla-mg] gpus=%s arrival=%s skew=%s reqs=%d steps=%d layers=%d sel=%d "
       "hot=%d attn=%d gap=%.1fms steal-batch=%d B_ref=%.1fGB/s cost-scale=%.2f "
       "mig-margin=%.1f kv-mode=%s rebal=%.0fms/thr%.2f prefix=grp%d/stp%d "
       "cap=%s steal-delay=%.1fms seed=%llu own-carry=%d vchan=%.2fGB/s/%.1fms "
-      "len=%s(med%d/sig%.2f) precheck=%d lock=%s mthread=%d\n",
+      "len=%s(med%d/sig%.2f) precheck=%d lock=%s mthread=%d nodes=%s "
+      "hier=%d rtax=%d lbw=%.2f lcost=%.0fMB slow=%s@%.0fms\n",
       gpu_buf, arrival, skew, reqs, steps, layers, sel, hot, attn, gap,
       steal_batch, b_ref, cost_scale, mig_margin, kvmode_s, rebal_interval,
       rebal_thr, prefix_group, prefix_steps, cap_mode_s, steal_delay, seed,
       sp.own_carry, vchan_bw, vchan_t0, len_dist, len_median, len_sigma,
       (int)steal_precheck, steal_lock_wide ? "wide" : "narrow",
-      (int)steal_thread);
+      (int)steal_thread, vchan_nodes_s[0] ? vchan_nodes_s : "per-gpu",
+      (int)hier_steal, (int)remote_tax, local_bw, layer_cost_mb,
+      slow_s[0] ? slow_s : "none", slow_at);
   std::fflush(stdout);
 
   // vchan 参数对全部模式生效（追加在 rebal 参数之后）
   auto runm = [&](int mode, double ri = 50.0, double rt = 0.25) {
     return run_wla_multigpu(devices, sp, mode, pol, spol, skew, arrival, gap,
                             steal_batch, attn, kvmode, ri, rt, vchan_bw,
-                            vchan_t0);
+                            vchan_t0, vchan_nodes, layer_cost_mb, slow_mult,
+                            slow_at);
   };
 
   // --modes：只跑指定模式子集。默认（空）= 全跑，下面的汇总行逐字不变。

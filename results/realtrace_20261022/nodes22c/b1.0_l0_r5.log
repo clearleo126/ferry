@@ -1,0 +1,11 @@
+[len] dist=lognormal median=32 sigma=0.60 seed=42 | 实际 p10=13 p50=31 p90=83 max=96 | 截断@steps=3 个 (6%) | 总步数 2006
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=imbalanced reqs=48 steps=96 layers=28 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 B_ref=1.0GB/s cost-scale=3.00 mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 cap=perreq steal-delay=0.0ms seed=42 own-carry=0 vchan=1.00GB/s/0.5ms len=lognormal(med32/sig0.60) precheck=1 lock=narrow mthread=0 nodes=0,0,1,1 hier=1 rtax=1 lbw=0.00
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  ferry-C   makespan=   974.83ms steps/s=   49.2 p50=  8.085 p99=  40.327 steals=  18(att=   19) migr=  364.0MB( 25 reqs) refill= 129983 seg  4488.31MB imb=0.204 ref=0 live=46588
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  costaware-E makespan=   542.31ms steps/s=   88.5 p50=  5.706 p99=  26.482 steals=   2(att=    3) migr=    0.0MB(  8 reqs) refill= 121078 seg  4177.59MB imb=0.333 ref=1 live=0
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  roundrobin-RR makespan=   541.53ms steps/s=   88.6 p50=  7.023 p99=  23.758 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill= 142173 seg  4880.81MB imb=0.000 ref=0 live=0
+  => [steal-cp] precheck: pre-refused=1239 att=19 | steal_ms=472.5 (24.87 ms/att, makespan 的 48.5%, 迁移 364.0MB ≈ 381.6ms@B_ref) | precheck_ms=0.1
+  => [steal-seg] 占 steal_ms 的份额: lock=45.6(10%) lease=27.3(6%) tick=176.9(37%) crit=15.2(3%) gathr=0.8(0%) xfer=21.2(4%) scttr=1.0(0%) net=184.3(39%) | 和=472.2 (100% of steal_ms)
+  => [vchan] B=1.00GB/s T0=0.5ms | 注入等待: A=0.0 B=0.0 C=1592.2 E=0.0 LLX=0.0 RR=0.0 ms | 计价字节: C=1070.31 E=0.00 LLX=0.00 RR=0.00 MB

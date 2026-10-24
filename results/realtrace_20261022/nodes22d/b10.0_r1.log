@@ -1,0 +1,11 @@
+[len] dist=lognormal median=32 sigma=0.60 seed=42 | 实际 p10=13 p50=31 p90=83 max=96 | 截断@steps=3 个 (6%) | 总步数 2006
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=imbalanced reqs=48 steps=96 layers=28 sel=64 hot=128 attn=8 gap=1.0ms steal-batch=4 B_ref=10.0GB/s cost-scale=3.00 mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 cap=perreq steal-delay=0.0ms seed=42 own-carry=0 vchan=10.00GB/s/0.5ms len=lognormal(med32/sig0.60) precheck=1 lock=narrow mthread=0 nodes=0,0,1,1 hier=1 rtax=1 lbw=16.60
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  ferry-C   makespan=   545.64ms steps/s=   88.0 p50=  6.759 p99=  27.445 steals=  17(att=   22) migr=  300.5MB( 24 reqs) refill= 129921 seg  4473.47MB imb=0.177 ref=0 live=38468
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  costaware-E makespan=   504.90ms steps/s=   95.1 p50=  6.707 p99=  23.027 steals=  11(att=   13) migr=  174.2MB( 18 reqs) refill= 126400 seg  4356.75MB imb=0.118 ref=1 live=22296
+[trace] real model trace: /root/ferry/results/realtrace_20261022/qwen7b_g4_s96_quest.bin | R=48 S=96 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=31664 slab_blocks=1044 hit=0.842
+  roundrobin-RR makespan=   535.01ms steps/s=   89.7 p50=  6.976 p99=  22.158 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill= 142173 seg  4880.81MB imb=0.000 ref=0 live=0
+  => [steal-cp] precheck: pre-refused=235 att=22 | steal_ms=203.8 (9.26 ms/att, makespan 的 37.3%, 迁移 300.5MB ≈ 31.5ms@B_ref) | precheck_ms=0.0
+  => [steal-seg] 占 steal_ms 的份额: lock=32.8(16%) lease=3.3(2%) tick=103.2(51%) crit=12.4(6%) gathr=0.7(0%) xfer=18.6(9%) scttr=0.9(0%) net=31.4(15%) | 和=203.3 (100% of steal_ms)
+  => [vchan] B=10.00GB/s T0=0.5ms | 注入等待: A=0.0 B=0.0 C=181.1 E=83.0 LLX=0.0 RR=0.0 ms | 计价字节: C=1482.44 E=739.41 LLX=0.00 RR=0.00 MB
