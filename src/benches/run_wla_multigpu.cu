@@ -158,6 +158,7 @@ int main(int argc, char** argv) {
   char miss_est_s[16] = "oracle";  // --miss-est：oracle|window
   char tax_account_s[16] = "full"; // --tax-account：full|legacy
   int len_prior = 0;               // --len-prior：median 先验（0=取 --len-median）
+  double miss_prior = 0.0;         // --miss-prior：window 冷启动命中率先验（0=全 miss）
   int kv_heads = 8, head_dim = 128;
 
   for (int i = 1; i < argc; ++i) {
@@ -254,6 +255,8 @@ int main(int argc, char** argv) {
       std::strncpy(miss_est_s, next(), sizeof(miss_est_s) - 1);
     } else if (std::strcmp(argv[i], "--tax-account") == 0) {
       std::strncpy(tax_account_s, next(), sizeof(tax_account_s) - 1);
+    } else if (std::strcmp(argv[i], "--miss-prior") == 0) {
+      miss_prior = std::atof(next());
     } else if (std::strcmp(argv[i], "--len-prior") == 0) {
       len_prior = std::atoi(next());
     } else if (std::strcmp(argv[i], "--steal-delay") == 0) {
@@ -326,6 +329,10 @@ int main(int argc, char** argv) {
   else {
     std::fprintf(stderr, "未知 len-est '%s'（oracle|budget|median|quantile）\n",
                  len_est_s);
+    return 2;
+  }
+  if (miss_prior < 0.0 || miss_prior > 1.0) {
+    std::fprintf(stderr, "--miss-prior 须在 [0,1]（命中率先验）\n");
     return 2;
   }
   if (std::strcmp(miss_est_s, "oracle") == 0) miss_est = 0;
@@ -443,6 +450,7 @@ int main(int argc, char** argv) {
   spol.b_local_gbs = local_bw;        // v30.1 同节点迁移带宽（0=跟随 mig-bw）
   spol.len_est = len_est;             // v31.4 剩余步数来源（默认 oracle）
   spol.miss_est = miss_est;           // v31.4 每步 miss 估计（默认 oracle）
+  spol.miss_prior_hit = miss_prior;   // v31.6 window 冷启动先验（默认 0）
   spol.len_prior = len_prior ? len_prior : len_median;  // median 先验
   spol.tax_legacy = tax_legacy;       // v31.4 税记账（默认 full=修复）
   // v31.5：输入非 oracle 时自动开影子决策（同候选 oracle 对照 + 翻转计数）
@@ -456,7 +464,7 @@ int main(int argc, char** argv) {
       "cap=%s steal-delay=%.1fms seed=%llu own-carry=%d vchan=%.2fGB/s/%.1fms "
       "len=%s(med%d/sig%.2f) precheck=%d lock=%s mthread=%d nodes=%s "
       "hier=%d rtax=%d lbw=%.2f lcost=%.0fMB slow=%s@%.0fms spd=%d "
-      "scope=%s tax=%s lense=%s missest=%s\n",
+      "scope=%s tax=%s lense=%s missest=%s mprior=%.2f\n",
       gpu_buf, arrival, skew, reqs, steps, layers, sel, hot, attn, gap,
       steal_batch, b_ref, cost_scale, mig_margin, kvmode_s, rebal_interval,
       rebal_thr, prefix_group, prefix_steps, cap_mode_s, steal_delay, seed,
@@ -465,7 +473,7 @@ int main(int argc, char** argv) {
       (int)steal_thread, vchan_nodes_s[0] ? vchan_nodes_s : "per-gpu",
       (int)hier_steal, (int)remote_tax, local_bw, layer_cost_mb,
       slow_s[0] ? slow_s : "none", slow_at, (int)speed_aware, mig_scope_s,
-      tax_account_s, len_est_s, miss_est_s);
+      tax_account_s, len_est_s, miss_est_s, miss_prior);
   std::fflush(stdout);
 
   // vchan 参数对全部模式生效（追加在 rebal 参数之后）
@@ -553,18 +561,33 @@ int main(int argc, char** argv) {
   // v31.5 est-flip：影子决策翻转率（E 模式、输入非 oracle 时自动累计）。
   // 误接受 = est 接受而 oracle 拒绝；误拒绝 = 反之。候选含 precheck 路径。
   auto print_est_flip = [&] {
-    if (e.est_cand == 0) return;
-    const double fr = 100.0 * (double)(e.est_flip_accept + e.est_flip_reject) /
-                      (double)e.est_cand;
+    // v31.6：真实尝试与 precheck 路径分别报（此前重复计数致候选数虚高），
+    // 并补 auto 档 do_home 动作翻转（hot<->home）。
+    if (e.est_cand == 0 && e.est_cand_pre == 0) return;
+    const double fr = e.est_cand
+                          ? 100.0 * (double)(e.est_flip_accept +
+                                             e.est_flip_reject) /
+                                (double)e.est_cand
+                          : 0.0;
+    const double frp = e.est_cand_pre
+                           ? 100.0 * (double)(e.est_flip_accept_pre +
+                                              e.est_flip_reject_pre) /
+                                 (double)e.est_cand_pre
+                           : 0.0;
     std::printf(
-        "  => [est-flip] lense=%s missest=%s | 候选=%llu oracle接受=%llu"
-        "(%.0f%%) | 误接受=%llu 误拒绝=%llu 翻转率=%.1f%%\n",
-        len_est_s, miss_est_s, (unsigned long long)e.est_cand,
+        "  => [est-flip] lense=%s missest=%s mprior=%.2f | 真实: 候选=%llu "
+        "oracle接受=%llu(%.0f%%) 误接受=%llu 误拒绝=%llu 翻转率=%.1f%% | "
+        "pre: 候选=%llu 翻转率=%.1f%% | auto动作: cand=%llu 翻转=%llu\n",
+        len_est_s, miss_est_s, miss_prior,
+        (unsigned long long)e.est_cand,
         (unsigned long long)e.est_oracle_accept,
         e.est_cand ? 100.0 * (double)e.est_oracle_accept / (double)e.est_cand
                    : 0.0,
         (unsigned long long)e.est_flip_accept,
-        (unsigned long long)e.est_flip_reject, fr);
+        (unsigned long long)e.est_flip_reject, fr,
+        (unsigned long long)e.est_cand_pre, frp,
+        (unsigned long long)e.est_action_cand,
+        (unsigned long long)e.est_action_flip);
   };
   if (!full_run) {  // 子集跑：只回显已跑模式的行 + 诊断行
     print_steal_cp();

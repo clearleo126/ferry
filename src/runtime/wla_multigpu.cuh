@@ -212,10 +212,17 @@ struct WlaMultiStats {
   // 同一候选、同一墙钟状态下，est 输入 vs oracle 输入的 accept 对比。
   //   误接受 = est 接受而 oracle 拒绝（搬了不该搬的）
   //   误拒绝 = est 拒绝而 oracle 接受（错过该搬的）
-  uint64_t est_cand = 0;            // 被影子评估的候选数（含 precheck 路径）
+  uint64_t est_cand = 0;            // 被影子评估的候选数（真实尝试路径）
   uint64_t est_oracle_accept = 0;
   uint64_t est_flip_accept = 0;
   uint64_t est_flip_reject = 0;
+  // v31.6：precheck 路径影子（与真实路径分开）+ auto 动作翻转
+  uint64_t est_cand_pre = 0;
+  uint64_t est_oracle_accept_pre = 0;
+  uint64_t est_flip_accept_pre = 0;
+  uint64_t est_flip_reject_pre = 0;
+  uint64_t est_action_cand = 0;
+  uint64_t est_action_flip = 0;
   // 控制面遥测（v30）：前置拒绝 / 前置判定耗时 / 实路径耗时
   uint64_t steal_pre_refused = 0;
   uint64_t precheck_calls = 0;
@@ -301,6 +308,10 @@ struct WlaStealPolicy {
   int miss_est = 0;
   int len_prior = 0;
   bool tax_legacy = false;
+  // v31.6：window 冷启动先验命中率（--miss-prior，默认 0 = 全 miss 保守上界）。
+  // 此前冷启动回退 miss_b_per_step_（全 trace 静态值）⇒ 在线档前 ~1 tick 仍
+  // 间接用未来信息；改固定先验后 window 档完全在线（warmup≈1 tick，可忽略）。
+  double miss_prior_hit = 0.0;
   // v31.5 est-flip：cost_filter 内做 oracle 影子决策并累计翻转计数
   //（.cu 侧在 len/miss 非 oracle 时自动置位；oracle 档恒 false，零开销）。
   bool est_flip = false;
@@ -922,14 +933,16 @@ class WlaMultiGpuCtx {
     const size_t take = std::min(std::min(k, cur - fair), cur / 2 + 1);
     if (take == 0) return false;
     if (!pol.cost_filter) return true;
-    return cost_filter_ok(g, v, take, pol, nullptr) > 0;
+    return cost_filter_ok(g, v, take, pol, nullptr, /*is_pre=*/true) > 0;
   }
 
   // E 的成本过滤（调用方须持 mtx_）：候选自队尾起（最近到达 = 剩余步最多），
   // 取通过过滤的最长前缀，返回通过数。snap_cands 非空时收集逐候选判定。
   // steal_from 与 steal_precheck 共用本函数 ⇒ 两处口径不会漂移。
-  size_t cost_filter_ok(int g, int v, size_t take, const WlaStealPolicy& pol,
-                        std::vector<SnapDecision::EbyteCand>* snap_cands) const {
+  size_t cost_filter_ok(
+      int g, int v, size_t take, const WlaStealPolicy& pol,
+      std::vector<SnapDecision::EbyteCand>* snap_cands,
+      bool is_pre = false) const {
     // E：价值过滤 —— 只迁"剩余工作 ≥ margin × 真实迁移成本"的请求。
     // 成本必须按当前 kv-mode 的真实代价计（否则 E 基于未支付的成本决策，
     // 与本项目"双侧记账"的立场矛盾）：
@@ -1023,13 +1036,19 @@ class WlaMultiGpuCtx {
           cost_o += (pol.tax_legacy ? (eff_o - cur_o) : eff_o) - tax_add;
         }
         const bool accept_o = (remain_o * step_ms >= pol.margin * cost_o);
-        est_cand_.fetch_add(1, std::memory_order_relaxed);
-        if (accept_o) est_acc_o_.fetch_add(1, std::memory_order_relaxed);
+        // v31.6：precheck 与真实路径分别计数 —— 此前同一候选在两处评估
+        // 被重复累计（est/oracle 同次配对比率不受影响，但候选数虚高）。
+        std::atomic<uint64_t>& cand = is_pre ? est_cand_pre_ : est_cand_;
+        std::atomic<uint64_t>& acc = is_pre ? est_acc_o_pre_ : est_acc_o_;
+        std::atomic<uint64_t>& fa = is_pre ? est_flip_a_pre_ : est_flip_a_;
+        std::atomic<uint64_t>& fr = is_pre ? est_flip_r_pre_ : est_flip_r_;
+        cand.fetch_add(1, std::memory_order_relaxed);
+        if (accept_o) acc.fetch_add(1, std::memory_order_relaxed);
         if (accept != accept_o) {
           if (accept)
-            est_flip_a_.fetch_add(1, std::memory_order_relaxed);
+            fa.fetch_add(1, std::memory_order_relaxed);
           else
-            est_flip_r_.fetch_add(1, std::memory_order_relaxed);
+            fr.fetch_add(1, std::memory_order_relaxed);
         }
       }
       if (snap_cands) snap_cands->push_back({r, value, cost_ms, accept});
@@ -1244,6 +1263,16 @@ class WlaMultiGpuCtx {
             const double tax = remain * est_miss_b(pol);
             const bool do_home =
                 (pol.mig_scope == 1) || (pol.mig_scope == 2 && tax > home_b);
+            // v31.6 动作影子：auto 档 do_home 判据同样吃 est 输入 —— 同请求
+            // 同状态换 oracle 输入重算动作，累计 hot<->home 翻转（只统计）。
+            if (pol.est_flip && pol.mig_scope == 2) {
+              const double remain_o =
+                  (double)(wla_len_of(sp_, r) - next_step_[r]);
+              const bool do_home_o = remain_o * miss_b_per_step_ > home_b;
+              est_act_cand_.fetch_add(1, std::memory_order_relaxed);
+              if (do_home != do_home_o)
+                est_act_flip_.fetch_add(1, std::memory_order_relaxed);
+            }
             if (!do_home) continue;
             // 扣掉已经算进 payload 的热集部分，避免重复计价
             home_charge += std::max(0.0, home_b - hot_b);
@@ -1706,8 +1735,13 @@ class WlaMultiGpuCtx {
         return (double)sp_.sel_blocks * (double)sp_.num_layers *
                (double)c4_ * (1.0 - hit);
       }
+      // v31.6：冷启动不再回退全 trace 静态值（未来信息泄漏）——用
+      // --miss-prior 固定先验（默认 hit=0 全 miss = 税上界，方向保守）。
+      // oracle 档（miss_est==0）不走本分支，逐位不变。
+      return (double)sp_.sel_blocks * (double)sp_.num_layers *
+             (double)c4_ * (1.0 - pol.miss_prior_hit);
     }
-    return miss_b_per_step_;  // oracle / 冷启动（真实系统此处放先验）
+    return miss_b_per_step_;  // oracle
   }
   // exec_step 的在线命中观测（每执行步累计；ctx 按模式重建 → 天然按模式清零）
   void obs_selects(uint64_t sel, uint64_t mis) {
@@ -1738,6 +1772,25 @@ class WlaMultiGpuCtx {
   }
   uint64_t est_flip_reject() const {
     return est_flip_r_.load(std::memory_order_relaxed);
+  }
+  // v31.6：precheck 路径影子 + auto 动作翻转
+  uint64_t est_cand_pre() const {
+    return est_cand_pre_.load(std::memory_order_relaxed);
+  }
+  uint64_t est_oracle_accept_pre() const {
+    return est_acc_o_pre_.load(std::memory_order_relaxed);
+  }
+  uint64_t est_flip_accept_pre() const {
+    return est_flip_a_pre_.load(std::memory_order_relaxed);
+  }
+  uint64_t est_flip_reject_pre() const {
+    return est_flip_r_pre_.load(std::memory_order_relaxed);
+  }
+  uint64_t est_action_cand() const {
+    return est_act_cand_.load(std::memory_order_relaxed);
+  }
+  uint64_t est_action_flip() const {
+    return est_act_flip_.load(std::memory_order_relaxed);
   }
   // 把 bytes 排上卡 g 的跨节点链路并阻塞到传输完成；with_t0 = 付一次建链开销
   void vlink_charge(int g, size_t bytes, bool with_t0) {
@@ -2189,6 +2242,13 @@ class WlaMultiGpuCtx {
   mutable std::atomic<uint64_t> est_acc_o_{0};
   mutable std::atomic<uint64_t> est_flip_a_{0};
   mutable std::atomic<uint64_t> est_flip_r_{0};
+  // v31.6：precheck 路径影子计数（与真实路径分开报）+ auto 动作翻转计数
+  mutable std::atomic<uint64_t> est_cand_pre_{0};
+  mutable std::atomic<uint64_t> est_acc_o_pre_{0};
+  mutable std::atomic<uint64_t> est_flip_a_pre_{0};
+  mutable std::atomic<uint64_t> est_flip_r_pre_{0};
+  mutable std::atomic<uint64_t> est_act_cand_{0};
+  mutable std::atomic<uint64_t> est_act_flip_{0};
   std::unique_ptr<WlaVLink[]> vlinks_;  // 索引 = 节点
   // v30 L2：每卡迁移请求信箱（见 enable_mig_thread）。空 = 迁移仍由执行线程
   // 内联完成（默认语义）。
@@ -2684,6 +2744,12 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   st.est_oracle_accept = ctx.est_oracle_accept();
   st.est_flip_accept = ctx.est_flip_accept();
   st.est_flip_reject = ctx.est_flip_reject();
+  st.est_cand_pre = ctx.est_cand_pre();
+  st.est_oracle_accept_pre = ctx.est_oracle_accept_pre();
+  st.est_flip_accept_pre = ctx.est_flip_accept_pre();
+  st.est_flip_reject_pre = ctx.est_flip_reject_pre();
+  st.est_action_cand = ctx.est_action_cand();
+  st.est_action_flip = ctx.est_action_flip();
   st.refill_events = refill_events.load();
   st.refill_bytes = refill_bytes.load();
   st.throughput_steps = (double)sp.num_requests / (st.makespan_ms / 1000.0);
