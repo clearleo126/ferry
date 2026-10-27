@@ -208,6 +208,14 @@ struct WlaMultiStats {
   // v31.2 迁移范围遥测：把 KV home 一起搬走的请求数与字节
   uint64_t home_reqs = 0;
   uint64_t home_bytes = 0;
+  // v31.5 估计器影子决策（est-flip；--len-est/--miss-est 非 oracle 时自动累计）：
+  // 同一候选、同一墙钟状态下，est 输入 vs oracle 输入的 accept 对比。
+  //   误接受 = est 接受而 oracle 拒绝（搬了不该搬的）
+  //   误拒绝 = est 拒绝而 oracle 接受（错过该搬的）
+  uint64_t est_cand = 0;            // 被影子评估的候选数（含 precheck 路径）
+  uint64_t est_oracle_accept = 0;
+  uint64_t est_flip_accept = 0;
+  uint64_t est_flip_reject = 0;
   // 控制面遥测（v30）：前置拒绝 / 前置判定耗时 / 实路径耗时
   uint64_t steal_pre_refused = 0;
   uint64_t precheck_calls = 0;
@@ -281,6 +289,21 @@ struct WlaStealPolicy {
   // 完全退化到不迁移、白丢本可拿到的均衡收益。
   // 0 = 跟随 b_ref（默认，单节点/历史口径逐位不变）。
   double b_local_gbs = 0.0;
+  // v31.4 决策输入在线性 + 税记账修复（默认 = oracle/full，既有数值路径）：
+  //   len_est  0=oracle（预采样真实长度——回放口径，在线系统不可得）
+  //            1=budget（max_new_tokens：steps − 已执行步，在线可得上界）
+  //            2=median（先验中位，--len-prior / --len-median）
+  //   miss_est 0=oracle（全 trace 静态命中率） 1=window（本模式已执行步滚动）
+  //   tax_account 0=full：v31.4 修复——税/home 全额入账（v30.1 语义+scope 扩展）
+  //              1=legacy：v31.3 的 += eff−cur（hot 下税蒸发、home/auto 负
+  //              补贴），仅作 ablation 复现历史数字
+  int len_est = 0;
+  int miss_est = 0;
+  int len_prior = 0;
+  bool tax_legacy = false;
+  // v31.5 est-flip：cost_filter 内做 oracle 影子决策并累计翻转计数
+  //（.cu 侧在 len/miss 非 oracle 时自动置位；oracle 档恒 false，零开销）。
+  bool est_flip = false;
 };
 
 // 偏移（与 kv_exec.cuh 同布局；独立命名避免头冲突）
@@ -804,6 +827,7 @@ class WlaMultiGpuCtx {
     for (int r : resident) {
       ++next_step_[r];
       if (next_step_[r] >= wla_len_of(sp_, r)) {
+        obs_done(wla_len_of(sp_, r));  // v31.5：完成长度是可观测事件（quantile 用）
         auto& dq = local_[g];
         for (auto it = dq.begin(); it != dq.end();) {
           if (*it == r)
@@ -949,9 +973,12 @@ class WlaMultiGpuCtx {
       // v31.2 迁移范围：把「一次性搬 home」与「每步缴税」放进同一个成本模型。
       // 否则 E 会按 hot 价批准迁移，实际却付了整条上下文（252MB），
       // home 模式的 E 结果不可解释。
+      double tax_add = 0.0;  // est 输入的税增量（est-flip 影子决策要用）
       if (vchan_on() && !same_node(v, g) && kvmode_ == WlaKvMode::Delta) {
+        // v31.4：剩余步数/每步 miss 字节改走 est_*（oracle 档数值与旧式
+        // 逐位相同），使"未来信息 vs 在线估计"成为可切换的实验轴。
         const double tax_ms =
-            (double)(wla_len_of(sp_, r) - next_step_[r]) * miss_b_per_step_ /
+            est_remain(pol, r) * est_miss_b(pol) /
             (vchan_bw_gbs_ * 1e9) * 1e3;
         const double cur_ms = (pol.remote_tax && is_remote(g, r)) ? tax_ms : 0.0;
         double eff_ms = cur_ms;
@@ -963,11 +990,48 @@ class WlaMultiGpuCtx {
           eff_ms = (pol.mig_scope == 1) ? home_ms
                                         : std::min(cur_ms, home_ms);
         }
-        cost_ms += eff_ms - cur_ms;
+        // v31.4 修复（--tax-account，默认 full）：v31.3 把本项写成 eff−cur ⇒
+        // hot 档 eff==cur 税恒 0（rtax 失效）；home/auto 档 eff−cur<0 成
+        // 负补贴 ⇒ 门控失效（scope3/slow4/geo 等历史 E 列均跑在旧公式上）。
+        // full = v30.1 全额入账 + scope 扩展：hot=transfer+税，
+        // home=transfer+home，auto=transfer+min(税,home)。
+        // legacy 保留 v31.3 公式，仅用于复现历史数字 / 量化本修复的影响。
+        tax_add = pol.tax_legacy ? (eff_ms - cur_ms) : eff_ms;
+        cost_ms += tax_add;
       }
-      const double value =
-          (double)(wla_len_of(sp_, r) - next_step_[r]) * step_ms;
+      const double value = est_remain(pol, r) * step_ms;
       const bool accept = (value >= pol.margin * cost_ms);
+      // v31.5 est-flip：影子 oracle 决策 —— 同一候选、同一墙钟状态，只把
+      // 输入换成 oracle（真实长度 / 静态命中率），看 accept 是否翻转。
+      // transfer 项与输入无关不重算；税项按 oracle 输入重算后替换 tax_add。
+      // 计数含 precheck 前置路径（同一公式同一状态，比率不受影响）。
+      if (pol.est_flip) {
+        const double remain_o =
+            (double)(wla_len_of(sp_, r) - next_step_[r]);
+        double cost_o = cost_ms;
+        if (vchan_on() && !same_node(v, g) && kvmode_ == WlaKvMode::Delta) {
+          const double tax_o = remain_o * miss_b_per_step_ /
+                               (vchan_bw_gbs_ * 1e9) * 1e3;
+          const double cur_o = (pol.remote_tax && is_remote(g, r)) ? tax_o : 0.0;
+          double eff_o = cur_o;
+          if (pol.mig_scope != 0) {
+            const double home_ms = (double)max_blocks_ *
+                                   (double)sp_.num_layers * (double)c4_ /
+                                   (vchan_bw_gbs_ * 1e9) * 1e3;
+            eff_o = (pol.mig_scope == 1) ? home_ms : std::min(cur_o, home_ms);
+          }
+          cost_o += (pol.tax_legacy ? (eff_o - cur_o) : eff_o) - tax_add;
+        }
+        const bool accept_o = (remain_o * step_ms >= pol.margin * cost_o);
+        est_cand_.fetch_add(1, std::memory_order_relaxed);
+        if (accept_o) est_acc_o_.fetch_add(1, std::memory_order_relaxed);
+        if (accept != accept_o) {
+          if (accept)
+            est_flip_a_.fetch_add(1, std::memory_order_relaxed);
+          else
+            est_flip_r_.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
       if (snap_cands) snap_cands->push_back({r, value, cost_ms, accept});
       if (accept)
         ++ok;
@@ -1175,9 +1239,9 @@ class WlaMultiGpuCtx {
           for (auto& pr : per_req) {
             const int r = pr.first;
             const double hot_b = (double)pr.second * (double)c4_;
-            const double remain =
-                (double)(wla_len_of(sp_, r) - next_step_[r]);
-            const double tax = remain * miss_b_per_step_;
+            // v31.4：判据输入与 cost_filter 同口径（est_*；oracle 档逐位同旧）
+            const double remain = est_remain(pol, r);
+            const double tax = remain * est_miss_b(pol);
             const bool do_home =
                 (pol.mig_scope == 1) || (pol.mig_scope == 2 && tax > home_b);
             if (!do_home) continue;
@@ -1617,6 +1681,64 @@ class WlaMultiGpuCtx {
         (1.0 - hit);
   }
   double miss_bytes_per_step() const { return miss_b_per_step_; }
+  // v31.4 决策输入的在线估计（--len-est/--miss-est，默认 oracle=既有数值）。
+  // cost_filter 与 do_home 判据共用本入口，保证两处口径一致。
+  double est_remain(const WlaStealPolicy& pol, int r) const {
+    int len;
+    if (pol.len_est == 1) len = sp_.steps;           // budget = max_new_tokens
+    else if (pol.len_est == 2) len = pol.len_prior;  // 先验中位（静态）
+    else if (pol.len_est == 3) {                     // quantile：完成样本在线 p50
+      const int p50 = done_len_p50();
+      // 预测总长 ≥ 已执行步（存活请求长度至少是 next_step+1）。
+      // ⚠️ 完成样本有存活偏差（先完成的偏短）⇒ 本估计系统性偏悲观——如实报。
+      len = (p50 > 0) ? std::max(p50, (int)next_step_[r]) : sp_.steps;
+    }
+    else len = wla_len_of(sp_, r);                   // oracle（默认）
+    const int rem = len - (int)next_step_[r];
+    return rem > 0 ? (double)rem : 0.0;  // 先验 < 已执行步 ⇒ 认为已近完成
+  }
+  double est_miss_b(const WlaStealPolicy& pol) const {
+    if (pol.miss_est == 1) {
+      const uint64_t sel = obs_sel_.load(std::memory_order_relaxed);
+      const uint64_t mis = obs_mis_.load(std::memory_order_relaxed);
+      if (sel >= kObsWarmup) {
+        const double hit = 1.0 - (double)mis / (double)sel;
+        return (double)sp_.sel_blocks * (double)sp_.num_layers *
+               (double)c4_ * (1.0 - hit);
+      }
+    }
+    return miss_b_per_step_;  // oracle / 冷启动（真实系统此处放先验）
+  }
+  // exec_step 的在线命中观测（每执行步累计；ctx 按模式重建 → 天然按模式清零）
+  void obs_selects(uint64_t sel, uint64_t mis) {
+    obs_sel_.fetch_add(sel, std::memory_order_relaxed);
+    obs_mis_.fetch_add(mis, std::memory_order_relaxed);
+  }
+  // v31.5 --len-est quantile：已完成请求长度的在线 p50。完成长度在完成
+  // 时刻是可观测事件（不含未来信息）；样本来自 tick_end 清出的请求。
+  void obs_done(int len) {
+    std::lock_guard<std::mutex> lk(done_mu_);
+    done_lens_.push_back(len);
+  }
+  int done_len_p50() const {  // 0 = 样本不足（<3）
+    std::lock_guard<std::mutex> lk(done_mu_);
+    if (done_lens_.size() < 3) return 0;
+    std::vector<int> v = done_lens_;  // 拷贝：不破坏共享样本的顺序
+    auto it = v.begin() + (long)v.size() / 2;
+    std::nth_element(v.begin(), it, v.end());
+    return *it;
+  }
+  // v31.5 est-flip 影子决策计数（cost_filter 内累计；mutable：const 方法更新）
+  uint64_t est_cand() const { return est_cand_.load(std::memory_order_relaxed); }
+  uint64_t est_oracle_accept() const {
+    return est_acc_o_.load(std::memory_order_relaxed);
+  }
+  uint64_t est_flip_accept() const {
+    return est_flip_a_.load(std::memory_order_relaxed);
+  }
+  uint64_t est_flip_reject() const {
+    return est_flip_r_.load(std::memory_order_relaxed);
+  }
   // 把 bytes 排上卡 g 的跨节点链路并阻塞到传输完成；with_t0 = 付一次建链开销
   void vlink_charge(int g, size_t bytes, bool with_t0) {
     if (vchan_bw_gbs_ <= 0.0) return;
@@ -2054,6 +2176,19 @@ class WlaMultiGpuCtx {
   std::vector<int> home_node_;  // 请求 -> KV home 节点（分发时定）
   int nnodes_ = 1;
   double miss_b_per_step_ = 0.0;  // set_hit_rate 计算，供 E 的远端税使用
+  // v31.4 在线命中观测（--miss-est window）：本模式已执行步的 select/miss。
+  // ctx 按模式重建 → 计数天然清零，E 的窗口只含 E 自己的执行。
+  static constexpr uint64_t kObsWarmup = 100000;  // ≈1 tick 事件量；冷启动回退静态口径
+  std::atomic<uint64_t> obs_sel_{0};
+  std::atomic<uint64_t> obs_mis_{0};
+  // v31.5：quantile 长度估计样本（tick_end 观测）+ est-flip 影子决策计数
+  //（mutable：cost_filter_ok 是 const 方法，影子计数在其中更新）
+  mutable std::mutex done_mu_;
+  std::vector<int> done_lens_;
+  mutable std::atomic<uint64_t> est_cand_{0};
+  mutable std::atomic<uint64_t> est_acc_o_{0};
+  mutable std::atomic<uint64_t> est_flip_a_{0};
+  mutable std::atomic<uint64_t> est_flip_r_{0};
   std::unique_ptr<WlaVLink[]> vlinks_;  // 索引 = 节点
   // v30 L2：每卡迁移请求信箱（见 enable_mig_thread）。空 = 迁移仍由执行线程
   // 内联完成（默认语义）。
@@ -2310,10 +2445,12 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
         } else if (mengine == 1) {
           // B：逐 miss 回填（每 C4 一次通道传输 + 逐次 sync）+ 逐层 kernel
           HostStagedChannel* ch = ctx.refill_ch(g);
+          uint64_t obs_m = 0;  // v31.4 在线命中观测（--miss-est window）
           for (int l = 0; l < L; ++l) {
             for (int k = 0; k < G; ++k) {
               const MissEvent& e = tr.events[base_ev + (size_t)l * G + k];
               if (!is_miss(r, s, l, k)) continue;
+              ++obs_m;
               // vchan：被迁移请求的 miss = 远端读（其 KV home 仍在原节点）
               if (ctx.is_remote(g, r))
                 ctx.vlink_charge(g, c4, /*with_t0=*/false);
@@ -2326,6 +2463,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
             }
             attn_layer(r, l);
           }
+          ctx.obs_selects((uint64_t)L * G, obs_m);  // v31.4 观测
         } else {
           // C：全层 miss 聚合 → 槽位排序去重 → 自适应批 → 连续段合并 submit
           //    → wait_last_arrival(cs) → 逐层 kernel（双流重叠）
@@ -2341,6 +2479,8 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
                 miss_list.push_back(
                     {l, tr.events[base_ev + (size_t)l * G + k].block_id});
             }
+          // v31.4 在线命中观测：本步 select = L×G，miss = 去重前事件数
+          ctx.obs_selects((uint64_t)L * G, (uint64_t)miss_list.size());
           std::sort(miss_list.begin(), miss_list.end(), [](const Ref& a,
                                                            const Ref& b) {
             if (a.layer != b.layer) return a.layer < b.layer;
@@ -2540,6 +2680,10 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   st.precheck_ms = ctx.precheck_ms();
   st.steal_ms = ctx.steal_ms();
   st.steal_seg = ctx.steal_segments_ms();
+  st.est_cand = ctx.est_cand();
+  st.est_oracle_accept = ctx.est_oracle_accept();
+  st.est_flip_accept = ctx.est_flip_accept();
+  st.est_flip_reject = ctx.est_flip_reject();
   st.refill_events = refill_events.load();
   st.refill_bytes = refill_bytes.load();
   st.throughput_steps = (double)sp.num_requests / (st.makespan_ms / 1000.0);

@@ -1,5 +1,33 @@
-实验设计（收束版 v29 · v28 主线不变；新增多节点模拟器基础设施：组缓存容量口径修正（cap-mode）+ 离线跨节点代价注入（node-map/net-bw/T0/full-history），首轮扫出决策边界 ≈1–3 GB/s；保留 v28 及此前记录）
+实验设计（收束版 v31.5 · v29 主线不变；v31.4/v31.5：E 税记账回归修复（--tax-account；v31.3 起 hot 档税蒸发、home/auto 档负补贴）+ 决策输入在线化与逐候选影子翻转率（--len-est/--miss-est/est-flip）；修复口径下 §27 弧线全部复现、"决策知道未来"结题；详见【28】）
 场景钉死：LLM 稀疏注意力持续 decode 的 host-staged 热 KV 工作集（QSA-style miss 流）。
+v31.5 = v31.4 + **决策输入在线化结题（"决策知道未来"问题）**（详见 28.6）：
+  - est-flip 影子决策：cost_filter 内对每个候选**同候选、同墙钟状态、只换
+    输入**重算 accept，逐候选配对累计误接受/误拒绝（[est-flip] 行自动输出，
+    len/miss 非 oracle 时自动置位，oracle 档零开销）。
+  - 判定：budget（max_new_tokens）+ window（滚动命中）——**真实系统可得
+    的两个输入——翻转率 0.0–1.1% ⇒ E 的逐决策行为几乎不依赖未来信息**
+    （对"收益来自未来信息"质疑的配对证据）。quantile（完成样本 p50）在
+    长输出分布翻掉 64.5%——存活偏差（先完成的偏短）负结果：朴素完成
+    统计不可作长度预测器，失效率随输出长度放大（短输出区 16%）。
+    所有估计器下"低带宽拒绝跨节点"主行为保持（第三次复现）。
+v31.4 = v31.3 + **E 税记账回归修复 + trace 广度（ShareGPT/32K）**（详见【28】）：
+  - 审计发现 v31.3（fbaab91 引入 mig-scope 时）把 v30.1（fee16c0）的税
+    全额入账重构成 `+= eff−cur`：hot 档 eff==cur ⇒ 税恒 0（--remote-tax
+    完全失效）；home/auto 档 eff−cur<0 ⇒ 负成本、margin×负数恒真 ⇒
+    门控失效。**scope3/slow4/geo/nodes22/25.x 的 E 列均跑在旧公式上**；
+    §22.9 的数字是 v30.1 代码跑的、不受影响，但修复前的当前代码不可复现。
+    修复 = --tax-account full（默认，v30.1 语义+scope 扩展；legacy 保留
+    作 ablation）。边际区 n=5 交错：E 跨节点字节 legacy 5/5 非零（308–746MB）
+    vs full **5/5 精确 0**；配对 ΔE 5/5 为正、中位 +154ms（≈13%）。
+  - trace 广度（capture_miss_trace --prefill-chunk 分块 prefill，修 32K
+    prompt 在 24GB 卡的 9.3GB 全量 logits OOM）：ShareGPT 4K hit 0.878
+    （书籍 0.861）⇒ **局部性跨语料成立**；32K hit 0.805、H=1634MB、
+    remain*=571>512 ⇒ auto home 恒 0（判据跨上下文方向由解析式预言，
+    实测吻合）。32K auto/home n=3 打平（前轮"home 快 27%"作废：
+    legacy 口径下 auto 无门控的假差距）。
+  - 修复口径下 §27 主张全部存活（SGPT trace 本地重表，n=3）：单调弧线
+    （B=1.0 E/RR hot 1.30→auto 1.03）、auto≤home（搬运 6/13/25 vs
+    6/14/28）、hot 的 95% 跨节点流量=远端回填（10.8–16.4GB vs 1.4–6.7GB）。
 v29 = v28 + **多节点模拟器（本机）落地 —— 工具/口径/首轮边界，不新增 GPU 实测**（详见【22】）：
   - **组缓存容量口径修正**（v28 §3.3 / 21.6 的缺陷）：新增 `--cap-mode {group,perreq}`。
     group = 历史口径（每组每层容量恒为 hot_blocks，拆组白拿容量）；perreq = 每请求
@@ -2654,4 +2682,130 @@ T_comm 1.84×）→ 绝对数字平台相关、比值平台无关。
    steal_from 内的 home 计费块、cost_filter_ok 内的 home 成本项、
    set_home_node/is_remote；`src/benches/run_wla_multigpu.cu`：--mig-scope。
    数据：results/realtrace_20261022/scope3/（36 次运行 + parse_scope3.py）。
+
+【28. v31.4/v31.5 税记账回归修复 + 决策输入在线化（2026-10-25/26，本机 4×3090）】
+28.1 起因与公式考古（审计结论，git -S 可复验）
+  - E 的 cost_filter 里"远端回填税"在 v31.3（fbaab91，引入 mig-scope 时）
+    出现**记账回归**：v30.1（fee16c0）原始语义是全额入账
+    `cost += remain × m / B`；v31.3 重构成 `cost += eff_ms − cur_ms`，其中
+    cur=税（rtax 且 is_remote 时）、eff=scope 修饰后的成本。后果：
+      hot（scope=0）：eff==cur ⇒ 加项恒 0 ⇒ **税蒸发，--remote-tax 失效**；
+      home/auto：eff−cur<0（税>home 的候选）⇒ **负成本**，且
+      `value ≥ margin×负数` 恒真 ⇒ E 门控对长剩余候选**无条件放行**。
+    数值演示（4K trace，B=2.5，margin=2）：remain=376 时 legacy 口径的
+    home/auto 成本 = **−187ms**。
+  - 影响面：v31.3 之后所有带 rtax/scope 的 E 列——scope3 主表、slow4、
+    geo/geo2-4、nodes22*、25.x、及 2026-10-24 的 32K 回放。§22.9 的
+    E 数字（549 vs C 1055）是 v30.1 代码跑的、语义正确，但修复前的
+    当前代码**不可复现**。执行侧 do_home 的字节判据（tax>home_b）是
+    独立实现，未受影响（32K home=0 的预测仍成立——预测的是执行侧）。
+28.2 修复与新增 flag（默认 = full/oracle ⇒ 历史数值路径逐位不变）
+  - `--tax-account {full,legacy}`：full（默认）= v30.1 全额入账 + scope
+    扩展——hot=transfer+税、home=transfer+home、auto=transfer+min(税,home)；
+    legacy = v31.3 公式（复现历史数字 / 量化修复影响的 ablation 臂）。
+    vchan 关或 rtax=0 的路径逐位不变（构造性：该块不进入或加 0）。
+  - `--len-est {oracle,budget,median,quantile}` / `--miss-est {oracle,window}`
+    / `--len-prior`：把"未来信息 vs 在线估计"变成可切换实验轴。
+    budget = max_new_tokens 口径（steps−已执行步）；window = 本模式已执行
+    步的滚动命中率（est_miss_b，<10 万 select 冷启动回退静态值）；
+    quantile = 已完成请求长度的在线 p50（tick_end 观测完成长度——完成
+    是可观测事件；max(p50, 已执行步) 作预测，<3 样本回退 budget）。
+    oracle 档的 est_* 是恒等变换（逐位）。
+  - v31.5 est-flip：cost_filter 内对每个候选**影子 oracle 决策**（同候选、
+    同墙钟状态、只换输入：真实长度 + 静态命中率），累计误接受（est 接受
+    而 oracle 拒绝）/误拒绝（反之）；len/miss 非 oracle 时自动置位。
+    [est-flip] 行输出候选数 / oracle 接受率 / 误接受 / 误拒绝 / 翻转率。
+28.3 修复的影响（s96/ln32/B=1.0/hot 边际区，n=5 臂间交错）
+  - **E 跨节点计价字节：legacy 5/5 非零（308–746MB）vs full 5/5 精确 0**
+    ——逐决策层面的确定性证据，不受墙钟噪声污染。full 的 E 只做同节点
+    救援（hier 优先同节点，同节点走 lbw 不付税），跨节点候选全拒。
+  - E makespan 配对差（legacy−full，同 rep）：+241/+125/+309/+154/+32，
+    5/5 为正，中位 **+154ms（≈13%）**——legacy E 批准跨节点偷并实付
+    694MB 计价字节 + 797ms 注入等待；E/RR 比值被 RR 噪声污染（RR 同
+    配置 5 rep 范围 1134–2289ms），只作方向参考。
+  - ⇒ §22.9"E 在 B=1.0 拒绝跨节点"在修复代码上复现；v31.3–v31.3.x 的
+    E 列等价于**无门控**跑出来的数字。长输出 value 主导区（med384）修复
+    前后 E 行为几乎不变（实测：auto full≈legacy）——回归的杀伤力集中
+    在低带宽/短输出的边际区，恰是税起作用的地方。
+28.4 32K 归因重做（本地 32K trace，B=2.5，E+RR，n=3）
+  - auto：E = 28535/19366/26280（home 搬 0——判据 571 步>512 所致；
+    E 跨节点 21546MB）；home：E = 24800/20717/33310（home 搬 4/6234MB；
+    E 跨节点 6108MB）。
+  - 配对 ΔE(home−auto) = −3736/+1351/+7030，**符号翻转 ⇒ auto vs home
+    在 n=3 无显著差**。**前轮"home 快 27%"作废**：那是 legacy 口径下
+    auto 无门控的假差距（同口径重跑后差距消失）。确定性账目仍立：
+    auto 付 3.5× 跨节点字节（21.5 vs 6.1GB）。
+28.5 scope3 式重表（SGPT 4K trace 本地重抓，B×scope×n=3，E+RR+C 同进程）
+  - 平台+trace+记账三变量都换 ⇒ **绝对值与原 4090 表不可比，只比定性**。
+  - E/RR 中位：B=1.0 hot 1.298→home 1.057→auto 1.027；B=2.5 1.130→
+    0.969→0.912；B=10 0.868/0.890/0.901（B=10 的排序被 RR 噪声打乱：
+    hot 行 RR 中位 15318 vs 其余 13106–13499，±17%；看 C 绝对值
+    14226 vs 12699/13086，home/auto 仍优 ~10%）。
+  - §27 三主张全部存活：①单调弧线（多节点惩罚 +30%→+3%）；②auto≤home
+    （home 搬运 6/13/25 vs 6/14/28，auto 跳过亏本搬运；搬运数随 B 单调
+    涨 = 判据与带宽计价的联合行为）；③hot 的 95% 跨节点流量是远端回填
+    （10.8–16.4GB vs home/auto 的 1.4–6.7GB）。
+28.6 v31.5 est-flip：翻转率实测（"决策知道未来"结题）
+  | 区 | 估计器 | 候选 | oracle接受% | 误接受 | 误拒绝 | 翻转率 |
+  |---|---|---|---|---|---|---|
+  | s96 边际区（ln32/B=1.0/hot） | budget | 2003 | 0 | 4 | 0 | **0.1%** |
+  |                            | window | 1870 | 1 | 0 | 0 | **0.0%** |
+  |                            | quantile | 1947 | 16 | 0 | 292 | 16.0% |
+  |                            | median | 4827 | 24 | 0 | 1133 | 23.5% |
+  | sgpt 长输出区（med384/B=2.5/auto） | online(budget+window) | 744 | 15 | 4 | 0 | **1.1%** |
+  |                            | quantile | 21474 | 65 | 0 | 13861 | **64.5%** |
+  - 判定：
+    ① **成立（正面，可写进论文）**：budget（max_new_tokens）+ window
+      （滚动命中）——真实系统可得的两个输入——翻转率 0.0–1.1%，
+      **E 的逐决策行为几乎不依赖未来信息**。完全在线（online 臂）的
+      误接受仅 4 个、误拒绝 0（方向安全：在线估计最多略微保守）。
+    ② **成立（负结果，同样可写）**：quantile（完成样本 p50）在长输出
+      分布翻掉 64.5%（21474 候选、误拒绝 13861）——**存活偏差**：先
+      完成的请求偏短，样本系统性低估在飞请求的剩余长度；失效率随
+      输出长度放大（短输出区仅 16%）。朴素完成样本统计不可作长度
+      预测器；删失校正类修法不值得做——budget 已 0.1%。
+    ③ **成立（第三次复现）**：所有估计器下 E 跨节点主行为保持（s96 区
+      全 0；sgpt 区同量级 14–15GB）——"低带宽拒绝跨节点亏本迁移"对
+      输入估计鲁棒（value 与税同随 remain 线性缩放，估计器改"做多做少"
+      改不了方向）。
+  - 已修的一个坑：est_flip 自动置位条件初版写成 miss_est!=1（应为 !=0），
+    window 臂首轮没开影子；CLI 校验（未知值报错）按设计拦截了传错参数
+    的运行，未静默产废数据。
+28.7 局限（必须随数字声明）
+  - 全部本机 4×3090 + 本地重抓 trace（s96/sgpt/32K 与原 4090 trace 差
+    ≤4 块，hit 差 ≤0.01）；3090 墙钟噪声 ±10–25%，E/RR 比值仅方向参考，
+    主张只用配对差与确定性字节账。
+  - est-flip 的候选集随轨迹漂移（墙钟耦合）：budget 臂 oracle 接受 0%
+    vs quantile 臂 53%——候选 mix 不同；**比率内部配对有效、跨臂候选
+    不可比**。严格同快照对照仍需 FERRY_WLA_SNAPSHOT + wla_counterfact。
+  - quantile 的误拒绝集中在长剩余候选，但其 E 跨节点字节仍 ~15GB
+    （被接受的那部分照付）——翻转率与字节账须分开读。
+  - n=3（28.4/28.5/28.6）与 n=5（28.3）按臂间交错；RR 噪声大的格子
+    （B=10 E/RR）不得单独引用。
+28.8 复现命令
+  # 修复影响（n=5 交错，边际区）：
+  FERRY_MISS_TRACE=<s96>.bin ./build/run_wla_multigpu --gpus 0,1,2,3 \
+    --requests 48 --steps 96 --layers 28 --kv-heads 4 --head-dim 128 --sel 64 \
+    --hot 128 --prefix-group 4 --prefix-steps 8 --arrival steady --skew balanced \
+    --cap-mode perreq --kv-mode delta --len-dist lognormal --len-median 32 \
+    --len-sigma 0.60 --len-seed 42 --vchan-bw 1.0 --vchan-t0 0.5 \
+    --vchan-nodes 0,0,1,1 --hier-steal 1 --remote-tax 1 --local-bw 16.6 \
+    --steal-precheck 1 --mig-scope hot --mig-bw 1.0 --seed 42 --modes 2,3,5 \
+    [--tax-account legacy]        # 对照臂；缺省 = full
+  # 翻转率（自动开影子）：--len-est budget|median|quantile / --miss-est window
+  # scope3 式重表：换 --vchan-bw {1.0,2.5,10.0} × --mig-scope {hot,home,auto}
+  #   + 512 步 trace + --len-median 384 --layer-cost-mb 271 --gap 20.0
+  # trace 广度：tools/capture_miss_trace.py --prefill-chunk 4096（32K 必需）
+  #   --corpus data/corpus/sharegpt_v3_sample.txt（ShareGPT 抽样 6MB，seed 42）
+28.9 代码位置与本轮产物
+  - `src/runtime/wla_multigpu.cuh`：WlaStealPolicy（len_est/miss_est/
+    len_prior/tax_legacy/est_flip）、cost_filter_ok（税全额入账 + est_* +
+    影子决策）、est_remain/est_miss_b/obs_selects/obs_done/done_len_p50、
+    tick_end 完成长度观测、exec_step B/C 路径命中观测。
+  - `src/benches/run_wla_multigpu.cu`：--tax-account/--len-est/--miss-est/
+    --len-prior CLI（未知值报错不静默回退）+ 头行回显 + [est-flip] 输出。
+  - `tools/capture_miss_trace.py`：--prefill-chunk（默认 0 = 整段，逐位不变）。
+  - 本轮产物（本机 /data1/ferry_artifacts，不入库）：v314r*（30 运行）、
+    v314_32k*/v314_sgpt*（8 运行）、v315_*（18 运行）、AGG_summary.txt、
+    AGG_est_flip.txt；trace 三份（s96/sgpt/32K 重抓）。
 
