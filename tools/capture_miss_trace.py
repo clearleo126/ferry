@@ -227,6 +227,9 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--timing-steps", type=int, default=30,
                     help="抓完后在最大上下文处做一次无 hook 的干净步时测量（0=关闭）")
+    ap.add_argument("--prefill-chunk", type=int, default=0,
+                    help="prompt 分块 prefill 的块大小（0=整段一次 forward，历史行为；"
+                         "长 prompt（>=16k）在 24GB 卡上必须分块，否则 logits 张量 OOM）")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--dtype", choices=["fp16", "bf16"], default="fp16")
     args = ap.parse_args()
@@ -322,11 +325,22 @@ def main():
     with torch.inference_mode():
         for r, prompt in enumerate(prompts):
             ids = list(prompt)
-            inp = torch.tensor([ids], dtype=torch.long, device=args.device)
             sel.active = False
-            out = model(input_ids=inp, use_cache=True)
-            cache = out.past_key_values
-            nxt = int(out.logits[0, -1].argmax())
+            if args.prefill_chunk and len(ids) > args.prefill_chunk:
+                # 分块 prefill：KV 语义与整段等价（位置由 cache 长度自动推），
+                # logits 只在末块有意义（下面只取 [0,-1]）。
+                cache = None
+                for c0 in range(0, len(ids), args.prefill_chunk):
+                    chunk = torch.tensor([ids[c0:c0 + args.prefill_chunk]],
+                                         dtype=torch.long, device=args.device)
+                    out = model(input_ids=chunk, past_key_values=cache, use_cache=True)
+                    cache = out.past_key_values
+                nxt = int(out.logits[0, -1].argmax())
+            else:
+                inp = torch.tensor([ids], dtype=torch.long, device=args.device)
+                out = model(input_ids=inp, use_cache=True)
+                cache = out.past_key_values
+                nxt = int(out.logits[0, -1].argmax())
 
             bid = BlockIds(args.block_tokens)
             bid.reset()
@@ -436,6 +450,7 @@ def main():
         },
         "wall_s": total_s,
         "dtype": args.dtype,
+        "prefill_chunk": args.prefill_chunk,
         "device": torch.cuda.get_device_name(torch.device(args.device)),
         "torch": torch.__version__,
         "transformers": __import__("transformers").__version__,
