@@ -2,7 +2,7 @@
   "format": "ferry-miss-trace",
   "version": 1,
   "bin": "qwen7b_g4_s512_quest.bin",
-  "model": "/workspace/.models/Qwen2.5-7B-Instruct",
+  "model": ".models/Qwen2.5-7B-Instruct",
   "method": "quest",
   "page_tokens": 16,
   "block_tokens": 4,
@@ -170,24 +170,25 @@
   ],
   "prefix_ids_match": true,
   "step_ms": {
-    "mean": 13.191257770112466,
-    "p50": 12.945214984938502,
-    "p99": 14.649220393039286,
-    "max": 102.97138430178165
+    "mean": 34.63870277020457,
+    "p50": 34.10586703103036,
+    "p99": 36.650392998126335,
+    "max": 146.37283800402656
   },
   "pages_per_layer_step": 16.0,
-  "step_reuse_rate": 0.6789750307229055,
+  "step_reuse_rate": 0.6796507344376107,
   "clean_step_ms": {
-    "n": 30,
-    "ctx": 4638,
-    "mean": 18.90783271789551,
-    "p50": 18.89073657989502
+    "n": 0,
+    "ctx": 4608,
+    "mean": 0.0,
+    "p50": 0.0
   },
-  "wall_s": 592.3499948978424,
+  "wall_s": 954.8539500236511,
   "dtype": "fp16",
-  "device": "NVIDIA GeForce RTX 4090",
-  "torch": "2.11.0+cu128",
-  "transformers": "5.20.2",
-  "time": "2026-10-24 09:21:45",
-  "cmd": "tools/capture_miss_trace.py --model /workspace/.models/Qwen2.5-7B-Instruct --method quest --out results/realtrace_20261022/qwen7b_g4_s512_quest --requests 48 --groups 12 --steps 512 --prompt-tokens 4096 --prefix-tokens 2048 --sel-pages 16 --seed 42"
+  "prefill_chunk": 0,
+  "device": "NVIDIA GeForce RTX 3090",
+  "torch": "2.6.0+cu124",
+  "transformers": "5.22.0",
+  "time": "2026-10-30 11:56:50",
+  "cmd": "tools/capture_miss_trace.py --model .models/Qwen2.5-7B-Instruct --method quest --out results/realtrace_20261022/qwen7b_g4_s512_quest --requests 48 --groups 12 --steps 512 --prompt-tokens 4096 --prefix-tokens 2048 --page-tokens 16 --sel-pages 16 --seed 42 --timing-steps 0 --device cuda:0"
 }

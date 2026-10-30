@@ -1,0 +1,11 @@
+[len] dist=lognormal median=300 sigma=0.40 seed=42 | 实际 p10=165 p50=296 p90=512 max=512 | 截断@steps=8 个 (17%) | 总步数 15843
+[wla-mg] gpus=0,1,2,3 arrival=steady skew=balanced reqs=48 steps=512 layers=28 sel=64 hot=128 attn=8 gap=20.0ms steal-batch=4 B_ref=1.0GB/s cost-scale=3.00 mig-margin=2.0 kv-mode=delta rebal=50ms/thr0.25 prefix=grp4/stp8 cap=perreq steal-delay=0.0ms seed=42 own-carry=0 vchan=2.50GB/s/0.5ms len=lognormal(med300/sig0.40) precheck=1 lock=narrow mthread=0 nodes=0,0,1,1 hier=1 rtax=1 lbw=16.60 lcost=271MB slow=none@0ms spd=0 scope=auto tax=full lense=oracle missest=oracle mprior=0.00
+[trace] real model trace: results/realtrace_20261022/qwen7b_g4_s512_quest.bin | R=48 S=512 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=36860 slab_blocks=1152 hit=0.861
+  ferry-C   makespan= 10270.13ms steps/s=    4.7 p50= 20.639 p99=  28.369 steals=  26(att=   29) migr=  440.8MB( 29 reqs) refill= 840274 seg 27749.88MB imb=0.228 ref=0 live=56416
+[trace] real model trace: results/realtrace_20261022/qwen7b_g4_s512_quest.bin | R=48 S=512 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=36860 slab_blocks=1152 hit=0.861
+  costaware-E makespan= 10176.96ms steps/s=    4.7 p50= 20.574 p99=  26.279 steals=  28(att=   32) migr=  436.5MB( 30 reqs) refill= 863828 seg 28514.78MB imb=0.156 ref=0 live=55876
+[trace] real model trace: results/realtrace_20261022/qwen7b_g4_s512_quest.bin | R=48 S=512 L=28 kv=4 d=128 page=16 sel_pages=16 unique_blocks=36860 slab_blocks=1152 hit=0.861
+  roundrobin-RR makespan= 10328.28ms steps/s=    4.6 p50= 20.067 p99=  24.526 steals=   0(att=    0) migr=    0.0MB(  0 reqs) refill= 969876 seg 32053.88MB imb=0.000 ref=0 live=0
+  => [steal-cp] precheck: pre-refused=1856 att=29 | steal_ms=3698.2 (127.52 ms/att, makespan 的 36.0%, 迁移 440.8MB ≈ 462.2ms@B_ref) | precheck_ms=0.5
+  => [steal-seg] 占 steal_ms 的份额: lock=105.3(3%) lease=1370.7(37%) tick=332.0(9%) crit=32.2(1%) gathr=2.2(0%) xfer=52.8(1%) scttr=2.2(0%) net=1799.9(49%) | 和=3697.3 (100% of steal_ms)
+  => [vchan] B=2.50GB/s T0=0.5ms | 注入等待: A=0.0 B=0.0 C=1975.0 E=1842.3 LLX=0.0 RR=0.0 ms | 计价字节: C=4014.22 E=4076.50 LLX=0.00 RR=0.00 MB | home: C=16 reqs/4032.0MB E=15/3780.0MB

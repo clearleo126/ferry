@@ -1,0 +1,56 @@
+Loading weights:   0%|          | 0/339 [00:00<?, ?it/s]Loading weights:   0%|          | 1/339 [00:00<02:18,  2.43it/s]Loading weights:   5%|▌         | 17/339 [00:00<00:07, 42.87it/s]Loading weights:  12%|█▏        | 40/339 [00:00<00:04, 60.48it/s]Loading weights:  16%|█▌        | 53/339 [00:00<00:03, 73.10it/s]Loading weights:  22%|██▏       | 76/339 [00:01<00:02, 99.86it/s]Loading weights:  29%|██▉       | 100/339 [00:01<00:02, 111.82it/s]Loading weights:  37%|███▋      | 124/339 [00:01<00:01, 114.69it/s]Loading weights:  44%|████▎     | 148/339 [00:01<00:01, 119.41it/s]Loading weights:  51%|█████     | 172/339 [00:01<00:01, 134.11it/s]Loading weights:  55%|█████▌    | 187/339 [00:01<00:01, 129.90it/s]Loading weights:  61%|██████▏   | 208/339 [00:02<00:01, 127.40it/s]Loading weights:  65%|██████▌   | 222/339 [00:02<00:00, 127.04it/s]Loading weights:  72%|███████▏  | 244/339 [00:02<00:00, 133.06it/s]Loading weights:  79%|███████▉  | 268/339 [00:02<00:00, 135.30it/s]Loading weights:  86%|████████▌ | 292/339 [00:02<00:00, 134.27it/s]Loading weights:  90%|█████████ | 306/339 [00:02<00:00, 132.33it/s]Loading weights:  97%|█████████▋| 328/339 [00:02<00:00, 141.57it/s]Loading weights: 100%|██████████| 339/339 [00:02<00:00, 115.80it/s]
+[trace] model=.models/Qwen2.5-7B-Instruct L=28 H=28 KV=4 D=128 dtype=fp16
+[trace] method=quest page=16 block=4 sel_pages=16 req=48×512 steps
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (777194 > 131072). Running this sequence through the model will result in indexing errors
+[trace] corpus tokens = 1257116
+[trace] prefix id 自检: PASS
+[trace] req 1/48 group=0 prompt=4096 out=512 19.0s (37.1 ms/step)
+[trace] req 2/48 group=0 prompt=4096 out=512 19.3s (37.7 ms/step)
+[trace] req 3/48 group=0 prompt=4096 out=512 19.6s (38.2 ms/step)
+[trace] req 4/48 group=0 prompt=4096 out=512 19.5s (38.2 ms/step)
+[trace] req 5/48 group=1 prompt=4096 out=512 18.9s (37.0 ms/step)
+[trace] req 6/48 group=1 prompt=4096 out=512 18.6s (36.2 ms/step)
+[trace] req 7/48 group=1 prompt=4096 out=512 18.6s (36.4 ms/step)
+[trace] req 8/48 group=1 prompt=4096 out=512 18.7s (36.5 ms/step)
+[trace] req 9/48 group=2 prompt=4096 out=512 19.0s (37.0 ms/step)
+[trace] req 10/48 group=2 prompt=4096 out=512 18.8s (36.7 ms/step)
+[trace] req 11/48 group=2 prompt=4096 out=512 19.2s (37.5 ms/step)
+[trace] req 12/48 group=2 prompt=4096 out=512 19.3s (37.7 ms/step)
+[trace] req 13/48 group=3 prompt=4096 out=512 18.6s (36.3 ms/step)
+[trace] req 14/48 group=3 prompt=4096 out=512 18.7s (36.5 ms/step)
+[trace] req 15/48 group=3 prompt=4096 out=512 18.7s (36.5 ms/step)
+[trace] req 16/48 group=3 prompt=4096 out=512 19.5s (38.0 ms/step)
+[trace] req 17/48 group=4 prompt=4096 out=512 19.1s (37.3 ms/step)
+[trace] req 18/48 group=4 prompt=4096 out=512 18.7s (36.6 ms/step)
+[trace] req 19/48 group=4 prompt=4096 out=512 18.9s (36.9 ms/step)
+[trace] req 20/48 group=4 prompt=4096 out=512 18.5s (36.2 ms/step)
+[trace] req 21/48 group=5 prompt=4096 out=512 18.5s (36.2 ms/step)
+[trace] req 22/48 group=5 prompt=4096 out=512 18.5s (36.2 ms/step)
+[trace] req 23/48 group=5 prompt=4096 out=512 18.6s (36.3 ms/step)
+[trace] req 24/48 group=5 prompt=4096 out=512 18.8s (36.7 ms/step)
+[trace] req 25/48 group=6 prompt=4096 out=512 18.9s (36.9 ms/step)
+[trace] req 26/48 group=6 prompt=4096 out=512 18.9s (36.9 ms/step)
+[trace] req 27/48 group=6 prompt=4096 out=512 19.3s (37.6 ms/step)
+[trace] req 28/48 group=6 prompt=4096 out=512 19.2s (37.5 ms/step)
+[trace] req 29/48 group=7 prompt=4096 out=512 19.3s (37.6 ms/step)
+[trace] req 30/48 group=7 prompt=4096 out=512 19.0s (37.0 ms/step)
+[trace] req 31/48 group=7 prompt=4096 out=512 18.6s (36.4 ms/step)
+[trace] req 32/48 group=7 prompt=4096 out=512 18.6s (36.3 ms/step)
+[trace] req 33/48 group=8 prompt=4096 out=512 18.7s (36.6 ms/step)
+[trace] req 34/48 group=8 prompt=4096 out=512 18.6s (36.4 ms/step)
+[trace] req 35/48 group=8 prompt=4096 out=512 19.1s (37.4 ms/step)
+[trace] req 36/48 group=8 prompt=4096 out=512 19.5s (38.1 ms/step)
+[trace] req 37/48 group=9 prompt=4096 out=512 19.3s (37.8 ms/step)
+[trace] req 38/48 group=9 prompt=4096 out=512 18.5s (36.2 ms/step)
+[trace] req 39/48 group=9 prompt=4096 out=512 18.5s (36.1 ms/step)
+[trace] req 40/48 group=9 prompt=4096 out=512 18.5s (36.2 ms/step)
+[trace] req 41/48 group=10 prompt=4096 out=512 18.5s (36.2 ms/step)
+[trace] req 42/48 group=10 prompt=4096 out=512 18.5s (36.2 ms/step)
+[trace] req 43/48 group=10 prompt=4096 out=512 18.5s (36.2 ms/step)
+[trace] req 44/48 group=10 prompt=4096 out=512 18.6s (36.2 ms/step)
+[trace] req 45/48 group=11 prompt=4096 out=512 18.5s (36.2 ms/step)
+[trace] req 46/48 group=11 prompt=4096 out=512 18.5s (36.2 ms/step)
+[trace] req 47/48 group=11 prompt=4096 out=512 18.8s (36.7 ms/step)
+[trace] req 48/48 group=11 prompt=4096 out=512 19.3s (37.7 ms/step)
+[trace] wrote results/realtrace_20261022/qwen7b_g4_s512_quest.bin (169.3 MB), results/realtrace_20261022/qwen7b_g4_s512_quest.json
+[trace] mean step 34.64 ms, p50 34.11, reuse 0.680, pages/layer/step 16.0
