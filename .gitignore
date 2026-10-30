@@ -12,4 +12,5 @@ results/realtrace_*/*.m[0-9]
 results/realtrace_*/*.trace
 .models/
 .hf_home/
+.venv/
 __pycache__/
