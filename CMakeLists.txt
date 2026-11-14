@@ -157,6 +157,13 @@ add_executable(run_mig_interference
 )
 target_link_libraries(run_mig_interference PRIVATE ferry_comm ferry_config ferry_common)
 
+# bench_graph_dma: decode 阶段 DMA × CUDA Graph 可行性探针（支线筛查，不入主线）
+add_executable(bench_graph_dma
+  src/benches/bench_graph_dma.cu
+)
+# 设备侧图发射（E5b）需要 relocatable device code
+set_target_properties(bench_graph_dma PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
 # ------------------------------------------------------------------
 # 后续模块（P2 中逐步添加，先占位说明）
 #   workloads/: Workload A/B 生成器
