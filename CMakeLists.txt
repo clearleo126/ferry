@@ -164,6 +164,13 @@ add_executable(bench_graph_dma
 # 设备侧图发射（E5b）需要 relocatable device code
 set_target_properties(bench_graph_dma PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+# bench_miss_contention: v32 数据面探针（host 共享介质争用 × SM/CE 路径边界）
+add_executable(bench_miss_contention
+  src/benches/bench_miss_contention.cu
+)
+target_include_directories(bench_miss_contention PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(bench_miss_contention PRIVATE ferry_common CUDA::cudart)
+
 # ------------------------------------------------------------------
 # 后续模块（P2 中逐步添加，先占位说明）
 #   workloads/: Workload A/B 生成器
