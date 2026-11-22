@@ -5,6 +5,8 @@
 //        path=ce（cudaMemcpyAsync H2D）或 sm（kernel 读 mapped host）
 //   lat：mapped host 上的依赖加载延迟探针（指针追逐），可与其它卡的流量并发
 //   fg ：前台 attention 代理（常驻页上的 QK/softmax/PV 形态），量背景流量下的 p50/p99
+//   nccl：集合通信负载发生器（ncclCommInitAll + allreduce 循环），供另一个进程
+//        的 agg/lat 与之并发，量"集合通信 × host 回填"共享 PCIe 的争用税
 //
 // 口径声明：所有数字为本机 4×3090 / PCIe4 x16 / 双路 Xeon 4314 上的微基准，
 // 不是端到端 LLM；绝对 step 时间不可换算 TPOT。
@@ -30,6 +32,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <nccl.h>
 
 #include "common/cuda_check.cuh"
 
@@ -60,6 +63,8 @@ struct Args {
   int cover_pct = 66;             // hier：预取覆盖率百分比
   int hier_iters = 64;            // hier：每页每线程的 FMA 轮数
   int steps = 20;                 // hier：测量步数
+  double nccl_mb = 4.0;           // nccl：allreduce 消息大小（MB/rank）
+  int nccl_warmup = 5;            // nccl：预热轮数
 };
 
 struct CardResult {
@@ -437,6 +442,79 @@ std::vector<int> parse_gpus(const std::string& s) {
   return out;
 }
 
+// ---------------- NCCL 负载发生器 ----------------
+// 目的：给"另一个进程的 host 回填"制造真实的集合通信背景流量。
+// 用 ncclCommInitAll（单进程多卡，无需 MPI）；本机无 P2P ⇒ NCCL 走 SHM
+// 路径，字节实际两次穿过 PCIe，与 host→HBM 回填争同一条链路。
+// 报告口径：payload = 每轮所有 rank 的输入字节之和 / 墙钟，不含 all-reduce
+// 内部 fan-out 放大，故与回填流的 GB/s 可直接对比。
+int run_nccl_load(const std::vector<int>& devs, size_t msg_bytes, double seconds,
+                  int warmup) {
+  const int n = (int)devs.size();
+  if (n < 2) {
+    std::fprintf(stderr, "[nccl] need >=2 devices\n");
+    return 1;
+  }
+  std::vector<ncclComm_t> comms(n);
+  ncclResult_t rr = ncclCommInitAll(comms.data(), n, devs.data());
+  if (rr != ncclSuccess) {
+    std::fprintf(stderr, "[nccl] init failed: %s\n", ncclGetErrorString(rr));
+    return 1;
+  }
+  const size_t count = msg_bytes / sizeof(float);
+  std::vector<float*> sbuf(n), rbuf(n);
+  std::vector<cudaStream_t> st(n);
+  for (int i = 0; i < n; ++i) {
+    CUDA_CHECK(cudaSetDevice(devs[i]));
+    CUDA_CHECK(cudaMalloc(&sbuf[i], msg_bytes));
+    CUDA_CHECK(cudaMalloc(&rbuf[i], msg_bytes));
+    CUDA_CHECK(cudaMemset(sbuf[i], 0, msg_bytes));
+    CUDA_CHECK(cudaMemset(rbuf[i], 0, msg_bytes));
+    CUDA_CHECK(cudaStreamCreate(&st[i]));
+  }
+  auto one = [&]() {
+    ncclGroupStart();
+    for (int i = 0; i < n; ++i) {
+      CUDA_CHECK(cudaSetDevice(devs[i]));
+      ncclAllReduce(sbuf[i], rbuf[i], count, ncclFloat, ncclSum, comms[i], st[i]);
+    }
+    ncclGroupEnd();
+    for (int i = 0; i < n; ++i) {
+      CUDA_CHECK(cudaSetDevice(devs[i]));
+      CUDA_CHECK(cudaStreamSynchronize(st[i]));
+    }
+  };
+  for (int i = 0; i < warmup; ++i) one();
+
+  std::vector<double> ms;
+  const auto t0 = Clock::now();
+  double elapsed = 0.0;
+  do {
+    const auto a = Clock::now();
+    one();
+    const auto b = Clock::now();
+    ms.push_back(std::chrono::duration<double, std::milli>(b - a).count());
+    elapsed = std::chrono::duration<double>(b - t0).count();
+  } while (elapsed < seconds);
+
+  std::sort(ms.begin(), ms.end());
+  auto pct = [&](double q) { return ms[(size_t)(q * (ms.size() - 1))]; };
+  const double payload = (double)n * (double)msg_bytes * (double)ms.size();
+  std::printf("[nccl] devs=%d msg=%.2fMB iters=%zu wall=%.2fs payload=%.2f GB/s "
+              "per-rank=%.2f GB/s p50=%.3fms p99=%.3fms\n",
+              n, msg_bytes / 1048576.0, ms.size(), elapsed, payload / elapsed / 1e9,
+              payload / elapsed / 1e9 / n, pct(0.50), pct(0.99));
+
+  for (int i = 0; i < n; ++i) {
+    CUDA_CHECK(cudaSetDevice(devs[i]));
+    CUDA_CHECK(cudaStreamDestroy(st[i]));
+    CUDA_CHECK(cudaFree(sbuf[i]));
+    CUDA_CHECK(cudaFree(rbuf[i]));
+    ncclCommDestroy(comms[i]);
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -465,6 +543,8 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--cover")) a.cover_pct = std::atoi(next());
     else if (!std::strcmp(argv[i], "--hier-iters")) a.hier_iters = std::atoi(next());
     else if (!std::strcmp(argv[i], "--steps")) a.steps = std::atoi(next());
+    else if (!std::strcmp(argv[i], "--nccl-mb")) a.nccl_mb = std::atof(next());
+    else if (!std::strcmp(argv[i], "--nccl-warmup")) a.nccl_warmup = std::atoi(next());
     else {
       std::fprintf(stderr, "unknown arg: %s\n", argv[i]);
       return 1;
@@ -472,6 +552,11 @@ int main(int argc, char** argv) {
   }
   const int ncards = (int)a.gpus.size();
   if (ncards == 0) return 1;
+
+  // 纯集合通信负载：不分配 host 池，直接跑
+  if (a.mode == "nccl")
+    return run_nccl_load(a.gpus, (size_t)(a.nccl_mb * 1048576.0), a.seconds,
+                         a.nccl_warmup);
 
   // ---- 共享 pinned 池（mapped）----
   const size_t pool_bytes = 256u << 20;          // 流量池

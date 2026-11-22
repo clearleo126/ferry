@@ -169,7 +169,9 @@ add_executable(bench_miss_contention
   src/benches/bench_miss_contention.cu
 )
 target_include_directories(bench_miss_contention PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(bench_miss_contention PRIVATE ferry_common CUDA::cudart)
+# nccl：集合通信背景负载发生器（--mode nccl）
+find_library(NCCL_LIB nccl)
+target_link_libraries(bench_miss_contention PRIVATE ferry_common CUDA::cudart ${NCCL_LIB})
 
 # ------------------------------------------------------------------
 # 后续模块（P2 中逐步添加，先占位说明）
