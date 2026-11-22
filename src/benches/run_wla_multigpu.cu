@@ -119,6 +119,12 @@ int main(int argc, char** argv) {
   // --steal-thread（v30 L2）：1 = 每卡迁移工作线程（执行线程只投递请求，
   // 迁移与 decode 重叠）；0（默认）= 既有内联语义（迁移阻塞 thief 的执行线程）。
   bool steal_thread = false;
+  // --mvcc（v34）：乐观快照握手。1 = 不等 victim 出 tick（KV 块只追加不可变
+  // ⇒ 快照不需一致切面，缺块 = 一次普通 miss）。0（默认）= 历史语义。
+  bool mvcc = false;
+  // --mig-rate-mbps（v35）：迁移准入令牌桶（MB/s，0 = 关）。按字节限流，
+  // 把"握手便宜 ⇒ 偷得更频繁 ⇒ 迁移量放大"的反馈锁住。
+  double mig_rate_mbps = 0.0;
   // --vchan-nodes（v30.1）：每卡所属节点 id，逗号分隔，长度须等于 --gpus。
   // 例：4 卡 2+2 = "0,0,1,1"（两节点各两张卡）。缺省 = 每卡一节点（v30 口径）。
   char vchan_nodes_s[128] = "";
@@ -231,6 +237,10 @@ int main(int argc, char** argv) {
       steal_lock_wide = std::atoi(next()) != 0;
     } else if (std::strcmp(argv[i], "--steal-thread") == 0) {
       steal_thread = std::atoi(next()) != 0;
+    } else if (std::strcmp(argv[i], "--mvcc") == 0) {
+      mvcc = std::atoi(next()) != 0;
+    } else if (std::strcmp(argv[i], "--mig-rate-mbps") == 0) {
+      mig_rate_mbps = std::atof(next());
     } else if (std::strcmp(argv[i], "--vchan-nodes") == 0) {
       std::strncpy(vchan_nodes_s, next(), sizeof(vchan_nodes_s) - 1);
     } else if (std::strcmp(argv[i], "--hier-steal") == 0) {
@@ -456,13 +466,15 @@ int main(int argc, char** argv) {
   // v31.5：输入非 oracle 时自动开影子决策（同候选 oracle 对照 + 翻转计数）
   // ⚠️ oracle 档是 len_est=0 / miss_est=0（不是 1——window 才是 1）
   spol.est_flip = (len_est != 0 || miss_est != 0);
+  spol.mvcc = mvcc;  // v34 乐观快照握手（默认关 = 历史语义逐位不变）
+  spol.mig_rate_mbps = mig_rate_mbps;  // v35 迁移准入令牌桶（0=关）
 
   std::printf(
       "[wla-mg] gpus=%s arrival=%s skew=%s reqs=%d steps=%d layers=%d sel=%d "
       "hot=%d attn=%d gap=%.1fms steal-batch=%d B_ref=%.1fGB/s cost-scale=%.2f "
       "mig-margin=%.1f kv-mode=%s rebal=%.0fms/thr%.2f prefix=grp%d/stp%d "
       "cap=%s steal-delay=%.1fms seed=%llu own-carry=%d vchan=%.2fGB/s/%.1fms "
-      "len=%s(med%d/sig%.2f) precheck=%d lock=%s mthread=%d nodes=%s "
+      "len=%s(med%d/sig%.2f) precheck=%d lock=%s mthread=%d mvcc=%d migrate=%.0fMB/s nodes=%s "
       "hier=%d rtax=%d lbw=%.2f lcost=%.0fMB slow=%s@%.0fms spd=%d "
       "scope=%s tax=%s lense=%s missest=%s mprior=%.2f\n",
       gpu_buf, arrival, skew, reqs, steps, layers, sel, hot, attn, gap,
@@ -470,7 +482,8 @@ int main(int argc, char** argv) {
       rebal_thr, prefix_group, prefix_steps, cap_mode_s, steal_delay, seed,
       sp.own_carry, vchan_bw, vchan_t0, len_dist, len_median, len_sigma,
       (int)steal_precheck, steal_lock_wide ? "wide" : "narrow",
-      (int)steal_thread, vchan_nodes_s[0] ? vchan_nodes_s : "per-gpu",
+      (int)steal_thread, (int)mvcc, mig_rate_mbps,
+      vchan_nodes_s[0] ? vchan_nodes_s : "per-gpu",
       (int)hier_steal, (int)remote_tax, local_bw, layer_cost_mb,
       slow_s[0] ? slow_s : "none", slow_at, (int)speed_aware, mig_scope_s,
       tax_account_s, len_est_s, miss_est_s, miss_prior);
@@ -542,6 +555,23 @@ int main(int argc, char** argv) {
                   c.steal_ms > 0 ? 100.0 * c.steal_seg[i] / c.steal_ms : 0.0);
     std::printf(" | 和=%.1f (%.0f%% of steal_ms)\n", sum,
                 c.steal_ms > 0 ? 100.0 * sum / c.steal_ms : 0.0);
+    // v35 迁移准入令牌桶：拒绝/授予次数与实际放行字节
+    if (c.budget_rate > 0.0) {
+      const double att = (double)(c.budget_granted + c.budget_refused);
+      std::printf("  => [budget] rate=%.0fMB/s 授予=%llu 拒绝=%llu (拒绝率 %.0f%%) "
+                  "放行=%.1fMB\n",
+                  c.budget_rate, (unsigned long long)c.budget_granted,
+                  (unsigned long long)c.budget_refused,
+                  att > 0 ? 100.0 * (double)c.budget_refused / att : 0.0,
+                  c.budget_mb);
+    }
+    // v34 MVCC：与 victim 在途 tick 重叠的窃取次数 / 就地推进步数
+    if (mvcc) {
+      std::printf("  => [mvcc] 在途重叠窃取=%llu 在途让过请求=%llu"
+                  "（快照不等 victim 出 tick；tick 税应为 0）\n",
+                  (unsigned long long)c.mvcc_inflight,
+                  (unsigned long long)c.mvcc_steps_ahead);
+    }
   };
   // vchan 诊断（--vchan-bw>0 才有）：注入的虚拟网络等待 = makespan 的可归因
   // 部分。A 恒 0（无迁移 ⇒ 无跨节点字节）。

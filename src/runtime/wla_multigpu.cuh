@@ -208,6 +208,14 @@ struct WlaMultiStats {
   // v31.2 迁移范围遥测：把 KV home 一起搬走的请求数与字节
   uint64_t home_reqs = 0;
   uint64_t home_bytes = 0;
+  // v34 MVCC 遥测：与 victim 在途 tick 重叠的窃取次数 + 就地推进的步数
+  uint64_t mvcc_inflight = 0;
+  uint64_t mvcc_steps_ahead = 0;
+  // v35 迁移准入令牌桶遥测
+  uint64_t budget_refused = 0;
+  uint64_t budget_granted = 0;
+  double budget_mb = 0.0;
+  double budget_rate = 0.0;
   // v31.5 估计器影子决策（est-flip；--len-est/--miss-est 非 oracle 时自动累计）：
   // 同一候选、同一墙钟状态下，est 输入 vs oracle 输入的 accept 对比。
   //   误接受 = est 接受而 oracle 拒绝（搬了不该搬的）
@@ -261,6 +269,15 @@ struct WlaStealPolicy {
   // v30 L1 ablation：true = 旧语义（steal_lock_ 持有到传输结束，全机迁移
   // 串行）。false（默认）= 只持有状态临界区，传输按卡租约并发。
   bool lock_wide = false;
+  // v34 MVCC：乐观快照握手（见 results/v34_mvcc_prereg_20261121.md）。
+  // false（默认）= 历史语义：等双侧出 tick 后再快照/交接。
+  // true = 不等 victim 出 tick，快照改由逐 (卡,组,层) 细粒度锁保护；
+  //        victim 的在途 tick 与批量传输重叠。KV 块只追加不可变 ⇒
+  //        缺块等价于一次普通 miss，不需要一致切面。
+  bool mvcc = false;
+  // v35 迁移准入令牌桶（--mig-rate-mbps，0 = 关）：按字节限流，把"握手变便宜
+  // ⇒ 偷得更频繁 ⇒ 迁移量放大"这一反馈锁住（见 results/v35_budget_prereg）。
+  double mig_rate_mbps = 0.0;
   // v30 L2：迁移搬出执行线程。true = 每卡一个迁移工作线程，执行线程只投递
   // 请求（post_mig_request）后继续 decode；false（默认）= 既有内联语义。
   // 依据：分段数据显示 lock 缩小后时间只是从 lock 转移到 net/tick —— 因为
@@ -611,6 +628,15 @@ class WlaMultiGpuCtx {
     next_step_.assign(R_, 0);
     done_ms_.assign(R_, 0.0);
     in_tick_.assign(n_, false);
+    // v34 MVCC：细粒度锁与 tick 序号（无论开关都分配，开销 ~几十 KB；
+    // 加锁与否由 mvcc_ 决定，关闭时行为与历史二进制逐位一致）
+    kv_mtx_.reset(new std::mutex[(size_t)n_ * (size_t)ngrp_ *
+                                 (size_t)sp_.num_layers]);
+    tick_seq_.reset(new std::atomic<uint64_t>[n_]);
+    tick_resident_.assign(n_, {});
+    for (int i = 0; i < n_; ++i) tick_seq_[i].store(0);
+    step_busy_.reset(new std::atomic<uint32_t>[R_]);
+    for (int r = 0; r < R_; ++r) step_busy_[r].store(0);
     per_gpu_done_.assign(n_, 0);
     completed_.store(0);
     next_arrive_.store(0);
@@ -829,14 +855,32 @@ class WlaMultiGpuCtx {
   std::vector<int> tick_begin(int g) {
     std::unique_lock<std::mutex> lk(mtx_);
     in_tick_[g] = true;
-    return std::vector<int>(local_[g].begin(), local_[g].end());
+    // v34：登记本 tick 的 resident（mvcc 下窃取方据此判定"该请求在途"）
+    tick_resident_[g].assign(local_[g].begin(), local_[g].end());
+    for (int r : tick_resident_[g])
+      if (step_busy_)
+        step_busy_[r].fetch_or(1u << g, std::memory_order_release);
+    return tick_resident_[g];
   }
-  void tick_end(int g, const std::vector<int>& resident, double now_ms) {
+  // executed = 本 tick 真正执行过 exec_step 的请求（mvcc 下可能少于 resident：
+  // 刚被偷走且仍在原卡在途 tick 内的请求会被让过，留到下一 tick）。
+  void tick_end(int g, const std::vector<int>& resident,
+                const std::vector<int>& executed, double now_ms) {
     std::unique_lock<std::mutex> lk(mtx_);
     in_tick_[g] = false;
+    if (tick_seq_) tick_seq_[g].fetch_add(1, std::memory_order_release);
+    // 只有真正执行过的请求才推进步数（乐观快照下"在途"请求由原卡 tick 记账）
+    for (int r : executed) ++next_step_[r];
+    for (int r : resident)
+      if (step_busy_)
+        step_busy_[r].fetch_and(~(1u << g), std::memory_order_acq_rel);
+    tick_resident_[g].clear();
     std::vector<int> trim_groups;
     for (int r : resident) {
-      ++next_step_[r];
+      // v34 MVCC：已迁走的请求 —— 归属位/容量/完成数由当前持有者收尾
+      //（成员数已由窃取方迁移时扣/加，这里重复扣会双计）。
+      if (std::find(local_[g].begin(), local_[g].end(), r) == local_[g].end())
+        continue;
       if (next_step_[r] >= wla_len_of(sp_, r)) {
         obs_done(wla_len_of(sp_, r));  // v31.5：完成长度是可观测事件（quantile 用）
         auto& dq = local_[g];
@@ -1088,6 +1132,8 @@ class WlaMultiGpuCtx {
     int v = v_sel;
     std::vector<int> moved;
     double home_charge = 0.0;  // v31.2：本次 steal 的 home 额外网络字节
+    // v35：本次窃取向令牌桶预扣的字节估计（传输结束后按实际去重字节退还差额）
+    double budget_est_mb = 0.0;
     // F0-a 竞态修复：状态快照产物（在下方临界区内构建，传输阶段只消费，
     // 不再触碰 host LRU 容器）。delta = 整批偏移表 + 每 chunk 条目数；
     // naive = 每请求偏移表（moved 顺序索引）。
@@ -1122,26 +1168,34 @@ class WlaMultiGpuCtx {
       // v30 L2：先等本卡（thief）出 tick —— 由 need flag 让执行线程主动让渡，
       // 期间不惊动 victim（否则 worker 等本卡长时间 tick 的整段时间里，
       // victim 每个 tick 都付 ≤2ms 让渡税，见 tick=559ms 的实测）。
-      while (in_tick_[g] && completed_.load() < (size_t)R_)
-        cv_.wait_for(lk, std::chrono::microseconds(500));
-      if (in_tick_[g] || completed_.load() >= (size_t)R_) return 0;
-      // 本卡已出 tick → 现在才通知 victim：有 thief 在等窗口
-      //（victim 在 tick_end 后有界让渡）
-      steal_pending_.fetch_add(1);
-      // 等双侧出 tick（cv wait 释放 ctx 锁 → 双方可完成 tick 并 notify）：
-      //   v = 状态源（下方快照/handoff 读 [v][q]，v 在 tick 内会 kv_touch
-      //       插入/逐出同组集合）；g = handoff 写入目标（LLX 由重平衡线程
-      //       调用时，g 的执行线程可能正在 tick 内 touch [g][q]）。
-      //   C/E：thief 即 g 的执行线程（自身出 tick），g 侧恒直通零成本。
-      // 双侧出 tick 后持锁直通快照段（tick_begin 需 mtx_ → 双侧无法再进
-      // tick）——F0-a 发现 2（组 LRU 并发修改竞态）的修复。
-      // 等待期间 lk 会释放 ⇒ thief 可能重新进 tick，故仍须同时判双侧
-      while ((in_tick_[v] || in_tick_[g]) && completed_.load() < (size_t)R_)
-        cv_.wait_for(lk, std::chrono::microseconds(500));
-      steal_pending_.fetch_sub(1);
-      cv_.notify_all();  // 唤醒让渡中的 victim
-      if (in_tick_[v] || in_tick_[g] || completed_.load() >= (size_t)R_)
-        return 0;
+      if (pol.mvcc) {
+        // v34 乐观快照：victim 不必出 tick。只需要 thief 自己不在 tick 内
+        //（它即将写自己的 LRU 镜像）；victim 的在途 tick 与批量传输重叠。
+        // 依据：KV 块只追加不可变 ⇒ 快照不需要一致切面，缺块 = 一次普通 miss。
+        if (in_tick_[g] || completed_.load() >= (size_t)R_) return 0;
+        if (in_tick_[v]) mvcc_inflight_.fetch_add(1);
+      } else {
+        while (in_tick_[g] && completed_.load() < (size_t)R_)
+          cv_.wait_for(lk, std::chrono::microseconds(500));
+        if (in_tick_[g] || completed_.load() >= (size_t)R_) return 0;
+        // 本卡已出 tick → 现在才通知 victim：有 thief 在等窗口
+        //（victim 在 tick_end 后有界让渡）
+        steal_pending_.fetch_add(1);
+        // 等双侧出 tick（cv wait 释放 ctx 锁 → 双方可完成 tick 并 notify）：
+        //   v = 状态源（下方快照/handoff 读 [v][q]，v 在 tick 内会 kv_touch
+        //       插入/逐出同组集合）；g = handoff 写入目标（LLX 由重平衡线程
+        //       调用时，g 的执行线程可能正在 tick 内 touch [g][q]）。
+        //   C/E：thief 即 g 的执行线程（自身出 tick），g 侧恒直通零成本。
+        // 双侧出 tick 后持锁直通快照段（tick_begin 需 mtx_ → 双侧无法再进
+        // tick）——F0-a 发现 2（组 LRU 并发修改竞态）的修复。
+        // 等待期间 lk 会释放 ⇒ thief 可能重新进 tick，故仍须同时判双侧
+        while ((in_tick_[v] || in_tick_[g]) && completed_.load() < (size_t)R_)
+          cv_.wait_for(lk, std::chrono::microseconds(500));
+        steal_pending_.fetch_sub(1);
+        cv_.notify_all();  // 唤醒让渡中的 victim
+        if (in_tick_[v] || in_tick_[g] || completed_.load() >= (size_t)R_)
+          return 0;
+      }
       seg.tick += ms_since(t_mtx0);  // 握手结束（等 mtx_ + 等双方出 tick）
       const auto t_crit0 = std::chrono::steady_clock::now();
       const size_t cur = local_[v].size();
@@ -1177,6 +1231,23 @@ class WlaMultiGpuCtx {
         }
         take = ok;
       }
+      // v35 迁移准入（令牌桶）：按"本批将要搬的 live 字节"限流。
+      // 动机（§36）：握手便宜 ⇒ 偷得更频繁 ⇒ 迁移量 +37% 把省下的时间吃掉。
+      // 这里把体积拉回预算内，其余决策逻辑不动。full 模式无 live 口径 → 跳过。
+      if (pol.mig_rate_mbps > 0.0 && kvmode_ != WlaKvMode::Full) {
+        double est_mb = 0.0;
+        for (size_t j = 0; j < take; ++j) {
+          const int r = local_[v][local_[v].size() - 1 - j];
+          const size_t live = own_on() ? kv_live_owned(v, r) : kv_live(v, r);
+          est_mb += (double)live * (double)c4_ / (1024.0 * 1024.0);
+        }
+        if (!tb_take(est_mb)) {
+          budget_refused_.fetch_add(1);
+          return 0;
+        }
+        budget_est_mb = est_mb;
+        budget_granted_.fetch_add(1);
+      }
       if (std::getenv("FERRY_WLA_DEBUG"))
         std::fprintf(stderr,
                      "[steal] g=%d v=%d take=%zu cur(v)=%zu fair=%zu "
@@ -1211,6 +1282,17 @@ class WlaMultiGpuCtx {
         grp_member_add(v, q, -1);
         grp_member_add(g, q, +1);
       }
+      // v34 MVCC：不在此处推进 next_step_。若请求仍在原卡的在途 tick 内，
+      // 那一步由原卡 tick_end 记账；持有者的执行循环用 step_busy_ 让过它
+      // （见驱动侧 exec 循环），避免同一 step 被执行两次或一次都不执行。
+      int inflight_moved = 0;
+      if (pol.mvcc && in_tick_[v] && !tick_resident_[v].empty()) {
+        for (int r : moved)
+          if (std::find(tick_resident_[v].begin(), tick_resident_[v].end(), r) !=
+              tick_resident_[v].end())
+            ++inflight_moved;
+      }
+      if (inflight_moved) mvcc_steps_ahead_.fetch_add((uint64_t)inflight_moved);
       // ---- 状态快照 + 交接 + F0-a 审计（本临界区内一次完成；此后传输
       // 阶段不触碰 host LRU 容器）。idx 枚举与 handoff 拷贝同临界区 ⇒
       // 消费卡镜像 == 实际传输集合（修复"镜像含未传输块"的语义裂缝：
@@ -1220,11 +1302,13 @@ class WlaMultiGpuCtx {
         auto emit = [&](int r, std::vector<uint64_t>& out) {
           const int q = wla_grp(sp_, r);
           const uint32_t bit = own_bit(r);
-          for (int l = 0; l < sp_.num_layers; ++l)
+          for (int l = 0; l < sp_.num_layers; ++l) {
+            KvGuard kg(kv_lk(v, q, l));  // v34：mvcc 下 victim 可能正在写
             for (uint64_t blk : kv_set(v, r, l)) {
               if (own_on() && own_mask(v, q, l, blk) != bit) continue;
               out.push_back((uint64_t)wla_gslot_off(sp_, r, l, blk));
             }
+          }
         };
         // v31.2：逐请求记录热集条目数（home 模式的额外计价要扣掉这部分）
         std::vector<std::pair<int, uint64_t>> per_req(  // (r, 热集块层数)
@@ -1502,11 +1586,22 @@ class WlaMultiGpuCtx {
     migrated_reqs_.fetch_add(moved.size());
     migrated_bytes_.fetch_add(moved_bytes);
     steals_.fetch_add(1);
+    // v35：实际传输是**去重后**的字节，通常小于逐请求 live 之和（组内共享块
+    // 只搬一次）⇒ 把预扣的估计与实际之差退还，避免预算被系统性高估 2×。
+    if (pol.mig_rate_mbps > 0.0)
+      tb_refund(budget_est_mb - (double)moved_bytes / (1024.0 * 1024.0));
     return moved.size();
   }
 
   // ---- 访问器 ----
   int step_of(int r) const { return next_step_[r]; }
+  // v34：该请求是否正被"别的卡"的在途 tick 执行（乐观快照下持有者须让过）。
+  // 排除自己那一位 —— 本卡 tick_begin 也会置位。
+  bool step_busy(int r, int g) const {
+    if (!step_busy_) return false;
+    const uint32_t m = step_busy_[r].load(std::memory_order_acquire);
+    return (m & ~(1u << g)) != 0;
+  }
   size_t occ(int g) {
     std::unique_lock<std::mutex> lk(mtx_);
     return local_[g].size();
@@ -1685,6 +1780,50 @@ class WlaMultiGpuCtx {
   }
   bool mig_thread_on() const { return mig_req_ != nullptr; }
   void enable_speed_aware(bool b) { speed_aware_ = b; }
+  // ---- v34 MVCC ----
+  void set_mvcc(bool b) {
+    if (b && snap_on_) {  // 反事实快照读 LRU 无锁 → 与乐观读不兼容
+      std::fprintf(stderr, "[mvcc] FERRY_WLA_SNAPSHOT 与 --mvcc 互斥，mvcc 关闭\n");
+      mvcc_ = false;
+      return;
+    }
+    mvcc_ = b;
+  }
+  bool mvcc_on() const { return mvcc_; }
+  // ---- v35 迁移准入令牌桶 ----
+  void set_mig_rate(double mbps) { tb_init(mbps); }
+  uint64_t budget_refused() const { return budget_refused_.load(); }
+  uint64_t budget_granted() const { return budget_granted_.load(); }
+  double budget_mb() const { return tb_moved_mb_.load(); }
+  double budget_rate() const { return tb_rate_mbps_; }
+  uint64_t mvcc_inflight() const { return mvcc_inflight_.load(); }
+  uint64_t mvcc_steps_ahead() const { return mvcc_steps_ahead_.load(); }
+  size_t kv_idx(int g, int q, int l) const {
+    return ((size_t)g * (size_t)ngrp_ + (size_t)q) * (size_t)sp_.num_layers +
+           (size_t)l;
+  }
+  // mvcc 关闭 → nullptr（调用方零开销；历史路径逐位不变）
+  std::mutex* kv_lk(int g, int q, int l) const {
+    if (!mvcc_) return nullptr;
+    return &kv_mtx_[kv_idx(g, q, l)];
+  }
+  // RAII：mvcc 关闭时等于空操作
+  struct KvGuard {
+    std::unique_lock<std::mutex> lk;
+    explicit KvGuard(std::mutex* m) : lk() {
+      if (m) lk = std::unique_lock<std::mutex>(*m);
+    }
+  };
+  // 双侧：按 (卡,组,层) 索引升序加锁，避免 (v,g)/(g,v) 交叉死锁。
+  struct KvGuard2 {
+    std::unique_lock<std::mutex> a, b;
+    KvGuard2(std::mutex* base, int ia, int ib, bool on) : a(), b() {
+      if (!on || base == nullptr) return;
+      if (ia > ib) std::swap(ia, ib);
+      a = std::unique_lock<std::mutex>(base[ia]);
+      if (ib != ia) b = std::unique_lock<std::mutex>(base[ib]);
+    }
+  };
 
   // ---- 虚拟跨节点链路（v30，默认关；见 WlaVLink 注释）----
   bool vchan_on() const { return vchan_bw_gbs_ > 0.0; }
@@ -1898,6 +2037,7 @@ class WlaMultiGpuCtx {
     const int q = wla_grp(sp_, r);
     const uint32_t bit = own_bit(r);
     for (int l = 0; l < sp_.num_layers; ++l) {
+      KvGuard kg(kv_lk(g, q, l));
       auto& m = own_[own_idx(g, q, l)];
       for (auto it = m.begin(); it != m.end();) {
         it->second &= ~bit;
@@ -1913,9 +2053,11 @@ class WlaMultiGpuCtx {
     const int q = wla_grp(sp_, r);
     const uint32_t bit = own_bit(r);
     size_t tot = 0;
-    for (int l = 0; l < sp_.num_layers; ++l)
+    for (int l = 0; l < sp_.num_layers; ++l) {
+      KvGuard kg(kv_lk(g, q, l));
       for (uint64_t blk : lru_dq_[g][q][l])
         if (own_mask(g, q, l, blk) == bit) ++tot;
+    }
     return tot;
   }
   // 成员离开后容量收缩 → 把该组 LRU 裁到新容量（cap_mode=1 专有；
@@ -1925,6 +2067,7 @@ class WlaMultiGpuCtx {
     if (g < 0 || g >= (int)lru_dq_.size() || lru_dq_[g].empty()) return;
     const int cap = kv_cap(g, q);
     for (int l = 0; l < sp_.num_layers; ++l) {
+      KvGuard kg(kv_lk(g, q, l));
       auto& dq = lru_dq_[g][q][l];
       auto& st = lru_set_[g][q][l];
       while ((int)dq.size() > cap) {
@@ -1936,6 +2079,7 @@ class WlaMultiGpuCtx {
   }
   bool kv_touch(int g, int r, int l, uint64_t blk) {
     const int q = wla_grp(sp_, r);
+    KvGuard kg(kv_lk(g, q, l));  // v34：mvcc 关闭时为空操作
     auto& dq = lru_dq_[g][q][l];
     auto& st = lru_set_[g][q][l];
     const bool hit = st.count(blk) > 0;
@@ -1975,6 +2119,7 @@ class WlaMultiGpuCtx {
       return;
     }
     for (int l = 0; l < sp_.num_layers; ++l) {
+      KvGuard2 kg(kv_mtx_.get(), (int)kv_idx(v, q, l), (int)kv_idx(c, q, l), mvcc_);
       if (carry) {
         lru_dq_[c][q][l] = lru_dq_[v][q][l];
         lru_set_[c][q][l] = lru_set_[v][q][l];
@@ -1992,6 +2137,7 @@ class WlaMultiGpuCtx {
     const int q = wla_grp(sp_, r);
     const uint32_t bit = own_bit(r);
     for (int l = 0; l < sp_.num_layers; ++l) {
+      KvGuard2 kg(kv_mtx_.get(), (int)kv_idx(v, q, l), (int)kv_idx(c, q, l), mvcc_);
       const auto& sdq = lru_dq_[v][q][l];
       auto& cdq = lru_dq_[c][q][l];
       auto& cst = lru_set_[c][q][l];
@@ -2017,7 +2163,10 @@ class WlaMultiGpuCtx {
   size_t kv_live(int g, int r) const {
     const int q = wla_grp(sp_, r);
     size_t tot = 0;
-    for (int l = 0; l < sp_.num_layers; ++l) tot += lru_set_[g][q][l].size();
+    for (int l = 0; l < sp_.num_layers; ++l) {
+      KvGuard kg(kv_lk(g, q, l));
+      tot += lru_set_[g][q][l].size();
+    }
     return tot;
   }
   const std::unordered_set<uint64_t>& kv_set(int g, int r, int l) const {
@@ -2149,6 +2298,58 @@ class WlaMultiGpuCtx {
   std::vector<double> done_ms_;
   std::vector<bool> in_tick_;
   std::vector<size_t> per_gpu_done_;
+  // ---- v34 MVCC（乐观快照）----
+  // kv_mtx_：逐 (卡,组,层) 细粒度锁。mvcc 关闭时不加锁（静默期已保证无并发
+  // 写者 ⇒ 与历史二进制逐位一致）。
+  bool mvcc_ = false;
+  std::unique_ptr<std::mutex[]> kv_mtx_;
+  // 每卡 tick 完成序号：mvcc=2（差量补丁）用它判定"在途 tick 已结束"。
+  std::unique_ptr<std::atomic<uint64_t>[]> tick_seq_;
+  // 快照时刻正处于 victim 在途 tick 内、因而本次窃取与 victim 计算重叠的次数
+  std::atomic<uint64_t> mvcc_inflight_{0};
+  // 因与 victim 在途 tick 重叠而就地推进的步数（诊断：乐观快照的"已算不重算"账）
+  std::atomic<uint64_t> mvcc_steps_ahead_{0};
+  // v35 令牌桶状态（只在 steal_from 的 mtx_ 临界区内读写）
+  double tb_rate_mbps_ = 0.0, tb_cap_mb_ = 0.0, tb_tokens_mb_ = 0.0;
+  std::chrono::steady_clock::time_point tb_last_{};
+  std::atomic<uint64_t> budget_refused_{0}, budget_granted_{0};
+  std::atomic<double> tb_moved_mb_{0.0};
+  void tb_init(double mbps) {
+    tb_rate_mbps_ = mbps;
+    if (mbps > 0.0) {
+      tb_cap_mb_ = std::max(8.0, mbps * 0.5);  // 桶容量 = 500ms 信用
+      tb_tokens_mb_ = tb_cap_mb_;
+      tb_last_ = std::chrono::steady_clock::now();
+    }
+  }
+  // 调用方须持 mtx_。按墙钟补充令牌后尝试扣减；不足则整批拒绝。
+  bool tb_take(double need_mb) {
+    if (tb_rate_mbps_ <= 0.0) return true;
+    const auto now = std::chrono::steady_clock::now();
+    const double dt = std::chrono::duration<double>(now - tb_last_).count();
+    tb_last_ = now;
+    tb_tokens_mb_ = std::min(tb_cap_mb_, tb_tokens_mb_ + dt * tb_rate_mbps_);
+    if (need_mb > tb_tokens_mb_) return false;
+    tb_tokens_mb_ -= need_mb;
+    tb_moved_mb_.store(tb_moved_mb_.load() + need_mb);
+    return true;
+  }
+  // 传输结束后按实际（去重后）字节退还预扣差额。调用方不得持 mtx_。
+  void tb_refund(double over_mb) {
+    if (tb_rate_mbps_ <= 0.0 || over_mb <= 0.0) return;
+    std::unique_lock<std::mutex> lk(mtx_);
+    tb_tokens_mb_ = std::min(tb_cap_mb_, tb_tokens_mb_ + over_mb);
+    tb_moved_mb_.store(std::max(0.0, tb_moved_mb_.load() - over_mb));
+  }
+  // 每卡当前 tick 的 resident 快照（tick_begin 写、tick_end 清），用于
+  // 窃取时判定"该请求是否在 victim 的在途 tick 里"（步数需就地记账）。
+  std::vector<std::vector<int>> tick_resident_;
+  std::vector<int> in_flight_moved_;  // 诊断：本次窃取中有多少请求在途
+  // 逐请求"正在某卡的 tick 内被执行"标记（v34）：保证同一请求的同一 step
+  // 不会被原卡与持有者各执行一次（乐观快照的核心正确性约束）。
+  // 逐请求的"哪些卡正在 tick 内执行它"位图（v34）。用位图而非计数，
+  // 是为了让执行卡能把自己那一位排除掉（否则自己的 tick_begin 会把自己锁死）。
+  std::unique_ptr<std::atomic<uint32_t>[]> step_busy_;
   std::mutex mtx_, steal_lock_;
   // v30 L1：按卡传输租约（保护该卡的 staging 缓冲 + 迁移通道）。
   // steal_lock_ 只在状态临界区持有；传输并发度由这里决定：
@@ -2355,6 +2556,8 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   // 模式下启用信箱；A/LLX/RR 不使用。
   if (spol.steal_thread && pull_steal) ctx.enable_mig_thread();
   ctx.enable_speed_aware(spol.speed_aware);
+  ctx.set_mvcc(spol.mvcc);  // v34：乐观快照握手
+  ctx.set_mig_rate(spol.mig_rate_mbps);  // v35：迁移准入令牌桶（0 = 关）
 
   const int n = devices.size();
   WlaMultiStats st;
@@ -2613,7 +2816,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
         ctx.wait_mig_window(g);
         std::vector<int> resident = ctx.tick_begin(g);
         if (resident.empty()) {
-          ctx.tick_end(g, resident, ht.toc_ms() - t0);  // 清 in_tick（空快照）
+          ctx.tick_end(g, resident, resident, ht.toc_ms() - t0);  // 清 in_tick（空快照）
           // 本地空：B/C/E/D1/D2 拉式窃取（粒度见 steal_k）；A/RR 只等到达；
           // LLX 等重平衡线程迁入（LLX 的迁移是全局调度器驱动的"推"，非执行卡"拉"）
           if (pull_steal) {
@@ -2640,11 +2843,16 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
         tick_slow = ctx.slow_mult(g, t_tick0);  // v31：卡变慢（默认恒 1.0）
         const uint64_t rb0 = ctx.refill_g_get(g);
         size_t executed = 0;
+        std::vector<int> executed_list;  // v34：真正执行过的请求（tick_end 记账）
         for (int r : resident) {
           const int s = ctx.step_of(r);
           if (s >= wla_len_of(sp, r)) continue;  // 完成者由 tick_end 清出
+          // v34：该请求的这一步仍在原卡的在途 tick 内 → 让过，下一 tick 再做
+          //（否则同一 step 会被两张卡各算一次）。
+          if (ctx.step_busy(r, g)) continue;
           exec_step(r, s);
           ++executed;
+          executed_list.push_back(r);
         }
         CUDA_CHECK(cudaSetDevice(devices[g]));
         // v30.1 第①步：tick 级计算成本（真实 decode 的权重读取量）。
@@ -2662,7 +2870,7 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
         const double t_tick1 = ht.toc_ms() - t0;
         ctx.record_tick(g, tick_idx++, (int)resident.size(),
                         ctx.refill_g_get(g) - rb0, t_tick1 - t_tick0);
-        ctx.tick_end(g, resident, t_tick1);
+        ctx.tick_end(g, resident, executed_list, t_tick1);
         ctx.update_step_ema(g, t_tick1 - t_tick0, executed);  // E 决策输入④
         for (size_t i = 0; i < executed; ++i)
           step_durs[g].push_back(t_tick1 - t_tick0);
@@ -2715,6 +2923,16 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   }
 
   st.makespan_ms = ht.toc_ms() - t0;
+  // v34 审计（乐观快照的正确性底线）：每个请求实际执行的步数必须恰好等于
+  // 它的长度。丢步会让 makespan 偏乐观；重复步会让账偏悲观。只在异常时打印。
+  {
+    int bad = 0;
+    for (int r = 0; r < sp.num_requests; ++r)
+      if (ctx.step_of(r) != wla_len_of(sp, r)) ++bad;
+    if (bad)
+      std::printf("  [audit] step_mismatch=%d/%d (mvcc 丢步或重步)\n", bad,
+                  sp.num_requests);
+  }
   st.home_reqs = ctx.home_reqs();
   st.home_bytes = ctx.home_bytes();
   st.steals = ctx.steals();
@@ -2740,6 +2958,12 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
   st.precheck_ms = ctx.precheck_ms();
   st.steal_ms = ctx.steal_ms();
   st.steal_seg = ctx.steal_segments_ms();
+  st.mvcc_inflight = ctx.mvcc_inflight();
+  st.mvcc_steps_ahead = ctx.mvcc_steps_ahead();
+  st.budget_refused = ctx.budget_refused();
+  st.budget_granted = ctx.budget_granted();
+  st.budget_mb = ctx.budget_mb();
+  st.budget_rate = ctx.budget_rate();
   st.est_cand = ctx.est_cand();
   st.est_oracle_accept = ctx.est_oracle_accept();
   st.est_flip_accept = ctx.est_flip_accept();
