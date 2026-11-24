@@ -122,6 +122,10 @@ void NodeLink::rx_loop() {
     }
     rx_bytes_.fetch_add(sizeof(hdr) + n);
     rx_frames_.fetch_add(1);
+    if (std::getenv("FERRY_LINK_TRACE")) {
+      std::fprintf(stderr, "[link] rx type=%u n=%zu frames=%llu\n", type, n,
+                   (unsigned long long)rx_frames_.load());
+    }
     if (type == kNodeFin) {
       peer_closed_.store(true);
       break;

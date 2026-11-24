@@ -303,6 +303,7 @@ class MnWorker {
         return;
       }
       case kShutdown:
+        std::fprintf(stderr, "[mn] worker 收到 shutdown\n");
         stop_->store(true);
         return;
       default:

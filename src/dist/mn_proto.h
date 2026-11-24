@@ -59,23 +59,26 @@ namespace ferry {
 namespace mn {
 
 // ---------------- 帧类型 ----------------
+// ⚠️ 取值从 0x100 起：1–15 是 NodeLink 自己的控制帧（kNodePing/kNodeFin…），
+//    重叠会被链路层的 "kNodeFin ⇒ 对端关闭" 判定吃掉。曾经的 kShutdown=7
+//    正好撞上 kNodeFin=7 ⇒ worker 收到收尾帧却当成 EOF 直接丢，进程不退。
 enum Msg : uint32_t {
   // ---- coordinator → worker ----
-  kTickExec = 1,    // TickExec{...}：本 tick 每请求要做什么（含回填数据）
-  kMigLocal = 2,    // OffsHdr + offs[]：worker 内部 gather+scatter（同节点迁移）
-  kScatter = 3,     // OffsHdr + offs[] + blob：把 blob 散进 g 的 cache
-  kGather = 4,      // OffsHdr + offs[]：从 v 的 cache 收集，回 kGatherData
-  kRefillReq = 5,   // RefillHdr + elems[]：请 worker 从自己的 slab 出字节
-  kHomeCopy = 6,    // HomeCopyHdr + blob：迁移范围=home 时，把整条上下文的
-                    // host 副本搬过去（worker 收到即丢——两端 slab 本就相同，
-                    // 真系统里这确实是 host→host 的一段真流量，这里忠实保量）
-  kShutdown = 7,    // 收尾
+  kTickExec = 0x100,  // TickExec{...}：本 tick 每请求要做什么（含回填数据）
+  kMigLocal = 0x101,  // OffsHdr + offs[]：worker 内部 gather+scatter（同节点迁移）
+  kScatter = 0x102,   // OffsHdr + offs[] + blob：把 blob 散进 g 的 cache
+  kGather = 0x103,    // OffsHdr + offs[]：从 v 的 cache 收集，回 kGatherData
+  kRefillReq = 0x104, // RefillHdr + elems[]：请 worker 从自己的 slab 出字节
+  kHomeCopy = 0x105,  // HomeCopyHdr + blob：迁移范围=home 时，把整条上下文的
+                      // host 副本搬过去（worker 收到即丢——两端 slab 本就相同，
+                      // 真系统里这确实是 host→host 的一段真流量，这里忠实保量）
+  kShutdown = 0x106,  // 收尾
   // ---- worker → coordinator ----
-  kWorkerHello = 20,  // Hello{node, n_local}（可选，仅诊断）
-  kTickDone = 21,     // TickDoneHdr + exec list
-  kGatherData = 22,   // OffsHdr + offs[] + blob
-  kRefillResp = 23,   // RefillRespHdr + blob
-  kOpDone = 24,       // OpDone{op_id, op}：kMigLocal / kScatter / kHomeCopy 完成
+  kWorkerHello = 0x120,  // Hello{node, n_local}（可选，仅诊断）
+  kTickDone = 0x121,     // TickDoneHdr + exec list
+  kGatherData = 0x122,   // OffsHdr + offs[] + blob
+  kRefillResp = 0x123,   // RefillRespHdr + blob
+  kOpDone = 0x124,       // OpDone{op_id, op}：kMigLocal / kScatter / kHomeCopy 完成
 };
 
 // ⚠️ 帧的变长段一律**按固定顺序紧跟头部**，收端用同一个 unpack 函数切；

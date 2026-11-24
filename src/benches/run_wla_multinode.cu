@@ -4,9 +4,13 @@
 //   # node A（协调者，拥有下标 0,1 的卡）
 //   ./run_wla_multinode --role coord --gpus 0,1,2,3 --local 0,1
 //       --listen 9900 --mode 2 --requests 48 --steps 96 ...
-//   # node B（worker，拥有下标 2,3 的卡）
-//   ./run_wla_multinode --role worker --gpus 0,1,2,3 --local 2,3
+//   # node B（worker，拥有全局下标 2,3 的卡；它本机只有两张卡 ⇒ --devs 0,1）
+//   ./run_wla_multinode --role worker --gpus 0,1,2,3 --local 2,3 --devs 0,1
 //       --peer 10.0.0.2 --port 9900 --mode 2 --requests 48 --steps 96 ...
+//
+//   --gpus 是**全局**卡号（两端必须一致，决定迁移/回填的来源与归属）；
+//   --devs 是本进程内本地卡的物理 CUDA 设备号（顺序对应 --local）。两机各 2 卡
+//   时必须给，否则 worker 会对全局卡号 2,3 调 cudaSetDevice(2/3) 而失败。
 //
 //   # 单机自检（一个进程、全卡本地、不建链路）：应与 run_wla_multigpu 的
 //   # A/C/RR 数字在同一量级（不是逐位——实现不同，但机制应一致）
@@ -52,6 +56,8 @@ struct Args {
   std::string role = "coord";
   std::vector<int> gpus{0, 1, 2, 3};
   std::vector<int> local{0, 1, 2, 3};
+  // 本地卡的物理 CUDA 设备号（顺序对应 --local 列表；空 = 与 --gpus 相同）。
+  std::vector<int> devs;
   std::string peer, host;
   int port = 9900;
   bool listen = false;
@@ -97,6 +103,7 @@ int main(int argc, char** argv) {
     if (!std::strcmp(argv[i], "--role")) a.role = nx();
     else if (!std::strcmp(argv[i], "--gpus")) parse_ints(nx(), a.gpus);
     else if (!std::strcmp(argv[i], "--local")) parse_ints(nx(), a.local);
+    else if (!std::strcmp(argv[i], "--devs")) parse_ints(nx(), a.devs);
     else if (!std::strcmp(argv[i], "--peer")) { a.peer = nx(); }
     else if (!std::strcmp(argv[i], "--port")) a.port = std::atoi(nx());
     else if (!std::strcmp(argv[i], "--listen")) { a.listen = true; a.port = std::atoi(nx()); }
@@ -199,6 +206,21 @@ int main(int argc, char** argv) {
   // 节点 id：本进程拥有的卡 = node 0，其余 = node 1（两端各自算 ⇒ 一致）
   std::vector<int> node_of(n, 0);
   for (int g = 0; g < n; ++g) node_of[g] = local[g] ? 0 : 1;
+  // 全局卡号 → 本机物理设备号（--devs 按 --local 的顺序给；缺省与 --gpus 相同）
+  std::vector<int> dev(n, 0);
+  {
+    int k = 0;
+    for (int g = 0; g < n; ++g) {
+      if (!local[g]) continue;
+      dev[g] = a.devs.empty() ? a.gpus[g] : a.devs[k];
+      ++k;
+    }
+    if (!a.devs.empty() && (int)a.devs.size() != k) {
+      std::fprintf(stderr, "--devs 个数(%zu) 必须等于本地卡数(%d)\n",
+                   a.devs.size(), k);
+      return 2;
+    }
+  }
 
   std::vector<double> slow_mult(n, 1.0);
   if (!a.slow_s.empty()) {
@@ -238,19 +260,21 @@ int main(int argc, char** argv) {
     return true;
   }();
 
-  std::string ln, gn;
+  std::string ln, gn, dn;
   for (int i = 0; i < n; ++i) {
-    if (i) { ln += ','; gn += ','; }
+    if (i) { ln += ','; gn += ','; dn += ','; }
     ln += local[i] ? "1" : "0";
     gn += std::to_string(a.gpus[i]);
+    dn += std::to_string(dev[i]);
   }
   std::printf(
-      "[mn-cfg] role=%s gpus=%s islocal=%s mode=%d kv=%s reqs=%d steps=%d "
+      "[mn-cfg] role=%s gpus=%s devs=%s islocal=%s mode=%d kv=%s reqs=%d steps=%d "
       "layers=%d sel=%d hot=%d prefix=grp%d/stp%d cap=%s trace=%s len=%s "
       "steal-batch=%d lcost=%.0fMB slow=%s spd=%d mig-bw=%.1f cost-scale=%.2f "
       "margin=%.1f lbw=%.1f scope=%s tax=%s rtax=%d lense=%s missest=%s "
       "mprior=%.2f mvcc=%d lock=%s hier=%d\n",
-      a.role.c_str(), gn.c_str(), ln.c_str(), a.mode, a.kv_mode.c_str(),
+      a.role.c_str(), gn.c_str(), dn.c_str(), ln.c_str(), a.mode,
+      a.kv_mode.c_str(),
       a.reqs, a.steps, a.layers, a.sel, a.hot, a.prefix_group,
       a.prefix_steps, a.cap_mode.c_str(), real ? "real" : "synthetic",
       a.len_dist.c_str(), a.steal_batch, a.layer_cost_mb,
@@ -262,7 +286,7 @@ int main(int argc, char** argv) {
   std::fflush(stdout);
 
   if (a.role == "worker") {
-    mn::MnWorker wk(a.gpus, local, sp, a.attn, a.layer_cost_mb);
+    mn::MnWorker wk(dev, local, sp, a.attn, a.layer_cost_mb);
     if (!all_local) {
       if (a.listen) {
         wk.attach(NodeLink::accept_one(a.port, [&wk](uint32_t t, const char* d,
@@ -286,7 +310,7 @@ int main(int argc, char** argv) {
   }
 
   // ── coordinator ──
-  mn::MnCoordinator co(a.gpus, local, node_of, sp, tr, a.mode, WlaKvMode::Delta,
+  mn::MnCoordinator co(dev, local, node_of, sp, tr, a.mode, WlaKvMode::Delta,
                        bpol, mp, a.steal_batch, a.attn, a.layer_cost_mb, slow_mult,
                        a.slow_at, a.speed_aware, /*rr=*/a.mode == 5);
   co.set_run_params(a.skew, a.arrival, a.gap);
