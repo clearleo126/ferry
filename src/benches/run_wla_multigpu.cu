@@ -125,6 +125,12 @@ int main(int argc, char** argv) {
   // --mig-rate-mbps（v35）：迁移准入令牌桶（MB/s，0 = 关）。按字节限流，
   // 把"握手便宜 ⇒ 偷得更频繁 ⇒ 迁移量放大"的反馈锁住。
   double mig_rate_mbps = 0.0;
+  // --mig-stream-nb（v38）：迁移 gather/scatter 改发 non-blocking 流，
+  // 取消 legacy 默认流带来的与 decode 的隐式双向序（默认关 = 逐位不变）。
+  bool mig_stream_nb = false;
+  // --kv-audit（v38 诊断）：跑完做缓存内容指纹校验。默认关（见 WlaStealPolicy 注释：
+  // 模拟器物理槽哈希寻址与 LRU 记账不自洽，该指标不是正确性门槛）。
+  bool kv_audit = false;
   // --vchan-nodes（v30.1）：每卡所属节点 id，逗号分隔，长度须等于 --gpus。
   // 例：4 卡 2+2 = "0,0,1,1"（两节点各两张卡）。缺省 = 每卡一节点（v30 口径）。
   char vchan_nodes_s[128] = "";
@@ -241,6 +247,10 @@ int main(int argc, char** argv) {
       mvcc = std::atoi(next()) != 0;
     } else if (std::strcmp(argv[i], "--mig-rate-mbps") == 0) {
       mig_rate_mbps = std::atof(next());
+    } else if (std::strcmp(argv[i], "--mig-stream-nb") == 0) {
+      mig_stream_nb = std::atoi(next()) != 0;
+    } else if (std::strcmp(argv[i], "--kv-audit") == 0) {
+      kv_audit = std::atoi(next()) != 0;
     } else if (std::strcmp(argv[i], "--vchan-nodes") == 0) {
       std::strncpy(vchan_nodes_s, next(), sizeof(vchan_nodes_s) - 1);
     } else if (std::strcmp(argv[i], "--hier-steal") == 0) {
@@ -468,13 +478,15 @@ int main(int argc, char** argv) {
   spol.est_flip = (len_est != 0 || miss_est != 0);
   spol.mvcc = mvcc;  // v34 乐观快照握手（默认关 = 历史语义逐位不变）
   spol.mig_rate_mbps = mig_rate_mbps;  // v35 迁移准入令牌桶（0=关）
+  spol.mig_stream_nb = mig_stream_nb;  // v38 迁移非阻塞流（默认关）
+  spol.kv_audit = kv_audit;            // v38 诊断（默认关）
 
   std::printf(
       "[wla-mg] gpus=%s arrival=%s skew=%s reqs=%d steps=%d layers=%d sel=%d "
       "hot=%d attn=%d gap=%.1fms steal-batch=%d B_ref=%.1fGB/s cost-scale=%.2f "
       "mig-margin=%.1f kv-mode=%s rebal=%.0fms/thr%.2f prefix=grp%d/stp%d "
       "cap=%s steal-delay=%.1fms seed=%llu own-carry=%d vchan=%.2fGB/s/%.1fms "
-      "len=%s(med%d/sig%.2f) precheck=%d lock=%s mthread=%d mvcc=%d migrate=%.0fMB/s nodes=%s "
+      "len=%s(med%d/sig%.2f) precheck=%d lock=%s mthread=%d mvcc=%d migrate=%.0fMB/s mignb=%d nodes=%s "
       "hier=%d rtax=%d lbw=%.2f lcost=%.0fMB slow=%s@%.0fms spd=%d "
       "scope=%s tax=%s lense=%s missest=%s mprior=%.2f\n",
       gpu_buf, arrival, skew, reqs, steps, layers, sel, hot, attn, gap,
@@ -482,7 +494,7 @@ int main(int argc, char** argv) {
       rebal_thr, prefix_group, prefix_steps, cap_mode_s, steal_delay, seed,
       sp.own_carry, vchan_bw, vchan_t0, len_dist, len_median, len_sigma,
       (int)steal_precheck, steal_lock_wide ? "wide" : "narrow",
-      (int)steal_thread, (int)mvcc, mig_rate_mbps,
+      (int)steal_thread, (int)mvcc, mig_rate_mbps, (int)mig_stream_nb,
       vchan_nodes_s[0] ? vchan_nodes_s : "per-gpu",
       (int)hier_steal, (int)remote_tax, local_bw, layer_cost_mb,
       slow_s[0] ? slow_s : "none", slow_at, (int)speed_aware, mig_scope_s,

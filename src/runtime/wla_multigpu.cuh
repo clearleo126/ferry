@@ -170,6 +170,53 @@ __global__ inline void wla_slot_scatter_kernel(
   for (int i = threadIdx.x; i < words_per_slot; i += blockDim.x) dst[i] = src[i];
 }
 
+// v38 KV 内容校验：逐槽算 64bit 指纹（FNV-1a 逐线程累加后块内 XOR 归约）。
+// 主机侧 kv_hash_bytes 用完全相同的顺序复算，二者逐位可比。
+__global__ inline void wla_slot_hash_kernel(const char* __restrict__ cache,
+                                            unsigned long long* __restrict__ out,
+                                            int n_slots, int words_per_slot) {
+  const int s = blockIdx.x;
+  if (s >= n_slots) return;
+  const uint4* src =
+      reinterpret_cast<const uint4*>(cache) + (size_t)s * words_per_slot;
+  unsigned long long h = 1469598103934665603ULL;
+  for (int i = threadIdx.x; i < words_per_slot; i += blockDim.x) {
+    const uint4 v = src[i];
+    const unsigned int w[4] = {v.x, v.y, v.z, v.w};
+    for (int j = 0; j < 4; ++j) {
+      h ^= (unsigned long long)w[j];
+      h *= 1099511628211ULL;
+    }
+  }
+  __shared__ unsigned long long sm[256];
+  sm[threadIdx.x] = h;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) sm[threadIdx.x] ^= sm[threadIdx.x + stride];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) out[s] = sm[0];
+}
+
+// 主机侧同口径指纹（必须与 wla_slot_hash_kernel 的线程划分/混合顺序一致）
+inline unsigned long long kv_hash_bytes(const char* p, int words_per_slot) {
+  const uint4* src = reinterpret_cast<const uint4*>(p);
+  unsigned long long acc = 0;
+  for (int t = 0; t < 256; ++t) {
+    unsigned long long h = 1469598103934665603ULL;
+    for (int i = t; i < words_per_slot; i += 256) {
+      const uint4 v = src[i];
+      const unsigned int w[4] = {v.x, v.y, v.z, v.w};
+      for (int j = 0; j < 4; ++j) {
+        h ^= (unsigned long long)w[j];
+        h *= 1099511628211ULL;
+      }
+    }
+    acc ^= h;
+  }
+  return acc;
+}
+
 // 到达分发路径：Affinity = 按 dest 亲和（A/B/C/E 既有语义）；
 // RoundRobin = 轮转（RR 基线的唯一差异项）
 enum class WlaDispatch { Affinity = 0, RoundRobin = 1 };
@@ -278,6 +325,22 @@ struct WlaStealPolicy {
   // v35 迁移准入令牌桶（--mig-rate-mbps，0 = 关）：按字节限流，把"握手变便宜
   // ⇒ 偷得更频繁 ⇒ 迁移量放大"这一反馈锁住（见 results/v35_budget_prereg）。
   double mig_rate_mbps = 0.0;
+  // v38 迁移非阻塞流（--mig-stream-nb，默认 0 = 与现状逐位一致）。
+  // 现状：delta 的索引 H2D 与 gather/scatter kernel 都发在 legacy 默认流上，
+  // 而 decode 流 cs（cudaStreamCreate）与 channel 的 copy 流都是 blocking ⇒
+  // legacy 流成为每次迁移的隐式全局同步点：迁移等待所有 blocking 流在途工作，
+  // 其后提交的 decode 又等待迁移 ⇒ "in_tick_ 为真"的重叠只是逻辑重叠。
+  // 1 = gather/scatter 改发专用 non-blocking 流，取消该隐式序
+  //（见 results/v38_nbstream_prereg_20261123.md）。
+  // ⚠️ 语义代价：legacy 屏障原本同时保证"gather 不与计算并发读写同槽"，
+  // 打开后该保证转由"同 (r,l,block) 内容确定 + 槽复用窗口"承担（未证明）。
+  bool mig_stream_nb = false;
+  // v38 诊断（--kv-audit，默认 0）：跑完对 LRU 常驻块做缓存内容指纹校验。
+  // ⚠️ 仅供诊断，**不能当正确性门槛**：本模拟器的物理槽按 `block % hot_blocks`
+  // 哈希寻址，而 LRU 按组记账，二者只在"零哈希冲突"下一致；真实 trace 的 block id
+  // 必冲突 ⇒ 槽内字节可能与 LRU 声明不符（未改动的 nb=0 路径同样如此，已实测）。
+  // 因此它测的是模拟器的内容模型，不是 nb=1 引入的损坏。
+  bool kv_audit = false;
   // v30 L2：迁移搬出执行线程。true = 每卡一个迁移工作线程，执行线程只投递
   // 请求（post_mig_request）后继续 decode；false（默认）= 既有内联语义。
   // 依据：分段数据显示 lock 缩小后时间只是从 lock 转移到 net/tick —— 因为
@@ -588,6 +651,14 @@ class WlaMultiGpuCtx {
         CUDA_CHECK(cudaMalloc(&mig_stage_v_[g], stage_bytes));
         CUDA_CHECK(cudaMalloc(&mig_stage_c_[g], stage_bytes));
         CUDA_CHECK(cudaMallocHost(&h_mig_idx_v_[g], mig_idx_cap_));
+      }
+      // v38：每卡一条 non-blocking 迁移流（只在 --mig-stream-nb 时使用）。
+      // 传输按卡租约对（xfer_lock_[g]）串行 ⇒ 每卡一条即可互斥复用。
+      mig_nb_.assign(n_, nullptr);
+      for (int g = 0; g < n_; ++g) {
+        CUDA_CHECK(cudaSetDevice(devs_[g]));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&mig_nb_[g],
+                                             cudaStreamNonBlocking));
       }
     }
     // v30 L1 修正：按卡传输租约对全部 kv-mode 分配（full/drop 的窃取也要拿
@@ -1469,16 +1540,20 @@ class WlaMultiGpuCtx {
         const size_t data_bytes = (size_t)ns * c4_;
         const int words = (int)(c4_ / sizeof(uint4));
         // ① victim：索引 H2D → staging 头部；gather 压实到数据区
+        // v38：--mig-stream-nb 时改发专用 non-blocking 流（取消 legacy 默认流
+        // 带来的与 decode 的隐式双向序）；关闭时 sv=0 ⇒ 与历史逐位一致。
         const auto t_g0 = std::chrono::steady_clock::now();
+        const cudaStream_t sv =
+            pol.mig_stream_nb ? mig_nb_[v] : (cudaStream_t)0;
         CUDA_CHECK(cudaSetDevice(devs_[v]));
         CUDA_CHECK(cudaMemcpyAsync(stg_v, idx,
                                    (size_t)ns * sizeof(uint64_t),
-                                   cudaMemcpyHostToDevice, 0));
-        wla_slot_gather_kernel<<<ns, 256>>>(
+                                   cudaMemcpyHostToDevice, sv));
+        wla_slot_gather_kernel<<<ns, 256, 0, sv>>>(
             d_cache_[v], stg_v + mig_idx_cap_,
             reinterpret_cast<const uint64_t*>(stg_v), ns, words);
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(0));  // gather 落地后才允许 submit 读
+        CUDA_CHECK(cudaStreamSynchronize(sv));  // gather 落地后才允许 submit 读
         seg.gather += ms_since(t_g0);
         // ② 单次 submit（数据区；通道内部自动 4MB 切分）
         const auto t_x0 = std::chrono::steady_clock::now();
@@ -1490,15 +1565,17 @@ class WlaMultiGpuCtx {
         seg.xfer += ms_since(t_x0);
         // ④ consumer：索引 H2D 直发 + scatter 散射回真实槽位
         const auto t_s0 = std::chrono::steady_clock::now();
+        const cudaStream_t sg =
+            pol.mig_stream_nb ? mig_nb_[g] : (cudaStream_t)0;
         CUDA_CHECK(cudaSetDevice(devs_[g]));
         CUDA_CHECK(cudaMemcpyAsync(stg_g, idx,
                                    (size_t)ns * sizeof(uint64_t),
-                                   cudaMemcpyHostToDevice, 0));
-        wla_slot_scatter_kernel<<<ns, 256>>>(
+                                   cudaMemcpyHostToDevice, sg));
+        wla_slot_scatter_kernel<<<ns, 256, 0, sg>>>(
             stg_g + mig_idx_cap_, d_cache_[g],
             reinterpret_cast<const uint64_t*>(stg_g), ns, words);
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(0));
+        CUDA_CHECK(cudaStreamSynchronize(sg));
         seg.scatter += ms_since(t_s0);
         // A1/L1：chunk 全程耗时 → 饱和 chunk（≥4MB = 通道切分粒度）计入
         const double ci_secs = std::chrono::duration<double>(
@@ -2172,6 +2249,70 @@ class WlaMultiGpuCtx {
   const std::unordered_set<uint64_t>& kv_set(int g, int r, int l) const {
     return lru_set_[g][wla_grp(sp_, r)][l];
   }
+  // v38：KV 内容校验（`--mig-stream-nb 1` 的正确性前提）。
+  // 不变量：**每个缓存槽的内容必须等于"映射到该槽的某个常驻块"的 slab 字节**。
+  // 注意槽按 `block % hot_blocks` 寻址 ⇒ 不同 block 会别名到同一槽，只有最后
+  // 写入者的字节在槽里，所以不能按"每个常驻块都必须匹配"判（那必然假阳性）。
+  // 前缀组下组内成员共用槽、slab 偏移不同 ⇒ 任一成员匹配即可；
+  // torn read 产生的混合字节对哪个成员都不匹配，故仍可检出。
+  // 只能在所有执行线程 join 之后调用（稳定快照）。
+  // 返回 {mism_all, checked_all, mism_uniq, checked_uniq}：
+  //   uniq = 只统计"该槽仅有一个常驻块"的无歧义子集 —— 若 uniq 全对而 all 有错，
+  //   说明差异全部来自槽别名（模拟器本就不维护内容），而非数据面损坏。
+  std::array<int, 4> verify_kv_content() {
+    int mism = 0, checked = 0, mism_u = 0, checked_u = 0;
+    if (kvmode_ != WlaKvMode::Delta || lru_set_.empty())
+      return {mism, checked, mism_u, checked_u};
+    const int L = sp_.num_layers;
+    const int wps = (int)(c4_ / sizeof(uint4));
+    const int PG = sp_.prefix_group > 1 ? sp_.prefix_group : 1;
+    for (int g = 0; g < n_; ++g) {
+      if (g >= (int)lru_set_.size() || lru_set_[g].empty()) continue;
+      const int ngrp = (int)lru_set_[g].size();
+      const int nslots = ngrp * L * sp_.hot_blocks;
+      unsigned long long* dh = nullptr;
+      CUDA_CHECK(cudaSetDevice(devs_[g]));
+      CUDA_CHECK(cudaMalloc(&dh, (size_t)nslots * sizeof(unsigned long long)));
+      wla_slot_hash_kernel<<<nslots, 256>>>(d_cache_[g], dh, nslots, wps);
+      CUDA_CHECK_LAST();
+      std::vector<unsigned long long> hh((size_t)nslots);
+      CUDA_CHECK(cudaMemcpy(hh.data(), dh,
+                            (size_t)nslots * sizeof(unsigned long long),
+                            cudaMemcpyDeviceToHost));
+      cudaFree(dh);
+      const int m1 = std::min(sp_.num_requests, ngrp * PG);
+      for (int q = 0; q < ngrp; ++q) {
+        for (int l = 0; l < L; ++l) {
+          const auto& set = lru_set_[g][q][l];
+          if (set.empty()) continue;
+          // 槽 -> 该槽上的常驻块列表
+          std::unordered_map<int, std::vector<uint64_t>> by_slot;
+          for (uint64_t blk : set)
+            by_slot[(int)(blk % (uint64_t)sp_.hot_blocks)].push_back(blk);
+          for (auto& kvp : by_slot) {
+            const size_t slot = (size_t)(q * L + l) * sp_.hot_blocks +
+                                (size_t)kvp.first;
+            const unsigned long long got = hh[slot];
+            bool ok = false;
+            for (uint64_t blk : kvp.second) {
+              const int a = q * PG, b = std::min(m1, (q + 1) * PG);
+              for (int m = a; m < b && !ok; ++m)
+                ok = (kv_hash_bytes(h_slab_ + wla_slab_off(sp_, m, l, blk),
+                                    wps) == got);
+              if (ok) break;
+            }
+            ++checked;
+            if (!ok) ++mism;
+            if (kvp.second.size() == 1) {
+              ++checked_u;
+              if (!ok) ++mism_u;
+            }
+          }
+        }
+      }
+    }
+    return {mism, checked, mism_u, checked_u};
+  }
   // ---- 阶段2：逐 tick 时间模型遥测（snap_on_ 时记录）----
   // 记录 (gpu, tick 序号, 常驻数, 本 tick 回填字节, tick 墙钟 ms)，离线拟合
   //   tick_ms ≈ a·resident + b·refill_MB + c
@@ -2288,6 +2429,8 @@ class WlaMultiGpuCtx {
   size_t slab_bytes_ = 0;
   std::vector<std::unique_ptr<HostStagedChannel>> chh_;
   std::vector<std::vector<std::unique_ptr<HostStagedChannel>>> mig_;
+  // v38：每卡一条 non-blocking 迁移流（--mig-stream-nb；仅在 delta 分支分配）
+  std::vector<cudaStream_t> mig_nb_;
   std::vector<std::deque<int>> local_;
   std::vector<int> next_step_;
   // v28 §3.3 容量口径修正（cap_mode=1）：每卡每组的常驻成员数。
@@ -2932,6 +3075,17 @@ inline WlaMultiStats run_wla_multigpu(const std::vector<int>& devices,
     if (bad)
       std::printf("  [audit] step_mismatch=%d/%d (mvcc 丢步或重步)\n", bad,
                   sp.num_requests);
+  }
+  // v38 内容审计（`--mig-stream-nb 1` 的正确性前提）：LRU 常驻块的槽字节必须
+  // 等于 slab 中该块字节。step_mismatch 查不出数据面损坏，这条才查得出。
+  // 只在有 LRU 镜像的路径（delta + stateful）生效，其余返回 checked==0 不打印。
+  {
+    if (spol_in.kv_audit) {
+      const auto kv = ctx.verify_kv_content();
+      if (kv[1] > 0)
+        std::printf("  [audit] kv_content=%d/%d | 无歧义槽=%d/%d (诊断，非门槛)\n",
+                    kv[0], kv[1], kv[2], kv[3]);
+    }
   }
   st.home_reqs = ctx.home_reqs();
   st.home_bytes = ctx.home_bytes();

@@ -22,6 +22,7 @@ endif()
 add_compile_options(-Wall -Wextra)
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
 
 # ------------------------------------------------------------------
 # 模块库
@@ -30,6 +31,14 @@ find_package(CUDAToolkit REQUIRED)
 # common: 错误检查宏、计时工具
 add_library(ferry_common INTERFACE)
 target_include_directories(ferry_common INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# link: 跨节点 TCP 链路（真多节点数据面底座；纯 C++，不依赖 CUDA，
+#       可在没有 GPU 的节点上单独跑链路体检）
+add_library(ferry_link STATIC
+  src/comm/node_link.cpp
+)
+target_include_directories(ferry_link PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(ferry_link PUBLIC ferry_common Threads::Threads)
 
 # config: 环境变量/配置解析（纯 C++，无 CUDA 依赖）
 add_library(ferry_config STATIC
@@ -63,6 +72,12 @@ add_executable(probe
   src/probe/main.cu
 )
 target_link_libraries(probe PRIVATE ferry_topo ferry_config ferry_common)
+
+# bench_node_link: 跨节点链路体检（RTT + 单向吞吐；真多节点第一步）
+add_executable(bench_node_link
+  src/benches/bench_node_link.cpp
+)
+target_link_libraries(bench_node_link PRIVATE ferry_link)
 
 # bench_comm: 通信层验收（正确性 + 吞吐对比 P1 batched）
 add_executable(bench_comm
@@ -132,6 +147,12 @@ add_executable(run_wla_multigpu
   src/benches/run_wla_multigpu.cu
 )
 target_link_libraries(run_wla_multigpu PRIVATE ferry_workloads ferry_comm ferry_runtime ferry_config ferry_common)
+
+# run_wla_multinode: Workload A 真多节点执行器（两进程 + 真 socket 数据面）
+add_executable(run_wla_multinode
+  src/benches/run_wla_multinode.cu
+)
+target_link_libraries(run_wla_multinode PRIVATE ferry_workloads ferry_comm ferry_link ferry_runtime ferry_config ferry_common)
 
 # wla_counterfact: 离线字节反事实分析（读取 FERRY_WLA_SNAPSHOT 产生的快照）
 add_executable(wla_counterfact
